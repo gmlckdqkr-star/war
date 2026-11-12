@@ -22,21 +22,29 @@ interface Threat {
   tile: number;
 }
 
-const tw = new Float32Array(CW * CH);
-const tsx = new Float32Array(CW * CH);
-const tsy = new Float32Array(CW * CH);
-const tn = new Int32Array(CW * CH);
 const DCS = 2;
 const DW = Math.ceil(GW / DCS);
 const DH = Math.ceil(GH / DCS);
-const dens = new Float32Array(DW * DH);
-const danger = new Float32Array(DW * DH);
-let rangedTick = 0;
+
+/**
+ * Scratch buffers and tick counters of the council. One per World: nothing here may live at module
+ * level, or a battle's outcome would depend on whatever battle ran before it in the same process.
+ */
+export class CouncilState {
+  tw = new Float32Array(CW * CH);
+  tsx = new Float32Array(CW * CH);
+  tsy = new Float32Array(CW * CH);
+  tn = new Int32Array(CW * CH);
+  dens = new Float32Array(DW * DH);
+  danger = new Float32Array(DW * DH);
+  rangedTick = 0;
+}
 
 const MELEE = new Set(['spear', 'sword', 'knight', 'militia']);
 
 export function findThreats(w: World): Threat[] {
   const g = w.grid;
+  const { tw, tsx, tsy, tn } = w.council;
   tw.fill(0);
   tsx.fill(0);
   tsy.fill(0);
@@ -136,8 +144,10 @@ export function runCouncil(w: World) {
   }
 
   // ---------------- ranged squads (every 2 s) ----------------
-  rangedTick++;
-  if (rangedTick % 4 === 0) {
+  const cs = w.council;
+  const { dens, danger } = cs;
+  cs.rangedTick++;
+  if (cs.rangedTick % 4 === 0) {
     dens.fill(0);
     danger.fill(0);
     for (const e of w.activeEnemies) {

@@ -82,8 +82,6 @@ class Heap {
   }
 }
 
-const heap = new Heap(GW * GH * 4);
-
 export interface Field {
   dist: Float64Array;
   next: Int32Array;
@@ -111,6 +109,8 @@ export class Grid {
   keepX = 0;
   keepY = 0;
   version = 0;
+  /** path-search scratch heap, owned by this grid (no shared module state) */
+  private heap = new Heap(GW * GH * 4);
 
   get(x: number, y: number): TileId {
     return this.tiles[idx(x, y)] as TileId;
@@ -325,6 +325,7 @@ export class Grid {
   /** Reverse Dijkstra from keep-adjacent tiles. dist = cost-to-keep for enemies walking there. */
   enemyField(kind: FieldKind, f: Field) {
     const { dist, next } = f;
+    const heap = this.heap;
     dist.fill(Infinity);
     next.fill(-1);
     heap.clear();
@@ -375,6 +376,7 @@ export class Grid {
   /** Multi-source Dijkstra for defenders toward a set of goal tiles. */
   defenderField(goals: number[], f: Field) {
     const { dist, next } = f;
+    const heap = this.heap;
     dist.fill(Infinity);
     next.fill(-1);
     heap.clear();

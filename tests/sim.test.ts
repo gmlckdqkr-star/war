@@ -74,6 +74,35 @@ describe('battle simulation', () => {
     expect(a.result!.dead).toBe(b.result!.dead);
   });
 
+  it('does not depend on other worlds stepped in between (no shared module state)', () => {
+    const st = STAGES.find((x) => x.id === 's5')!;
+    const fingerprint = (w: World) => {
+      let h = 0;
+      for (const u of w.units) h = (Math.imul(h, 31) + Math.round(u.x * 100) + Math.round(u.y * 7) + Math.round(u.hp * 10) + u.state) | 0;
+      return { t: w.t, kills: w.stats.kills, dead: w.stats.dead, keep: w.keepHp, wave: w.waveIdx, arrows: w.supplies.arrows, h, squads: w.squads.map((q) => q.destTile) };
+    };
+    const make = (seed: number, stage = st) => {
+      const s = armyFor(stage.index);
+      s.settings.autoCommand = true;
+      const w = new World(battleConfig(s, stage, defaultLineup(s, stage), {}, seed));
+      w.start();
+      return w;
+    };
+    const steps = 30 * 150;
+    // reference run, alone
+    const a = make(424242);
+    for (let i = 0; i < steps; i++) a.step();
+    // a different battle advanced an odd number of ticks first, then interleaved tick by tick
+    const other = make(5, STAGES[0]);
+    for (let i = 0; i < 15; i++) other.step();
+    const b = make(424242);
+    for (let i = 0; i < steps; i++) {
+      b.step();
+      if (i % 3 === 0) other.step();
+    }
+    expect(fingerprint(b)).toEqual(fingerprint(a));
+  });
+
   it.each(STAGES.map((s) => [s.id]))('%s runs to completion with sane state', (id) => {
     const w = runBattle(id, 1000 + Number(id.slice(1)));
     expect(['won', 'lost']).toContain(w.state);

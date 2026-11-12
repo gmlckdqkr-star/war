@@ -20,7 +20,7 @@ import { Grid, cx, cy, idx, inb, newField, tileAt, tx, ty, type Field, N8 } from
 import { SpatialHash } from './hash';
 import { RNG } from './rng';
 import type { Edge, StageDef, Supplies, WaveGroup } from './stages';
-import { runCouncil, autoCommander } from './council';
+import { CouncilState, runCouncil, autoCommander } from './council';
 
 export const ST = { ACTIVE: 0, DOWN: 1, DEAD: 2, CARRIED: 3, EVAC: 4, FLED: 5, CLIMB: 6 } as const;
 export const ACT = { NONE: 0, PLANT: 1, DIG: 2, DOCKED: 3, SET: 4, PICKUP: 5, DONE_LADDER: 6 } as const;
@@ -266,6 +266,8 @@ export class World {
   fieldsDirty = true;
   lastFieldT = -10;
   councilT = 0;
+  /** per-world council scratch state (keeps battles independent of each other) */
+  council = new CouncilState();
   moraleT = 0;
   dHash = new SpatialHash<Unit>(32);
   eHash = new SpatialHash<Unit>(32);
