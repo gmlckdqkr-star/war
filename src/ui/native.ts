@@ -67,6 +67,24 @@ export function setupNativeBack(onBack: () => void): boolean {
   }
 }
 
+/**
+ * Run `cb` when the native app goes to the background (Android may kill it there without another event).
+ * Both the 'pause' event and appStateChange(isActive=false) are wired; a double call is harmless.
+ */
+export function setupNativePause(cb: () => void): boolean {
+  const A = plugin('App');
+  if (!A?.addListener) return false;
+  try {
+    A.addListener('pause', () => cb());
+    A.addListener('appStateChange', (st: { isActive?: boolean } | undefined) => {
+      if (st && st.isActive === false) cb();
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function exitNativeApp(): boolean {
   const A = plugin('App');
   if (!A?.exitApp) return false;

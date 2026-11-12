@@ -434,3 +434,21 @@ describe('build id', () => {
     expect(RESUME_VER).toMatch(/^\d+\.\d+\.\d+\+[0-9a-f]{12}$/);
   });
 });
+
+describe('only World commands change the battle from the UI', () => {
+  it('no direct writes to squad or unit state in src/ui and src/render', () => {
+    const sources = import.meta.glob(['../src/ui/*.ts', '../src/render/*.ts'], { query: '?raw', import: 'default', eager: true }) as Record<string, string>;
+    expect(Object.keys(sources).length).toBeGreaterThan(8);
+    const hits: string[] = [];
+    // assignments to fields the simulation reads (stance, auto, focus, morale, positions, hp, ...)
+    const re = /\b(sq|squad|s|q|u|unit|e|t|target|c\.target)\.(stance|auto|focus|morale|routing|destTile|homeTile|slots|hp|x|y|px|py|fx|fy|state|fleeing|ammo|lastOrderT)\s*(=(?!=)|\+=|-=|\+\+|--)/;
+    for (const [f, src] of Object.entries(sources)) {
+      src
+        .split('\n')
+        .forEach((line, i) => {
+          if (re.test(line) && !/^\s*(\/\/|\*)/.test(line)) hits.push(`${f}:${i + 1}: ${line.trim()}`);
+        });
+    }
+    expect(hits).toEqual([]);
+  });
+});
