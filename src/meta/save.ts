@@ -71,6 +71,8 @@ export interface SaveData {
   sweep: { key: string; n: number };
   /** pass progress of other seasons (clock-rollback safety), keyed by season number */
   passArchive: Record<string, { xp: number; claimedFree: number[]; claimedPrem: number[] }>;
+  /** id of the last battle whose result is in this save: a leftover resume record with this id is stale */
+  battleDone: string;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -134,6 +136,7 @@ export function newSave(now = Date.now()): SaveData {
     lineups: [],
     sweep: { key: '', n: 0 },
     passArchive: {},
+    battleDone: '',
   };
   s.roster.push(newSquad(s, 'spear', '창병대 I'));
   s.roster.push(newSquad(s, 'sword', '방패검병대 I'));
@@ -250,6 +253,7 @@ export function sanitize(raw: any): SaveData {
       if (!/^\d+$/.test(k) || !a || typeof a !== 'object') continue;
       s.passArchive[k] = { xp: num(a.xp, 0, 0, 1e8), claimedFree: numArr(a.claimedFree), claimedPrem: numArr(a.claimedPrem) };
     }
+  s.battleDone = typeof raw.battleDone === 'string' ? raw.battleDone.slice(0, 64) : '';
   return s;
 }
 
