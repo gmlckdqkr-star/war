@@ -20,6 +20,41 @@ export function planCost(extra: Partial<Supplies>): number {
   return c;
 }
 
+/**
+ * The plan cut down to what `gold` covers: drops one pack at a time, always from the kind with the most
+ * packs (the dearest on a tie), so the cut is spread out. Returns the new plan and how many packs went.
+ */
+export function fitPlan(extra: Partial<Supplies>, gold: number): { extra: Partial<Supplies>; dropped: number } {
+  const out: Partial<Supplies> = { ...extra };
+  const keys = Object.keys(SUPPLY_PRICE) as (keyof Supplies)[];
+  let dropped = 0;
+  while (planCost(out) > Math.max(0, gold)) {
+    let k: keyof Supplies | null = null;
+    for (const c of keys) {
+      const n = packsOf(out, c);
+      if (n <= 0) continue;
+      if (!k || n > packsOf(out, k) || (n === packsOf(out, k) && SUPPLY_PRICE[c].pack > SUPPLY_PRICE[k].pack)) k = c;
+    }
+    if (!k) break;
+    out[k] = Math.max(0, (out[k] ?? 0) - SUPPLY_PRICE[k].per);
+    if (!out[k]) delete out[k];
+    dropped++;
+  }
+  return { extra: out, dropped };
+}
+
+/**
+ * How many squads the player means to take out, per pre-battle session (set when they toggle a row or
+ * when a battle starts). Refills and retries aim for this size instead of filling every free slot.
+ */
+const wanted = new WeakMap<object, number>();
+export function wantedSize(pre: object, fallback: number): number {
+  return wanted.get(pre) ?? fallback;
+}
+export function setWantedSize(pre: object, n: number) {
+  wanted.set(pre, Math.max(0, n));
+}
+
 export interface Strength {
   ready: number;
   full: number;
@@ -63,10 +98,10 @@ export function careAll(s: SaveData, kind: 'fill' | 'heal'): { done: number; err
 /**
  * Lineup that prefers squads able to fight: keeps the chosen squads that still have ready soldiers,
  * swaps squads that are mostly out (under half) for idle squads that are at least 3/4 ready, then fills
- * free slots the way the default lineup would.
+ * up to `want` squads (default: every slot) the way the default lineup would.
  */
-export function readyLineup(s: SaveData, st: StageDef, ids: string[]): string[] {
-  const cap = squadCap(s, st);
+export function readyLineup(s: SaveData, st: StageDef, ids: string[], want?: number): string[] {
+  const cap = Math.min(squadCap(s, st), want ?? Infinity);
   const ratio = (id: string) => {
     const r = s.roster.find((x) => x.id === id);
     return r ? readyCount(r) / SQUAD_TYPES[r.type].size : 0;

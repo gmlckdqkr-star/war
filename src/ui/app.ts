@@ -56,7 +56,7 @@ import { REFUND_NOTICE, sellerLine } from '../meta/legal';
 import { cosmeticCard, cosmeticPreview } from './preview';
 import { audio } from './audio';
 import { BattleView, squadNumbers, type BattleMode, type BattleSetup } from './battle';
-import { MAX_PACKS, careAll, careCosts, foodForecast, lineupStrength, packsOf, planCost, readyLineup } from './prebattle';
+import { MAX_PACKS, careAll, careCosts, fitPlan, foodForecast, lineupStrength, packsOf, planCost, readyLineup, setWantedSize, wantedSize } from './prebattle';
 import { bar, clear, confirmBox, fmt, h, modal, stars, toast } from './dom';
 
 export const VERSION = '1.0.0';
@@ -388,6 +388,8 @@ export class App {
     const p = this.pre!;
     const st = p.stage;
     const cap = squadCap(s, st);
+    // remember how many squads the player means to take, before squads with nobody ready drop out
+    setWantedSize(p, wantedSize(p, p.lineup.length));
     p.lineup = p.lineup.filter((id) => s.roster.some((r) => r.id === id && readyCount(r) > 0));
     // re-render in place: keep the scroll position so taps low on a small screen don't jump to the top
     const refresh = () => {
@@ -421,12 +423,13 @@ export class App {
               toast(`이 성에는 최대 ${cap}개 분대만 출전할 수 있습니다.`, 'warn');
               return;
             } else p.lineup.push(r.id);
+            setWantedSize(p, p.lineup.length);
             refresh();
           },
         },
         h('span', { class: 'check' }, on ? '✔' : ''),
         h('span', { class: 'glyph' }, SQUAD_TYPES[r.type].short, n ? h('i', { class: 'num' }, String(n)) : null),
-        h('span', { class: 'nm' }, r.name, h('small', null, ` ${RANK_NAMES[rankOf(r)]}`)),
+        h('span', { class: 'nm' }, h('b', null, r.name), h('small', null, RANK_NAMES[rankOf(r)])),
         h('span', { class: 'cnt' + (ready < SQUAD_TYPES[r.type].size ? ' short' : '') }, `${ready}/${SQUAD_TYPES[r.type].size}`, wounded ? h('small', { class: 'warn' }, ` 부상 ${wounded}`) : null, missing ? h('small', { class: 'muted' }, ` 결원 ${missing}`) : null),
       );
     });
@@ -446,7 +449,7 @@ export class App {
             if (r.err) toast(r.err, 'warn');
             if (r.done) {
               audio.play('coin');
-              p.lineup = readyLineup(s, st, p.lineup);
+              p.lineup = readyLineup(s, st, p.lineup, wantedSize(p, cap));
               toast(kind === 'fill' ? `${r.done}개 분대를 보충했습니다.` : `${r.done}개 분대를 치료했습니다.`, 'good', undefined, 1600);
             }
             this.persist();
@@ -543,7 +546,28 @@ export class App {
           );
     const planLine =
       cost > 0
-        ? h('p', { class: 'plan-line' + (cost > s.gold ? ' warn' : '') }, `보급 계획 ◉${fmt(cost)} — 전투 결과가 나올 때 지불 (보유 ◉${fmt(s.gold)})`)
+        ? h(
+            'div',
+            { class: 'plan-line' + (cost > s.gold ? ' warn' : '') },
+            h('span', null, `보급 계획 ◉${fmt(cost)} — 전투 결과가 나올 때 지불 (보유 ◉${fmt(s.gold)})`),
+            // over budget (e.g. after a defeat): one tap cuts the plan down to the gold instead of many "−" taps
+            cost > s.gold
+              ? h(
+                  'button',
+                  {
+                    class: 'btn small primary',
+                    onclick: () => {
+                      const fit = fitPlan(p.extra, s.gold);
+                      p.extra = fit.extra;
+                      audio.play('click');
+                      toast(`보급 계획을 ${fit.dropped}묶음 줄였습니다 (◉${fmt(planCost(p.extra))}).`, 'info', undefined, 1800);
+                      refresh();
+                    },
+                  },
+                  '보유 금화에 맞추기',
+                )
+              : null,
+          )
         : h('p', { class: 'muted small' }, '추가 보급은 계획만 해 두고, 전투 결과가 나올 때 금화를 냅니다.');
     // ---- lineup presets
     const slots = hasFlag(s, 'presets') ? 5 : 1;
@@ -700,8 +724,17 @@ export class App {
     if (retry && this.pre) {
       if (this.pre.mode !== 'daily') this.pre.seed = (Math.random() * 1e9) | 0;
       if (this.pre.mode === 'endless') this.pre.stage = endlessStage(this.pre.seed);
-      // after losses go out with squads that can fight: drop empty ones, swap broken ones, fill free slots
-      this.pre.lineup = res ? readyLineup(this.save, this.pre.stage, this.pre.lineup) : this.pre.lineup.filter((id) => this.save.roster.some((r) => r.id === id && readyCount(r) > 0));
+      // after losses go out with squads that can fight: drop empty ones and swap broken ones, but keep the
+      // number of squads the player chose (a deliberately small lineup stays small)
+      const want = this.pre.lineup.length;
+      setWantedSize(this.pre, want);
+      this.pre.lineup = res ? readyLineup(this.save, this.pre.stage, this.pre.lineup, want) : this.pre.lineup.filter((id) => this.save.roster.some((r) => r.id === id && readyCount(r) > 0));
+      // a defeat can leave too little gold for the same supply plan: cut it to fit rather than refuse the start
+      const fit = fitPlan(this.pre.extra, this.save.gold);
+      if (fit.dropped) {
+        this.pre.extra = fit.extra;
+        toast(`금화가 모자라 보급 계획을 ${fit.dropped}묶음 줄였습니다.`, 'warn', undefined, 3000);
+      }
       this.go('prebattle');
       return;
     }

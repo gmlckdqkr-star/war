@@ -10,9 +10,9 @@
  *  - Pause is tactical: every order still works while paused.
  *  - Until the first contact of a wave the battle runs fast-forward on its own (same sim steps, less waiting).
  */
-import { DT, SQUAD_TYPES, TILE } from '../sim/defs';
+import { DT, SQUAD_TYPES, TILE, Tile } from '../sim/defs';
 import { tileAt, tx, ty } from '../sim/grid';
-import { particle, type JosaPair } from '../sim/josa';
+import { hasFinal, particle, type JosaPair } from '../sim/josa';
 import type { StageDef } from '../sim/stages';
 import { ABILITY_INFO, ST, World, type AbilityId, type BattleConfig, type BattleResult, type GameEvent, type Squad, type Stance, type Unit } from '../sim/world';
 import { cosmeticById } from '../meta/cosmetics';
@@ -55,6 +55,20 @@ const ROMAN: Record<string, number> = { I: 1, II: 2, III: 3, IV: 4, V: 5, VI: 6,
 export function nameJosa(name: string, pair: JosaPair): string {
   const spoken = name.replace(/\s([IVX]+)$/, (m, r: string) => (ROMAN[r] ? ' ' + ROMAN[r] : m));
   return name + particle(spoken, pair);
+}
+
+/** "무리이(가)" style particle placeholders in event texts, with the particle pair each stands for. */
+const PLACEHOLDER: Record<string, JosaPair | 'wa'> = { '이(가)': '이/가', '을(를)': '을/를', '은(는)': '은/는', '(으)로': '으로/로', '으로(로)': '으로/로', '와(과)': 'wa', '과(와)': 'wa' };
+
+/** Replace particle placeholders after a word with the particle that word takes ("징집병 무리이(가)" → "징집병 무리가"). */
+export function fixParticles(text: string): string {
+  if (!text.includes('(')) return text;
+  return text.replace(/(\S+?)(이\(가\)|을\(를\)|은\(는\)|\(으\)로|으로\(로\)|와\(과\)|과\(와\))/g, (_m, word: string, ph: string) => {
+    const pair = PLACEHOLDER[ph];
+    const spoken = word.replace(/^([IVX]+)$/, (r: string) => (ROMAN[r] ? String(ROMAN[r]) : r));
+    if (pair === 'wa') return word + (hasFinal(spoken) ? '과' : '와');
+    return word + particle(spoken, pair);
+  });
 }
 
 /**
@@ -111,6 +125,10 @@ export class BattleView {
   private interKey = '';
   private councilNames = new Map<string, string>();
   private laidOut = false;
+  /** where the alert column sits: top-left or top-right, and how far below the top bar */
+  private toastPos = { left: false, dy: 0 };
+  /** the castle's wall ring in world px (opening view, alert placement) */
+  private castle: { x0: number; y0: number; x1: number; y1: number } | undefined;
 
   constructor(app: App, setup: BattleSetup) {
     this.app = app;
@@ -133,7 +151,8 @@ export class BattleView {
     this.renderer.attach(this.world);
     this.renderer.deployMode = true;
     const g = this.world.grid;
-    this.renderer.cam.focusCastle(g.keepX, g.keepY);
+    this.castle = this.castleBox();
+    this.renderer.cam.focusCastle(g.keepX, g.keepY, this.castle);
     this.laidOut = true;
     this.bindInput();
     this.ro = new ResizeObserver(() => this.layout());
@@ -148,8 +167,9 @@ export class BattleView {
     this.destroyed = true;
     cancelAnimationFrame(this.raf);
     this.ro?.disconnect();
-    document.body.classList.remove('in-battle');
+    document.body.classList.remove('in-battle', 'toasts-left');
     document.body.style.removeProperty('--battle-top');
+    document.body.style.removeProperty('--toast-dy');
     this.app.save.stats.playSeconds += (performance.now() - this.playStart) / 1000;
     this.root.remove();
   }
@@ -158,6 +178,26 @@ export class BattleView {
 
   private speeds() {
     return [1, 2, 3, ...(hasFlag(this.app.save, 'speed4') ? [4] : [])];
+  }
+
+  /** World-px box around the castle's wall ring and keep (field rubble left out), for the opening view. */
+  private castleBox() {
+    const g = this.world.grid;
+    let x0 = Infinity;
+    let y0 = Infinity;
+    let x1 = -Infinity;
+    let y1 = -Infinity;
+    for (let i = 0; i < g.n; i++) {
+      const t = g.tiles[i];
+      if (t !== Tile.WALL && t !== Tile.TOWER && t !== Tile.GATE && t !== Tile.GATE_BROKEN && t !== Tile.KEEP) continue;
+      const x = tx(i);
+      const y = ty(i);
+      if (x < x0) x0 = x;
+      if (x > x1) x1 = x;
+      if (y < y0) y0 = y;
+      if (y > y1) y1 = y;
+    }
+    return x1 < 0 ? undefined : { x0: x0 * TILE, y0: y0 * TILE, x1: (x1 + 1) * TILE, y1: (y1 + 1) * TILE };
   }
 
   /** Fit the canvas between the HUD bars. The map never jumps: the world point under the screen centre stays put. */
@@ -302,7 +342,8 @@ export class BattleView {
       this.targeting = null;
       audio.play('select');
       haptic(this.app.save.settings.haptics, 8);
-      this.firstHint('select', '땅을 탭하면 이동, 적을 탭하면 집중 공격.');
+      // while deploying the banner says how to place; enemy focus only makes sense once the battle runs
+      if (this.world.state !== 'deploy') this.firstHint('select', '땅 탭: 이동 · 적 탭: 집중 공격');
     }
     this.renderStrip();
     this.updateHud(true);
@@ -476,12 +517,14 @@ export class BattleView {
     let cls = '';
     if (w.state === 'deploy') {
       const first = this.edgeText(w.nextWaveEdges());
-      text = `배치 — 깃발을 끌어 파란 칸에 두세요${first ? ` · 첫 공세: ${first}` : ''}`;
+      const how = this.selected ? `${this.selected.name}: 파란 칸을 탭해 배치` : '배치 — 깃발을 끌어 파란 칸에 두세요';
+      text = `${how}${first ? ` · 첫 공세: ${first}` : ''}`;
       cls = 'deploy';
     } else if (this.targeting) {
       text = `${ABILITY_INFO[this.targeting].name}: 지도에서 지점을 탭하세요 (다시 누르면 취소)`;
       cls = 'target';
-    } else if (this.paused) {
+    } else if (this.paused && w.state !== 'intermission') {
+      // in an intermission the panel shows the pause itself, so no second banner over the castle
       text = '일시정지 — 명령은 계속 내릴 수 있습니다';
       cls = 'paused';
     } else if (this.approaching) {
@@ -493,6 +536,87 @@ export class BattleView {
     this.updateInter();
     E.start.style.display = w.state === 'deploy' ? '' : 'none';
     if (this.selected && this.selected.alive === 0) this.select(null);
+    this.updateOccluders();
+    this.placeToasts();
+  }
+
+  /** HUD panels over the map, so the renderer keeps approach arrows out from under them. */
+  private updateOccluders() {
+    const E = this.els;
+    const cr = this.canvas.getBoundingClientRect();
+    const out: { x0: number; y0: number; x1: number; y1: number }[] = [];
+    // each side column as one block (the buttons and the gaps between them)
+    const block = (els: Element[]) => {
+      const rs = els.map((el) => el.getBoundingClientRect()).filter((r) => r.width > 0 && r.height > 0);
+      if (!rs.length) return;
+      out.push({
+        x0: Math.min(...rs.map((r) => r.left)) - cr.left,
+        y0: Math.min(...rs.map((r) => r.top)) - cr.top,
+        x1: Math.max(...rs.map((r) => r.right)) - cr.left,
+        y1: Math.max(...rs.map((r) => r.bottom)) - cr.top,
+      });
+    };
+    block([...E.left.children]);
+    block([...E.right.children]);
+    if (!E.inter.classList.contains('hidden')) block([E.inter]);
+    if (!E.banner.classList.contains('hidden')) block([E.banner]);
+    this.renderer.occluders = out;
+  }
+
+  /**
+   * Put the alert column (top-left or top-right, right under the top bar or one arrow lower) where it hides
+   * the least: never on an approach arrow if any spot is free, then away from off-screen alerts, the keep,
+   * banners and enemies. While alerts are showing they only move for a clearly better spot.
+   */
+  private placeToasts() {
+    const root = document.querySelector<HTMLElement>('.toasts');
+    const showing = !!root && root.childElementCount > 0;
+    const r = this.renderer;
+    const cam = r.cam;
+    const colW = root?.offsetWidth || Math.min(250, window.innerWidth * 0.38);
+    const side = 72;
+    const stackH = showing ? Math.max(28, root!.offsetHeight) : 58;
+    const pts: { x: number; y: number; wt: number }[] = [];
+    for (const p of r.approachPts) pts.push({ x: p.x, y: p.y, wt: 100 });
+    for (const p of r.edgePts) pts.push({ x: p.x, y: p.y, wt: 30 });
+    const g = this.world.grid;
+    pts.push({ x: cam.toScreenX(g.keepX), y: cam.toScreenY(g.keepY), wt: 5 });
+    // the castle itself is where squads fight: prefer covering open field (cost by the share of the column over it)
+    const cb = this.castle;
+    const cs = cb ? { x0: cam.toScreenX(cb.x0), y0: cam.toScreenY(cb.y0), x1: cam.toScreenX(cb.x1), y1: cam.toScreenY(cb.y1) } : null;
+    for (const sq of this.world.squads) if (sq.alive > 0) pts.push({ ...r.bannerScreen(sq), wt: 3 });
+    for (const e of this.world.activeEnemies) pts.push({ x: cam.toScreenX(e.x), y: cam.toScreenY(e.y), wt: 1 });
+    const cands = [
+      { left: false, dy: 0, pen: 0 },
+      { left: true, dy: 0, pen: 1 },
+      { left: false, dy: 44, pen: 4 },
+      { left: true, dy: 44, pen: 5 },
+    ];
+    const cost = (c: (typeof cands)[number]) => {
+      const x0 = c.left ? side : cam.w - side - colW;
+      const x1 = x0 + colW;
+      const y0 = cam.insetTop + c.dy;
+      const y1 = y0 + stackH;
+      let sum = c.pen;
+      for (const p of pts) if (p.x > x0 - 12 && p.x < x1 + 12 && p.y > y0 - 12 && p.y < y1 + 12) sum += p.wt;
+      if (cs) sum += (12 * Math.max(0, Math.min(x1, cs.x1) - Math.max(x0, cs.x0)) * Math.max(0, Math.min(y1, cs.y1) - Math.max(y0, cs.y0))) / ((x1 - x0) * (y1 - y0));
+      return sum;
+    };
+    const cur = cands.find((c) => c.left === this.toastPos.left && c.dy === this.toastPos.dy) ?? cands[0];
+    const cc = cost(cur);
+    let best = cur;
+    let bc = cc;
+    for (const c of cands) {
+      const k = cost(c);
+      if (k < bc) {
+        bc = k;
+        best = c;
+      }
+    }
+    if (best === cur || (showing && cc - bc < 10)) return;
+    this.toastPos = { left: best.left, dy: best.dy };
+    document.body.classList.toggle('toasts-left', best.left);
+    document.body.style.setProperty('--toast-dy', `${best.dy}px`);
   }
 
   /** Intermission panel: countdown, where the next wave comes from, and the war council choice. */
@@ -520,6 +644,7 @@ export class BattleView {
     if (key !== this.interKey) {
       this.interKey = key;
       clear(E.inter);
+      const go = h('button', { class: 'btn small primary inter-go', onclick: () => this.world.skipIntermission() }, h('span', null, '바로 시작'), h('small', null, ' +◉'));
       const head = h(
         'div',
         { class: 'inter-head' },
@@ -527,7 +652,8 @@ export class BattleView {
         h('span', { class: 'inter-t' }),
         h('span', { class: 'inter-dir' }),
         pick ? h('span', { class: 'inter-pick' }, `✔ ${this.councilNames.get(pick) ?? pick}`) : null,
-        h('button', { class: 'btn small primary inter-go', onclick: () => this.world.skipIntermission() }, '바로 시작 +◉'),
+        // with council options the button joins their row as a full-height target, so the panel stays low
+        showOpts ? null : go,
       );
       E.inter.append(head);
       if (showOpts) {
@@ -543,6 +669,7 @@ export class BattleView {
                 h('small', null, o.desc),
               ),
             ),
+            go,
           ),
         );
       }
@@ -551,7 +678,8 @@ export class BattleView {
       this.root.classList.add('inter-on');
       this.root.style.setProperty('--inter-h', `${E.inter.offsetHeight}px`);
     }
-    (E.inter.querySelector('.inter-t') as HTMLElement).textContent = `다음 물결 ${Math.max(0, Math.ceil(w.interT))}초`;
+    E.inter.classList.toggle('paused', this.paused);
+    (E.inter.querySelector('.inter-t') as HTMLElement).textContent = `${this.paused ? '⏸ ' : ''}다음 물결 ${Math.max(0, Math.ceil(w.interT))}초`;
     const dir = this.edgeText(w.nextWaveEdges());
     (E.inter.querySelector('.inter-dir') as HTMLElement).textContent = dir ? `다음 공세: ${dir}` : '';
   }
@@ -695,6 +823,7 @@ export class BattleView {
     const w = this.world;
     if (!w.events.length) return;
     const evs = w.events.splice(0, w.events.length);
+    this.placeToasts();
     for (const e of evs) this.onEvent(e);
   }
 
@@ -717,7 +846,7 @@ export class BattleView {
     }
     if (e.type === 'cleared') audio.play('coin');
     // short-lived: the map matters more than the log
-    toast(e.text, e.level === 'good' ? 'good' : e.level, jump, e.level === 'danger' ? 3000 : 2000);
+    toast(fixParticles(e.text), e.level === 'good' ? 'good' : e.level, jump, e.level === 'danger' ? 3000 : 2000);
     if (e.type === 'breach') this.firstHint('breach', '돌파구! 근접 분대를 보내거나 "본성 후퇴"를 누르세요.');
     if (e.type === 'rout') this.firstHint('rout', '사기가 무너진 분대는 도주합니다. "함성"으로 붙잡으세요.');
   }

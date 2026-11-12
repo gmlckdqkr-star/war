@@ -35,13 +35,26 @@ export class Camera {
     this.clamp();
   }
 
-  /** opening view: fill the free height, keep the castle (east side) in view */
-  focusCastle(kx: number, _ky: number) {
+  /**
+   * Opening view: fill the free height and keep the castle (east side) in view. With `box` (the castle's
+   * walls in world px) the whole wall ring stays between the HUD bars: the view shifts, and zooms out
+   * only as far as it must.
+   */
+  focusCastle(kx: number, _ky: number, box?: { x0: number; y0: number; x1: number; y1: number }) {
     const ah = Math.max(100, this.h - this.insetTop - this.insetBottom);
-    this.zoom = Math.min(this.maxZoom, Math.max(this.fitZoom(), ah / (WORLD_H * 0.78)));
+    const pad = 8; // screen px kept free between the walls and a HUD bar
+    let z = Math.min(this.maxZoom, Math.max(this.fitZoom(), ah / (WORLD_H * 0.78)));
+    if (box && (box.y1 - box.y0) * z > ah - 2 * pad) z = Math.max(this.fitZoom(), (ah - 2 * pad) / Math.max(1, box.y1 - box.y0));
+    this.zoom = z;
     const vw = this.w / this.zoom;
     this.x = vw >= WORLD_W ? WORLD_W / 2 : Math.min(WORLD_W - vw / 2, Math.max(vw / 2, kx - vw * 0.2));
     this.y = WORLD_H / 2;
+    if (box) {
+      const half = ah / 2 / z;
+      const p = pad / z;
+      if (box.y1 + p > this.y + half) this.y = box.y1 + p - half;
+      if (box.y0 - p < this.y - half) this.y = box.y0 - p + half;
+    }
     this.clamp();
   }
 

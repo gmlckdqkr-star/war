@@ -391,6 +391,10 @@ section {
   font-weight: 700;
   color: var(--accent);
   margin: 6px 0 2px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
 }
 .plan-line.warn {
   color: var(--warn);
@@ -452,6 +456,31 @@ section {
 .lineup-row .check {
   color: var(--accent);
   font-weight: 900;
+}
+/* squad name on one line (cut with … if it must be), rank under it: never broken mid-word */
+.lineup-row .nm {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.2;
+}
+.lineup-row .nm b {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.lineup-row .nm small {
+  color: var(--muted);
+  font-size: 0.78em;
+}
+.lineup-row .cnt {
+  text-align: right;
+  word-break: keep-all;
+}
+/* the sticky header is opaque here, so the scrolled lineup does not show through it */
+.prebattle .topbar {
+  background: #1a1612;
 }
 .glyph {
   width: 30px;
@@ -1082,6 +1111,7 @@ html.reduce-motion * {
   bottom: calc(var(--hud-bottom, 76px) + 6px);
   left: 50%;
   transform: translateX(-50%);
+  width: max-content;
   background: rgba(20, 16, 12, 0.88);
   border: 1px solid var(--line);
   border-radius: 20px;
@@ -1100,6 +1130,13 @@ html.reduce-motion * {
 }
 .hud-banner.paused {
   border-color: var(--blue);
+}
+/* deploy instructions wrap instead of cutting off the first-wave direction */
+.hud-banner.deploy {
+  white-space: normal;
+  word-break: keep-all;
+  text-align: center;
+  border-radius: 14px;
 }
 /* automatic fast-forward until the first contact of a wave */
 .hud-banner.ff {
@@ -1175,6 +1212,11 @@ html.reduce-motion * {
 .ability.ready {
   opacity: 1;
   border-color: var(--accent);
+}
+/* big text: wider side buttons so labels such as "끓는 기름" keep a clear margin (still inside the 72 px gutter) */
+html.big-text .side-btn,
+html.big-text .ability {
+  width: 64px;
 }
 .ability.armed {
   background: var(--warn);
@@ -1402,20 +1444,36 @@ html.reduce-motion * {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.inter-go {
+.inter .inter-go {
   margin-left: auto;
   flex: none;
+  min-height: 44px;
+}
+.inter.paused {
+  border-color: var(--blue);
 }
 .council-title {
   color: var(--gold);
 }
 .council {
-  display: grid;
-  grid-auto-flow: column;
-  grid-auto-columns: minmax(0, 1fr);
+  display: flex;
   gap: 6px;
 }
+/* with council options the start button is the last cell of their row */
+.inter .council .inter-go {
+  margin: 0;
+  width: 72px;
+  min-height: 52px;
+  padding: 2px 4px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  line-height: 1.2;
+}
 .council-opt {
+  flex: 1 1 0;
   min-height: 52px;
   min-width: 0;
   border-radius: 10px;
@@ -1439,6 +1497,7 @@ html.reduce-motion * {
   text-overflow: ellipsis;
 }
 .council-opt small {
+  word-break: keep-all;
   font-size: 0.7rem;
   line-height: 1.25;
   color: #d8ccb4;
@@ -1613,12 +1672,16 @@ html.reduce-motion * {
   .hud-right {
     bottom: calc(100px + var(--sab));
   }
+  .hud-banner {
+    max-width: calc(100vw - 24px);
+  }
 }
 
-/* alerts during battle sit top-right, clear of the enemy approach (west), the ability column and the controls;
-   at most two at a time (see toast()) */
+/* alerts during battle sit in a top corner between the side columns, at most two at a time (see toast()).
+   BattleView.placeToasts() picks the corner (body.toasts-left) and drop (--toast-dy) that hides the least:
+   never an approach arrow when a spot is free, then the keep, banners and enemies. */
 .in-battle .toasts {
-  top: calc(var(--battle-top, 48px) + 4px);
+  top: calc(var(--battle-top, 48px) + 4px + var(--toast-dy, 0px));
   left: auto;
   right: calc(72px + var(--sar));
   transform: none;
@@ -1626,17 +1689,50 @@ html.reduce-motion * {
   align-items: stretch;
   gap: 4px;
 }
+.in-battle.toasts-left .toasts {
+  right: auto;
+  left: calc(72px + var(--sal));
+}
 .in-battle .toast {
+  display: flex;
+  align-items: center;
   font-size: 0.78em;
   line-height: 1.3;
   padding: 4px 9px;
   background: rgba(28, 24, 19, 0.82);
+}
+.in-battle .toast .tt {
+  flex: 1 1 auto;
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.in-battle .toast.hint {
+.in-battle .toast.hint .tt {
   white-space: normal;
+}
+/* an alert that jumps to its place: 32 px tall, and the touch area reaches 6 px further up and down (44 px) */
+.in-battle .toast.tappable {
+  position: relative;
+  min-height: 32px;
+}
+.in-battle .toast.tappable::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -6px;
+  bottom: -6px;
+}
+.in-battle .toast.tappable::after {
+  flex: none;
+  padding-left: 4px;
+}
+/* portrait: alerts use the whole gap between the side columns */
+@media (max-width: 560px) {
+  .in-battle .toasts {
+    width: min(250px, calc(100vw - 144px));
+  }
 }
 /* prebattle: start button always reachable */
 .prebattle .pre-actions {

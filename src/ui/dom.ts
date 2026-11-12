@@ -42,7 +42,8 @@ export function toast(text: string, level: 'info' | 'good' | 'warn' | 'danger' =
   }
   // the same alert again replaces the old copy instead of stacking up
   for (const old of [...toastRoot.children]) if (old.textContent === text) old.remove();
-  const t = h('div', { class: `toast ${level}${cls ? ' ' + cls : ''}`, role: 'status' }, text);
+  // the text sits in its own span, so a battle alert can cut it with "…" while its touch area reaches past its edge
+  const t = h('div', { class: `toast ${level}${cls ? ' ' + cls : ''}`, role: 'status' }, h('span', { class: 'tt' }, text));
   if (onTap) {
     t.classList.add('tappable');
     t.addEventListener('pointerdown', (e) => {

@@ -87,6 +87,12 @@ export class Renderer {
   labels = new Map<number, string>();
   /** soldiers drawn in the last frame (debug / e2e) */
   drawnUnits = 0;
+  /** screen rects (CSS px) covered by HUD panels: screen-space markers are kept out from under them */
+  occluders: { x0: number; y0: number; x1: number; y1: number }[] = [];
+  /** approach arrows drawn in the last frame (screen CSS px), for HUD placement and tests */
+  approachPts: { x: number; y: number; edge: string }[] = [];
+  /** off-screen alert arrows drawn in the last frame (screen CSS px) */
+  edgePts: { x: number; y: number }[] = [];
   private buckets = new Map<string, Unit[]>();
   private tileRng = new RNG(1);
   onSound: (k: string, x: number, y: number) => void = () => {};
@@ -583,7 +589,6 @@ export class Renderer {
     ctx.drawImage(this.decals, 0, 0, WORLD_W, WORLD_H);
     this.drawStructOverlays(w);
     if (this.deployMode) this.drawDeployZones(w);
-    if (this.deployMode || w.state === 'intermission') this.drawApproach(w);
     this.drawFires(w);
     this.drawLadders(w);
     this.drawSelection(w);
@@ -609,6 +614,9 @@ export class Renderer {
       ctx.stroke();
     }
     ctx.setTransform(1, 0, 0, 1, 0, 0);
+    // screen-space overlays
+    if (this.deployMode || w.state === 'intermission') this.drawApproach(w);
+    else this.approachPts.length = 0;
     this.drawEdgeIndicators(w);
   }
 
@@ -676,48 +684,70 @@ export class Renderer {
     ctx.stroke();
   }
 
-  /** Red arrows on the map edge for the edges the next wave comes from (deploy and intermission only). */
+  /**
+   * Red arrows for the edges the next wave comes from (deploy and intermission only). Drawn in screen space
+   * at the map edge where that wave's groups enter, but always inside the free area between the HUD bars and
+   * pushed out from under HUD panels (`occluders`), so a northern wave is never announced under the top bar.
+   */
   private drawApproach(w: World) {
-    const ctx = this.ctx;
+    this.approachPts.length = 0;
     const edges = w.nextWaveEdges();
     if (!edges.length) return;
+    const ctx = this.ctx;
+    const cam = this.cam;
     // place arrows where that wave's groups enter when the stage data says so
     const waves = w.stage.waves;
     const wi = w.state === 'deploy' ? 0 : w.state === 'intermission' ? w.waveIdx + 1 : Math.max(0, w.waveIdx);
     const wave = waves[Math.min(Math.max(0, wi), waves.length - 1)];
-    const s = Math.max(1, 0.9 / this.cam.zoom);
-    const arrow = (x: number, y: number, ang: number) => {
-      ctx.save();
-      ctx.translate(x, y);
-      ctx.rotate(ang);
-      ctx.scale(s, s);
-      ctx.beginPath();
-      ctx.moveTo(14, 0);
-      ctx.lineTo(-6, -10);
-      ctx.lineTo(-2, 0);
-      ctx.lineTo(-6, 10);
-      ctx.closePath();
-      ctx.fill();
-      ctx.stroke();
-      ctx.restore();
-    };
-    ctx.fillStyle = 'rgba(235,70,55,0.85)';
-    ctx.strokeStyle = 'rgba(40,10,5,0.8)';
-    ctx.lineWidth = 1.2;
-    const pulse = this.reduceMotion ? 0 : 4 * Math.sin(this.time * 4);
-    const m = 18 * s;
+    const R = 14; // half size of the arrow in screen px
+    const x0 = R + 2;
+    const x1 = cam.w - R - 2;
+    const y0 = cam.insetTop + R + 2;
+    const y1 = cam.h - cam.insetBottom - R - 2;
     for (const e of edges) {
       const mids = (wave?.groups ?? []).filter((gr) => gr.edge === e).map((gr) => Math.round((gr.span[0] + gr.span[1]) / 2));
       const along = [...new Set(mids)].slice(0, 3);
       const len = e === 'W' || e === 'E' ? GH : GW;
       const pts = along.length ? along.map((v) => (Math.max(1, Math.min(len - 2, v)) + 0.5) * T) : [len * T * 0.35, len * T * 0.65];
       for (const at of pts) {
-        if (e === 'W') arrow(m + pulse, at, 0);
-        else if (e === 'E') arrow(WORLD_W - m - pulse, at, Math.PI);
-        else if (e === 'N') arrow(at, m + pulse, Math.PI / 2);
-        else if (e === 'S') arrow(at, WORLD_H - m - pulse, -Math.PI / 2);
+        let x = e === 'W' ? cam.toScreenX(0) + 18 : e === 'E' ? cam.toScreenX(WORLD_W) - 18 : cam.toScreenX(at);
+        let y = e === 'N' ? cam.toScreenY(0) + 18 : e === 'S' ? cam.toScreenY(WORLD_H) - 18 : cam.toScreenY(at);
+        x = Math.min(x1, Math.max(x0, x));
+        y = Math.min(y1, Math.max(y0, y));
+        // out from under HUD panels, along the way the wave walks in
+        for (let k = 0; k < 3; k++) {
+          const o = this.occluders.find((r) => x + R > r.x0 && x - R < r.x1 && y + R > r.y0 && y - R < r.y1);
+          if (!o) break;
+          if (e === 'W') x = o.x1 + R + 2;
+          else if (e === 'E') x = o.x0 - R - 2;
+          else if (e === 'N') y = o.y1 + R + 2;
+          else y = o.y0 - R - 2;
+        }
+        this.approachPts.push({ x, y, edge: e });
       }
     }
+    const pulse = this.reduceMotion ? 0 : 4 * Math.sin(this.time * 4);
+    const ang: Record<string, number> = { W: 0, E: Math.PI, N: Math.PI / 2, S: -Math.PI / 2 };
+    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    ctx.fillStyle = 'rgba(235,70,55,0.92)';
+    ctx.strokeStyle = 'rgba(40,10,5,0.85)';
+    ctx.lineWidth = 1.5;
+    for (const p of this.approachPts) {
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(ang[p.edge] ?? 0);
+      ctx.translate(pulse - 3, 0);
+      ctx.beginPath();
+      ctx.moveTo(R, 0);
+      ctx.lineTo(-R * 0.55, -R * 0.8);
+      ctx.lineTo(-R * 0.2, 0);
+      ctx.lineTo(-R * 0.55, R * 0.8);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      ctx.restore();
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
   }
 
   private drawFires(w: World) {
@@ -1332,12 +1362,14 @@ export class Renderer {
     const m = 22;
     const top = cam.insetTop + m;
     const bottom = cam.h - cam.insetBottom - m;
+    this.edgePts.length = 0;
     for (const p of pts.slice(0, 12)) {
       const sx = cam.toScreenX(p.x);
       const sy = cam.toScreenY(p.y);
       if (sx > m && sx < cam.w - m && sy > top && sy < bottom) continue;
       const ex = Math.min(cam.w - m, Math.max(m, sx));
       const ey = Math.min(bottom, Math.max(top, sy));
+      this.edgePts.push({ x: ex, y: ey });
       const ang = Math.atan2(sy - ey, sx - ex);
       ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
       ctx.save();
