@@ -826,15 +826,28 @@ export class World {
     return this.grid.tiles[i] === Tile.GATE && !this.grid.gateShut[i];
   }
 
+  /**
+   * A gate opened or shut: only paths between the field and the courtyard change, so only squads with
+   * a post or a man outside the walls need new fields (and the retreat fields, if anyone is outside).
+   */
   refreshSquadFields() {
     this.defFieldsDirty = false;
     this.lastDefFieldT = this.t;
-    this.computeDefenderFields();
+    const g = this.grid;
+    const out = (i: number) => g.inside[i] === 0 && !g.isBoundary(i);
     for (const sq of this.squads) {
+      sq.tfieldTile = -1; // per-task approach fields are rebuilt on their next use
       if (sq.alive === 0 || !sq.slots.length) continue;
-      this.grid.defenderField(sq.slots, sq.field);
-      sq.tfieldTile = -1;
+      let affected = sq.slots.some(out);
+      if (!affected)
+        for (const u of sq.units)
+          if (u.state === ST.ACTIVE && out(tileAt(u.x, u.y))) {
+            affected = true;
+            break;
+          }
+      if (affected) g.defenderField(sq.slots, sq.field);
     }
+    if (this.activeDefs.some((u) => out(tileAt(u.x, u.y)))) this.computeDefenderFields();
   }
 
   recomputeFields() {
