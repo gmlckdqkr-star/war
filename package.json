@@ -1,0 +1,25 @@
+{
+  "name": "ashen-ramparts",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "잿빛 성벽 (Ashen Ramparts) - offline mobile siege defense game",
+  "scripts": {
+    "dev": "vite --host",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host --port 4173",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "balance": "tsx scripts/balance.ts",
+    "e2e": "node scripts/e2e.mjs",
+    "icons": "node scripts/icons.mjs",
+    "diag": "tsx scripts/diag.ts",
+    "check": "npm run build && npm test && npm run e2e"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.0",
+    "typescript": "~5.9.3",
+    "vite": "^8.3.8",
+    "vitest": "^5.1.0"
+  }
+}

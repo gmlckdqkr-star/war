@@ -1,0 +1,13 @@
+{
+  "appId": "com.example.ashenramparts",
+  "appName": "잿빛 성벽",
+  "webDir": "dist",
+  "android": {
+    "allowMixedContent": false,
+    "captureInput": true,
+    "webContentsDebuggingEnabled": false
+  },
+  "ios": {
+    "contentInset": "never"
+  }
+}
