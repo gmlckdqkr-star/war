@@ -16,12 +16,13 @@ import { hasFinal, particle, type JosaPair } from '../sim/josa';
 import type { StageDef, Supplies } from '../sim/stages';
 import { ABILITY_INFO, ST, World, type AbilityId, type BattleConfig, type BattleResult, type GameEvent, type Squad, type Stance } from '../sim/world';
 import { cosmeticById } from '../meta/cosmetics';
-import { RANK_NAMES } from '../meta/progression';
+import { RANK_NAMES, type Rewards } from '../meta/progression';
 import { hasFlag } from '../meta/shop';
 import { Renderer, type Theme } from '../render/renderer';
 import { audio, haptic } from './audio';
 import { bar, clear, confirmBox, fmt, h, modal, stars, toast } from './dom';
 import { Charges } from './orders';
+import { rewardLines } from './prebattle';
 import { BattleRecorder, clearRecord, newBattleId, saveRecord, stageSig, storableCfg, type BattleMode, type BattleRecord, type StageRef } from './resume';
 import { RESUME_VER } from './version';
 import type { App } from './app';
@@ -52,6 +53,13 @@ export interface ResumedBattle {
 
 /** real time between automatic resume saves while the battle runs */
 const RESUME_SAVE_MS = 20000;
+
+/** The reward lines of a settled battle (result screen and the "포기" summary list the same). */
+export function rewardList(rw: Rewards, cls?: string): HTMLElement | null {
+  const lines = rewardLines(rw);
+  if (!lines.length) return null;
+  return h('ul', cls ? { class: cls } : null, ...lines.map((l) => h('li', l.good ? { class: 'good' } : null, l.text)));
+}
 
 const STANCE_NAMES: Record<Stance, string> = { hold: '고수', defend: '방어', aggressive: '추격' };
 const EDGE_NAMES: Record<string, string> = { W: '서쪽', N: '북쪽', S: '남쪽', E: '동쪽' };
@@ -1309,14 +1317,7 @@ export class BattleView {
         'div',
         { class: 'rewards' },
         h('h3', null, `보상: 금화 ${fmt(rw.gold)}${rw.medals ? ` · 훈장 ${rw.medals}` : ''} · 연대기 ${rw.passXp}xp`),
-        h(
-          'ul',
-          null,
-          ...rw.lines.map((l) => h('li', null, l)),
-          ...rw.unlocked.map((l) => h('li', { class: 'good' }, '🔓 ' + l)),
-          ...rw.promoted.map((l) => h('li', { class: 'good' }, '⬆ 진급 ' + l)),
-          ...rw.achievements.map((l) => h('li', { class: 'good' }, '🏅 업적: ' + l)),
-        ),
+        rewardList(rw),
       ),
       h('details', { class: 'squad-stats' }, h('summary', null, '분대별 전과'), h('table', null, h('tr', null, h('th', null, '분대'), h('th', null, '처치'), h('th', null, '전사'), h('th', null, '부상')), ...squadRows)),
       h(
