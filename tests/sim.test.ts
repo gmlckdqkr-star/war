@@ -125,6 +125,7 @@ describe('siege engines', () => {
     const g = w.grid;
     let climber: Unit | undefined;
     for (let i = 0; i < 30 * 120 && !climber; i++) {
+      for (const e of w.enemies) e.hp = e.maxHp; // whatever the castle's strength, let them reach the wall
       w.step();
       climber = w.enemies.find((e) => e.state === ST.CLIMB);
     }
