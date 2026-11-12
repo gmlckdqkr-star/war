@@ -3,7 +3,7 @@
  */
 import { SQUAD_TYPES, FACTIONS, BANDS, UNITS, type SquadTypeId } from '../sim/defs';
 import { STAGES, dailyChallenge, dailyKey, endlessStage, type StageDef, type Supplies } from '../sim/stages';
-import type { BattleResult } from '../sim/world';
+import { World, type BattleConfig, type BattleResult } from '../sim/world';
 import { cosmeticById, seasonCosmetics, type Cosmetic } from '../meta/cosmetics';
 import {
   ACHIEVEMENTS,
@@ -12,7 +12,6 @@ import {
   SQUAD_PRICE,
   SUPPLY_PRICE,
   UPGRADES,
-  applyBattle,
   baseSupplies,
   battleConfig,
   buySquad,
@@ -33,7 +32,7 @@ import {
   upgradeCost,
   type Rewards,
 } from '../meta/progression';
-import { exportCodeShort, importCodeAny, loadSave, newSave, writeSave, type KV, type SaveData } from '../meta/save';
+import { exportCodeShort, importCodeAny, loadSave, newSave, writeSave, type KV, type LoadResult, type SaveData } from '../meta/save';
 import {
   PASS_TIERS,
   XP_PER_TIER,
@@ -55,11 +54,13 @@ import { CANCELLED, MockIAP, type IAPAdapter } from '../meta/iap';
 import { REFUND_NOTICE, sellerLine } from '../meta/legal';
 import { cosmeticCard, cosmeticPreview } from './preview';
 import { audio } from './audio';
-import { BattleView, squadNumbers, type BattleMode, type BattleSetup } from './battle';
-import { MAX_PACKS, careAll, careCosts, fitPlan, foodForecast, lineupStrength, packsOf, planCost, readyLineup, setWantedSize, wantedSize } from './prebattle';
+import { BattleView, nameJosa, rewardList, squadNumbers, type BattleMode, type BattleSetup } from './battle';
+import { MAX_PACKS, careAll, careCosts, fitPlan, foodForecast, lineupStrength, packsOf, planCost, readyLineup, setWantedSize, settleBattle, wantedSize } from './prebattle';
 import { bar, clear, confirmBox, fmt, h, modal, stars, toast } from './dom';
+import { clearRecord, loadRecord, newBattleId, replay, resolveStage, stateHash, stageRefFor, stageSig, writeSaveMakingRoom, yieldToBrowser, type BattleRecord, type ReplayStats } from './resume';
+import { RESUME_VER, VERSION } from './version';
 
-export const VERSION = '1.0.0';
+export { VERSION };
 
 type Screen = 'home' | 'campaign' | 'barracks' | 'research' | 'chronicle' | 'shop' | 'settings' | 'help' | 'prebattle';
 
@@ -71,6 +72,8 @@ interface PrebattleState {
   seed: number;
   mods?: string[];
   modName?: string;
+  /** daily challenge inputs (date key + progress), so the same stage can be rebuilt after a resume */
+  daily?: { key: string; maxIdx: number };
 }
 
 export class App {
@@ -89,6 +92,16 @@ export class App {
   private storageBanner: HTMLElement | null = null;
   /** called after every successful save (native backup mirror) */
   afterPersist: (() => void) | null = null;
+  /** a saved battle is being rebuilt (progress overlay up): screens and the back button wait */
+  resuming = false;
+  /** timings of the last battle replay (resume or abandon), for tests and the error log */
+  lastReplay: (ReplayStats & { prepMs?: number; hashMs?: number; viewMs?: number }) | null = null;
+  /**
+   * A battle was settled but the save could not be written (storage full). Its resume record is kept
+   * until a save gets through: if the app dies first, the stored save does not have the result yet and
+   * the record lets the player settle it then (once). The save's battleDone marks it settled after that.
+   */
+  private settledUnsaved = false;
 
   constructor(root: HTMLElement, kv: KV, iap: IAPAdapter) {
     this.root = root;
@@ -116,9 +129,13 @@ export class App {
         }
       })
       .catch((e) => this.logError('iap-init', e));
+    // the interrupted battle is read before anything writes to storage: a boot save that has to make room
+    // (storage full) must not make it vanish without the player hearing of it
+    const pending = this.pendingResume(lr);
     this.updateStorageBanner();
     this.persist();
     this.go('home');
+    if (pending) void this.offerResume(pending);
     if (lr.source === 'backup' || lr.source === 'day') setTimeout(() => toast('저장 파일 손상을 감지해 백업에서 자동 복구했습니다.', 'warn', undefined, 5000), 600);
     if (lr.lost)
       setTimeout(
@@ -163,22 +180,29 @@ export class App {
 
   // ================================================================== infra
 
-  persist() {
+  /** Write the save. False when it did not reach storage (storage full: the banner says so). */
+  persist(): boolean {
     clearTimeout(this.saveTimer);
-    const ok = this.kv.mode !== 'memory' && writeSave(this.kv, this.save);
+    // the save matters more than a battle's resume point: the record makes room if that helps
+    const ok = this.kv.mode !== 'memory' && writeSaveMakingRoom(this.kv, () => writeSave(this.kv, this.save));
     if (ok) {
       if (this.kv.mode !== 'ok') this.kv.mode = 'ok';
       if (this.storageBanner) this.updateStorageBanner();
+      // the settled battle is in the stored save now: its resume record has nothing left to do
+      if (this.settledUnsaved) {
+        this.settledUnsaved = false;
+        clearRecord(this.kv);
+      }
       try {
         this.afterPersist?.();
       } catch {
         /* optional */
       }
-      return;
+      return true;
     }
     if (this.kv.mode === 'memory') {
       writeSave(this.kv, this.save);
-      return;
+      return true;
     }
     this.kv.mode = 'full';
     this.updateStorageBanner();
@@ -187,6 +211,7 @@ export class App {
       this.saveFailToastT = now;
       toast('저장 공간이 부족해 저장하지 못했습니다. 기기 저장 공간을 확인해 주세요.', 'danger', undefined, 5000);
     }
+    return false;
   }
 
   /** Errors are kept on the device only (no telemetry). Players can copy them from Settings if they want. */
@@ -211,7 +236,7 @@ export class App {
   }
 
   go(screen: Screen) {
-    if (this.battle) return;
+    if (this.battle || this.resuming) return;
     this.screen = screen;
     clear(this.screenRoot);
     try {
@@ -364,8 +389,9 @@ export class App {
       toast('2번째 성을 지킨 뒤 열립니다.', 'warn');
       return;
     }
-    const d = dailyChallenge(dailyKey(new Date()), maxCleared(s));
-    this.pre = { mode: 'daily', stage: d.stage, lineup: defaultLineup(s, d.stage), extra: {}, seed: d.seed, mods: [d.mod.id], modName: d.mod.name };
+    const daily = { key: dailyKey(new Date()), maxIdx: maxCleared(s) };
+    const d = dailyChallenge(daily.key, daily.maxIdx);
+    this.pre = { mode: 'daily', stage: d.stage, lineup: defaultLineup(s, d.stage), extra: {}, seed: d.seed, mods: [d.mod.id], modName: d.mod.name, daily };
     this.go('prebattle');
   }
 
@@ -692,9 +718,22 @@ export class App {
       return;
     }
     audio.unlock();
+    // a new battle replaces whatever resume point was left
+    clearRecord(this.kv);
+    this.settledUnsaved = false;
     const cfg = battleConfig(this.save, p.stage, p.lineup, p.extra, p.seed, { mods: p.mods });
     if (p.mode === 'endless') cfg.autoCommand = this.save.settings.autoCommand;
-    const setup: BattleSetup = { mode: p.mode, stage: p.stage, cfg, modName: p.modName, supplyCost };
+    const setup: BattleSetup = {
+      mode: p.mode,
+      stage: p.stage,
+      cfg,
+      modName: p.modName,
+      supplyCost,
+      ref: stageRefFor(p.mode, p.stage, p.seed, p.daily),
+      extra: { ...p.extra },
+      lineup: [...p.lineup],
+      battleId: newBattleId(),
+    };
     clear(this.screenRoot);
     try {
       this.battle = new BattleView(this, setup);
@@ -706,19 +745,22 @@ export class App {
     }
   }
 
-  /** Called by BattleView when the result screen appears. The planned supplies are paid here, never before. */
+  /**
+   * Called when the result screen appears (or when a resumed battle is abandoned). The planned supplies
+   * are paid here, never before. The save remembers the battle id together with the result, so a resume
+   * record that survived a kill right after this point is recognised as already paid.
+   */
   recordBattle(setup: BattleSetup, res: BattleResult): Rewards {
-    const rw = applyBattle(this.save, setup.stage, res, setup.mode);
-    const cost = Math.min(Math.max(0, Math.round(setup.supplyCost ?? 0)), Math.max(0, this.save.gold));
-    if (cost > 0) {
-      this.save.gold -= cost;
-      rw.lines.push(`보급품 비용 −◉${fmt(cost)}`);
-    }
-    this.persist();
+    const rw = settleBattle(this.save, setup, res);
+    if (this.persist()) clearRecord(this.kv);
+    else this.settledUnsaved = true;
     return rw;
   }
 
   exitBattle(view: BattleView, res: BattleResult | null, retry: boolean, to: Screen | 'next' = 'campaign') {
+    // leaving by any path (result, retry, exit, crash) ends the battle: no resume point may stay behind,
+    // except one of a settled battle that is not in the stored save yet (see settledUnsaved)
+    if (!this.settledUnsaved) clearRecord(this.kv);
     view.destroy();
     this.battle = null;
     if (retry && this.pre) {
@@ -794,7 +836,7 @@ export class App {
               class: 'btn small ghost',
               'aria-label': '분대 해산',
               onclick: async () => {
-                if (await confirmBox('분대 해산', `${r.name}을(를) 해산합니다. 되돌릴 수 없습니다.`, '해산', true)) {
+                if (await confirmBox('분대 해산', `${nameJosa(r.name, '을/를')} 해산합니다. 되돌릴 수 없습니다.`, '해산', true)) {
                   const err = dismissSquad(s, r.id);
                   if (err) toast(err, 'warn');
                   this.persist();
@@ -1403,12 +1445,244 @@ export class App {
     );
   }
 
+  // ================================================================== battle resume
+
+  /**
+   * At boot: the battle the app was killed in, to be offered once the home screen is up; a record that
+   * can't be resumed is dropped silently (null).
+   */
+  private pendingResume(lr: LoadResult): BattleRecord | null {
+    let rec: BattleRecord | null = null;
+    try {
+      rec = loadRecord(this.kv, RESUME_VER);
+    } catch {
+      rec = null;
+    }
+    // unreadable / other version / expired / already paid out / the save it belongs to is gone
+    if (!rec || rec.id === this.save.battleDone || lr.source === 'new') {
+      clearRecord(this.kv);
+      return null;
+    }
+    return rec;
+  }
+
+  private async offerResume(rec: BattleRecord) {
+    const st = resolveStage(rec.ref);
+    const name = (st?.name ?? rec.name) || '전투';
+    const started = rec.cmds.some((c) => c.m === 'start');
+    const ended = rec.state === 'won' || rec.state === 'lost';
+    const t = Math.max(0, Math.floor(rec.t ?? 0));
+    const clock = `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
+    const wave = Math.max(1, (rec.wave ?? 0) + 1);
+    const where = !started
+      ? '배치 중 (전투 시작 전)'
+      : rec.state === 'won' || rec.state === 'lost'
+        ? `전투 종료 직전 · 전투 시간 ${clock}`
+        : `물결 ${rec.mode === 'endless' || !rec.waves ? wave : `${Math.min(wave, rec.waves)}/${rec.waves}`} · 전투 시간 ${clock}`;
+    for (;;) {
+      const v = await modal(
+        '중단된 전투가 있습니다',
+        [
+          h('p', null, h('b', null, name), rec.modName && rec.mode !== 'daily' ? ` · ${rec.modName}` : rec.modName ? ` (${rec.modName})` : ''),
+          h('p', null, where),
+          h(
+            'p',
+            { class: 'muted small' },
+            ended
+              ? '전투는 이미 끝났습니다. 어느 쪽을 골라도 그 결과(사상자·보상·보급 비용)가 한 번 반영됩니다.'
+              : started
+                ? '이어하기: 멈춘 곳부터 그대로 계속합니다.\n포기: "후퇴"로 처리되어 지금까지 막아낸 물결만큼 위로금을 받고, 사상자와 보급 비용이 반영됩니다.'
+                : '이어하기: 배치 화면으로 돌아갑니다.\n포기: 기록 없이 나갑니다 (비용 없음).',
+          ),
+        ],
+        [
+          { label: '포기', value: 'abandon', kind: 'ghost' },
+          { label: '이어하기', value: 'resume', kind: 'primary' },
+        ],
+        { dismissable: false },
+      );
+      if (v === 'resume') {
+        await this.resumeBattle(rec);
+        return;
+      }
+      if (v !== 'abandon') continue;
+      if (!started) {
+        clearRecord(this.kv);
+        toast('중단된 전투를 정리했습니다.', 'info');
+        return;
+      }
+      if (ended || (await confirmBox('전투 포기', '후퇴로 처리합니다. 지금까지 막아낸 물결만큼 위로금을 받고, 이번 전투의 사상자와 보급 비용이 반영됩니다.', '후퇴', true))) {
+        await this.abandonBattle(rec);
+        return;
+      }
+    }
+  }
+
+  /** Full-screen progress while a battle is replayed; the UI keeps painting between replay chunks. */
+  private replayOverlay(label: string) {
+    const pct = h('b', { class: 'pct' }, '0%');
+    const b = bar(0, 'replay');
+    const el = h('div', { class: 'resume-overlay', role: 'status', 'aria-live': 'polite' }, h('div', { class: 'resume-box' }, h('p', null, `${label} `, pct), b));
+    document.body.append(el);
+    let last = -1;
+    return {
+      set: (f: number) => {
+        const p = Math.max(0, Math.min(100, Math.floor(f * 100)));
+        if (p === last) return;
+        last = p;
+        pct.textContent = `${p}%`;
+        (b.firstChild as HTMLElement).style.width = `${p}%`;
+      },
+      remove: () => el.remove(),
+    };
+  }
+
+  /**
+   * Rebuild a recorded battle up to its last saved step: same stage, same config, same commands, and the
+   * same state fingerprint at the end. Throws if the stage can't be rebuilt identically or the replay
+   * fails or drifts. Each part runs in a task of its own (the overlay paints in between): building the
+   * world, every replay chunk, and whatever the caller does next.
+   */
+  private async rebuildBattle(rec: BattleRecord, ov: { set: (f: number) => void }): Promise<{ world: World; stage: StageDef }> {
+    // let the overlay show before the first piece of work
+    await nextPaint();
+    let t0 = performance.now();
+    const stage = resolveStage(rec.ref);
+    if (!stage) throw new Error('resume: unknown stage ' + JSON.stringify(rec.ref));
+    const cfg = { ...JSON.parse(JSON.stringify(rec.cfg)), stage } as BattleConfig;
+    const world = new World(cfg);
+    let prepMs = performance.now() - t0;
+    await yieldToBrowser();
+    t0 = performance.now();
+    if (stageSig(world) !== rec.sig) throw new Error('resume: rebuilt stage differs from the recorded one');
+    prepMs = Math.max(prepMs, performance.now() - t0);
+    await yieldToBrowser();
+    const stats = await replay(world, rec, ov.set, REPLAY_CHUNK_MS, REPLAY_MAX_CHUNK_MS);
+    const t1 = performance.now();
+    const same = stateHash(world) === rec.h;
+    // prepMs: the longest of the set-up tasks (building the world, checking the stage)
+    this.lastReplay = { ...stats, prepMs: Math.round(prepMs * 10) / 10, hashMs: Math.round((performance.now() - t1) * 10) / 10 };
+    if (!same) throw new Error('resume: replayed state differs from the saved one');
+    // the last chunk and what the caller does next (battle screen, settlement) are separate tasks too
+    await yieldToBrowser();
+    return { world, stage };
+  }
+
+  /**
+   * The setup a recorded battle was started with (same rewards, supply charge, retry and exit paths).
+   * The stage is the one rebuilt from the record's reference, as the pre-battle screen had it, not
+   * world.stage (the simulation may keep its own copy of the stage).
+   */
+  private setupFromRecord(rec: BattleRecord, stage: StageDef, world: World): BattleSetup {
+    const extra = { ...(rec.extra ?? {}) };
+    return { mode: rec.mode, stage, cfg: world.cfg, modName: rec.modName, supplyCost: planCost(extra), ref: rec.ref, extra, lineup: [...rec.lineup], battleId: rec.id };
+  }
+
+  /** The pre-battle state the battle was started from, so "다시 도전" starts the same battle again. */
+  private restorePre(rec: BattleRecord, stage: StageDef, world: World) {
+    this.pre = {
+      mode: rec.mode,
+      stage,
+      lineup: [...rec.lineup],
+      extra: { ...(rec.extra ?? {}) },
+      seed: world.cfg.seed,
+      mods: world.cfg.mods ? [...world.cfg.mods] : undefined,
+      modName: rec.modName,
+      daily: rec.ref.kind === 'daily' ? { key: rec.ref.key, maxIdx: rec.ref.maxIdx } : undefined,
+    };
+    setWantedSize(this.pre, this.pre.lineup.length);
+  }
+
+  /** Something went wrong while restoring: drop the record (nothing charged) and land on the home screen. */
+  private resumeFailed(err: unknown) {
+    this.logError('resume', err);
+    clearRecord(this.kv);
+    this.resuming = false;
+    document.querySelectorAll('.resume-overlay').forEach((el) => el.remove());
+    document.body.classList.remove('in-battle', 'toasts-left');
+    if (this.battle) {
+      try {
+        this.battle.destroy();
+      } catch {
+        /* already half gone */
+      }
+      this.battle = null;
+    }
+    toast('중단된 전투를 복원하지 못해 기록을 정리했습니다. 병력 손실과 비용은 없습니다.', 'warn', undefined, 5000);
+    this.go('home');
+  }
+
+  async resumeBattle(rec: BattleRecord) {
+    if (this.battle || this.resuming) return;
+    this.resuming = true;
+    audio.unlock();
+    const ov = this.replayOverlay('전투 복원 중…');
+    try {
+      const { world, stage } = await this.rebuildBattle(rec, ov);
+      this.restorePre(rec, stage, world);
+      const setup = this.setupFromRecord(rec, stage, world);
+      const t0 = performance.now();
+      clear(this.screenRoot);
+      this.battle = new BattleView(this, setup, { world, record: rec });
+      if (this.lastReplay) this.lastReplay.viewMs = Math.round((performance.now() - t0) * 10) / 10;
+      this.resuming = false;
+      // removed in the task that built the battle screen: the next frame shows the battle
+      ov.remove();
+    } catch (err) {
+      this.resumeFailed(err);
+    }
+  }
+
+  /** "포기": exactly what the in-battle "후퇴" does, at the point the battle was saved. */
+  async abandonBattle(rec: BattleRecord) {
+    if (this.battle || this.resuming) return;
+    this.resuming = true;
+    let rw: Rewards;
+    let res: BattleResult;
+    let retreated = false;
+    const ov = this.replayOverlay('전투 정리 중…');
+    try {
+      const { world, stage } = await this.rebuildBattle(rec, ov);
+      // a battle that had already ended keeps its own result; otherwise the army retreats now
+      if (!world.result) {
+        world.surrender();
+        retreated = true;
+      }
+      if (!world.result) throw new Error('resume: no result after retreat');
+      res = world.result;
+      this.restorePre(rec, stage, world);
+      rw = this.recordBattle(this.setupFromRecord(rec, stage, world), res);
+      this.resuming = false;
+      ov.remove();
+    } catch (err) {
+      this.resumeFailed(err);
+      return;
+    }
+    this.go('home');
+    // the same reward list as the result screen (achievements, promotions and unlocks included)
+    await modal(
+      retreated ? '후퇴했습니다' : '전투 결과를 반영했습니다',
+      [
+        h('p', null, `막아낸 물결 ${res.wavesCleared}${rec.mode === 'endless' ? '' : '/' + res.totalWaves} · 전사 ${res.dead} · 부상 ${res.wounded}`),
+        h('p', null, `보상: 금화 ${fmt(rw.gold)}${rw.medals ? ` · 훈장 ${rw.medals}` : ''} · 연대기 ${rw.passXp}xp`),
+        rewardList(rw, 'small'),
+      ],
+      [{ label: '확인', value: 'ok', kind: 'primary' }],
+    );
+    if (!this.battle) this.go('home');
+  }
+
   // ================================================================== lifecycle
 
   onHidden() {
     this.battle?.autoPause();
     this.persist();
     audio.suspend();
+  }
+  /** The page is being unloaded (reload, close, WebView killed politely): keep a resume point. */
+  onPageHide() {
+    this.battle?.saveResume();
+    this.persist();
   }
   onVisible() {
     audio.resume();
@@ -1421,8 +1695,44 @@ export class App {
 
   /** for tests / debugging in the browser console */
   debugState() {
-    return { screen: this.screen, gold: this.save.gold, battle: !!this.battle, state: this.battle?.world.state, wave: this.battle?.world.waveIdx, t: this.battle?.world.t };
+    return {
+      screen: this.screen,
+      gold: this.save.gold,
+      battle: !!this.battle,
+      state: this.battle?.world.state,
+      wave: this.battle?.world.waveIdx,
+      t: this.battle?.world.t,
+      steps: this.battle?.recorder.steps,
+      resuming: this.resuming,
+      replay: this.lastReplay,
+    };
   }
+}
+
+/**
+ * Replay chunk budget while the progress overlay is up: work ~25 ms, then let the browser paint and take
+ * input. A chunk stops early when its slowest step so far would take it past 40 ms; the ~50 ms rule
+ * keeps some room for the browser's own work in the same task.
+ */
+const REPLAY_CHUNK_MS = 25;
+const REPLAY_MAX_CHUNK_MS = 40;
+
+/** Wait for the browser to paint (e.g. an overlay just added); never stalls in a hidden tab. */
+function nextPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    let done = false;
+    const go = () => {
+      if (done) return;
+      done = true;
+      resolve();
+    };
+    try {
+      requestAnimationFrame(() => setTimeout(go, 0));
+    } catch {
+      /* no animation frames here */
+    }
+    setTimeout(go, 100);
+  });
 }
 
 function kindName(k: Cosmetic['kind']) {

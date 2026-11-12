@@ -13,17 +13,21 @@
 import { DT, SQUAD_TYPES, TILE, Tile } from '../sim/defs';
 import { tileAt, tx, ty } from '../sim/grid';
 import { hasFinal, particle, type JosaPair } from '../sim/josa';
-import type { StageDef } from '../sim/stages';
-import { ABILITY_INFO, ST, World, type AbilityId, type BattleConfig, type BattleResult, type GameEvent, type Squad, type Stance, type Unit } from '../sim/world';
+import type { StageDef, Supplies } from '../sim/stages';
+import { ABILITY_INFO, ST, World, type AbilityId, type BattleConfig, type BattleResult, type GameEvent, type Squad, type Stance } from '../sim/world';
 import { cosmeticById } from '../meta/cosmetics';
-import { RANK_NAMES } from '../meta/progression';
+import { RANK_NAMES, type Rewards } from '../meta/progression';
 import { hasFlag } from '../meta/shop';
 import { Renderer, type Theme } from '../render/renderer';
 import { audio, haptic } from './audio';
 import { bar, clear, confirmBox, fmt, h, modal, stars, toast } from './dom';
+import { Charges } from './orders';
+import { rewardLines } from './prebattle';
+import { BattleRecorder, clearRecord, newBattleId, saveRecord, stageSig, storableCfg, type BattleMode, type BattleRecord, type StageRef } from './resume';
+import { RESUME_VER } from './version';
 import type { App } from './app';
 
-export type BattleMode = 'campaign' | 'daily' | 'endless';
+export type { BattleMode };
 
 export interface BattleSetup {
   mode: BattleMode;
@@ -32,6 +36,29 @@ export interface BattleSetup {
   modName?: string;
   /** gold for the planned supply packs; charged only when the result is recorded */
   supplyCost?: number;
+  /** how to rebuild the stage if the app is killed mid-battle; null = this battle can't be resumed */
+  ref?: StageRef | null;
+  /** planned supply packs and the chosen lineup (restored with the battle after a resume) */
+  extra?: Partial<Supplies>;
+  lineup?: string[];
+  /** unique id of this battle: resume record and settlement guard */
+  battleId?: string;
+}
+
+/** A battle rebuilt from its resume record: the world is already replayed up to the record. */
+export interface ResumedBattle {
+  world: World;
+  record: BattleRecord;
+}
+
+/** real time between automatic resume saves while the battle runs */
+const RESUME_SAVE_MS = 20000;
+
+/** The reward lines of a settled battle (result screen and the "포기" summary list the same). */
+export function rewardList(rw: Rewards, cls?: string): HTMLElement | null {
+  const lines = rewardLines(rw);
+  if (!lines.length) return null;
+  return h('ul', cls ? { class: cls } : null, ...lines.map((l) => h('li', l.good ? { class: 'good' } : null, l.text)));
 }
 
 const STANCE_NAMES: Record<Stance, string> = { hold: '고수', defend: '방어', aggressive: '추격' };
@@ -112,7 +139,14 @@ export class BattleView {
   /** sim time of the last contact */
   private contactT = -99;
   /** melee charges ordered by tapping an enemy: the stance to restore once the target is gone */
-  private charges = new Map<Squad, { target: Unit; prev: Stance }>();
+  private charges = new Charges();
+  /** records every order so the battle can be resumed after the app is killed */
+  readonly recorder: BattleRecorder;
+  /** the resume record is closed (result recorded, battle left or crashed): never write it again */
+  private recordClosed = false;
+  private lastResumeSave = performance.now();
+  private resumeSaved = { steps: -1, cmds: -1 };
+  private lastState = '';
   private els: Record<string, HTMLElement> = {};
   private cards: HTMLElement[] = [];
   private abilityBtns: Partial<Record<AbilityId, HTMLButtonElement>> = {};
@@ -130,10 +164,39 @@ export class BattleView {
   /** the castle's wall ring in world px (opening view, alert placement) */
   private castle: { x0: number; y0: number; x1: number; y1: number } | undefined;
 
-  constructor(app: App, setup: BattleSetup) {
+  constructor(app: App, setup: BattleSetup, resumed?: ResumedBattle) {
     this.app = app;
     this.setup = setup;
-    this.world = new World(setup.cfg);
+    // the stored config is taken before the world exists, so nothing the world does can change it
+    const cfg = resumed ? resumed.record.cfg : storableCfg(setup.cfg);
+    this.world = resumed ? resumed.world : new World(setup.cfg);
+    this.recorder = new BattleRecorder(
+      this.world,
+      {
+        ver: RESUME_VER,
+        id: resumed?.record.id ?? setup.battleId ?? newBattleId(),
+        mode: setup.mode,
+        ref: setup.ref ?? { kind: 'campaign', id: '' },
+        cfg,
+        modName: setup.modName,
+        extra: { ...(setup.extra ?? {}) },
+        lineup: [...(setup.lineup ?? setup.cfg.squads.map((q) => q.rosterId))],
+        sig: resumed?.record.sig ?? stageSig(this.world),
+        name: setup.stage.name,
+      },
+      resumed ? { steps: resumed.record.steps, cmds: resumed.record.cmds } : undefined,
+    );
+    // the result is settled under the same id the record carries
+    setup.battleId = this.recorder.base.id;
+    if (!setup.ref) this.recordClosed = true;
+    if (resumed) {
+      // the replay's alerts and effects are history: start from a quiet screen
+      this.world.events.length = 0;
+      this.world.fx.length = 0;
+      this.world.dirtyTiles.length = 0;
+      this.charges.load(this.world, resumed.record.charges);
+    }
+    this.lastState = this.world.state;
     const s = app.save;
     const allowed = this.speeds();
     this.speed = allowed.includes(s.settings.speed) ? s.settings.speed : Math.min(Math.max(1, Math.round(s.settings.speed || 1)), allowed[allowed.length - 1]);
@@ -149,7 +212,7 @@ export class BattleView {
     document.body.classList.add('in-battle');
     this.layout();
     this.renderer.attach(this.world);
-    this.renderer.deployMode = true;
+    this.renderer.deployMode = this.world.state === 'deploy';
     const g = this.world.grid;
     this.castle = this.castleBox();
     this.renderer.cam.focusCastle(g.keepX, g.keepY, this.castle);
@@ -160,10 +223,38 @@ export class BattleView {
     this.last = performance.now();
     this.raf = requestAnimationFrame(this.loop);
     this.updateHud(true);
-    setTimeout(() => this.introTips(), 250);
+    if (resumed && (this.world.state === 'won' || this.world.state === 'lost')) {
+      // it had already ended: the result screen comes up by itself
+    } else if (resumed && this.world.state !== 'deploy') {
+      // back where it stopped, paused, so the player can look around before it runs on
+      this.togglePause(true);
+      setTimeout(() => !this.destroyed && toast('전투를 이어갑니다 · ▶를 누르면 계속', 'good', undefined, 4000), 150);
+    } else {
+      if (resumed) setTimeout(() => !this.destroyed && toast('중단된 배치를 이어갑니다.', 'good', undefined, 3000), 150);
+      setTimeout(() => this.introTips(), 250);
+    }
+  }
+
+  /**
+   * Write the resume record (on hide, page unload, wave breaks and every ~20 s while the battle runs).
+   * Never throws into the game: if storage is full the battle just goes on without a resume point.
+   */
+  saveResume(): boolean {
+    if (this.recordClosed || this.crashed || this.destroyed) return false;
+    const r = this.recorder;
+    if (r.steps === this.resumeSaved.steps && r.cmds.length === this.resumeSaved.cmds) return true;
+    try {
+      const w = this.world;
+      const ok = saveRecord(this.app.kv, r.record({ t: w.t, wave: w.waveIdx, waves: w.totalWaves(), state: w.state, charges: this.charges.save() }));
+      if (ok) this.resumeSaved = { steps: r.steps, cmds: r.cmds.length };
+      return ok;
+    } catch {
+      return false;
+    }
   }
 
   destroy() {
+    this.recordClosed = true;
     this.destroyed = true;
     cancelAnimationFrame(this.raf);
     this.ro?.disconnect();
@@ -770,6 +861,18 @@ export class BattleView {
       this.updateHud(true);
     }
     this.checkCharges();
+    // resume point: at the start of every wave break (and the end) and every ~20 s of real time, never per frame
+    if (w.state !== this.lastState) {
+      this.lastState = w.state;
+      if (w.state === 'intermission' || w.state === 'won' || w.state === 'lost') {
+        this.saveResume();
+        this.lastResumeSave = ts;
+      }
+    }
+    if (ts - this.lastResumeSave >= RESUME_SAVE_MS) {
+      this.lastResumeSave = ts;
+      this.saveResume();
+    }
     const alpha = Math.max(0, Math.min(1, this.acc / DT));
     try {
       this.renderer.render(this.paused ? 1 : alpha, dt);
@@ -795,18 +898,21 @@ export class BattleView {
   /** A charge (melee squad sent at a tapped enemy) ends when the target falls, flees or is no longer the focus. */
   private checkCharges() {
     if (!this.charges.size) return;
-    for (const [sq, c] of this.charges) {
-      const t = c.target;
-      const gone = sq.alive === 0 || sq.focus !== t || (t.state !== ST.ACTIVE && t.state !== ST.CLIMB) || t.fleeing || !!t.band?.broken;
-      if (!gone) continue;
-      this.charges.delete(sq);
-      if (sq.stance === 'aggressive' && c.prev !== 'aggressive') sq.stance = c.prev;
-      if (sq === this.selected) this.renderStrip();
+    let ended: Squad[] = [];
+    try {
+      ended = this.charges.check(this.world);
+    } catch (err) {
+      this.app.logError('charges', err);
+      this.charges.clear();
     }
+    if (this.selected && ended.includes(this.selected)) this.renderStrip();
   }
 
   private onCrash(err: unknown) {
     this.crashed = true;
+    // "this battle is not recorded": a crash leaves no resume point behind either
+    this.recordClosed = true;
+    clearRecord(this.app.kv);
     this.app.logError('battle', err);
     void modal(
       '전투를 이어갈 수 없습니다',
@@ -868,6 +974,8 @@ export class BattleView {
     audio.play('horn');
     this.updateHud(true);
     this.layout();
+    this.saveResume();
+    this.lastResumeSave = performance.now();
   }
 
   private pressAbility(id: AbilityId) {
@@ -935,11 +1043,7 @@ export class BattleView {
       toast(`${sq.name}: 집중 사격`, 'info', undefined, 1200);
     } else if (e) {
       // charge: pursue this target, then fall back to the stance the squad had before
-      const prev = this.charges.get(sq)?.prev ?? sq.stance;
-      w.commandMove(sq, e.x, e.y);
-      w.commandFocus(sq, e);
-      sq.stance = 'aggressive';
-      this.charges.set(sq, { target: e, prev });
+      this.charges.start(w, sq, e);
       this.renderer.ping(e.x, e.y, '#ff7060');
       toast(`${nameJosa(sq.name, '이/가')} 돌격합니다`, 'info', undefined, 1200);
     } else {
@@ -1178,6 +1282,8 @@ export class BattleView {
 
   private showResult(res: BattleResult) {
     document.querySelector('.toasts')?.replaceChildren();
+    // the result is paid out now: from here on there is nothing left to resume
+    this.recordClosed = true;
     const rw = this.app.recordBattle(this.setup, res);
     const won = res.won;
     const mins = Math.floor(res.time / 60);
@@ -1211,14 +1317,7 @@ export class BattleView {
         'div',
         { class: 'rewards' },
         h('h3', null, `보상: 금화 ${fmt(rw.gold)}${rw.medals ? ` · 훈장 ${rw.medals}` : ''} · 연대기 ${rw.passXp}xp`),
-        h(
-          'ul',
-          null,
-          ...rw.lines.map((l) => h('li', null, l)),
-          ...rw.unlocked.map((l) => h('li', { class: 'good' }, '🔓 ' + l)),
-          ...rw.promoted.map((l) => h('li', { class: 'good' }, '⬆ 진급 ' + l)),
-          ...rw.achievements.map((l) => h('li', { class: 'good' }, '🏅 업적: ' + l)),
-        ),
+        rewardList(rw),
       ),
       h('details', { class: 'squad-stats' }, h('summary', null, '분대별 전과'), h('table', null, h('tr', null, h('th', null, '분대'), h('th', null, '처치'), h('th', null, '전사'), h('th', null, '부상')), ...squadRows)),
       h(
@@ -1246,9 +1345,10 @@ export class BattleView {
     return '💡 이전 성을 다시 지켜 금화를 모으고, 석궁대·공병대로 편성을 보강해 보세요. 돌파구가 생기면 "본성 후퇴"로 전열을 좁히는 것도 방법입니다.';
   }
 
-  /** used by App when the tab is hidden */
+  /** used by App when the tab is hidden (the app may be killed in the background: save a resume point) */
   autoPause() {
     if (this.world.state === 'battle' || this.world.state === 'intermission') this.togglePause(true);
+    this.saveResume();
   }
 
   squadInfo(sq: Squad) {

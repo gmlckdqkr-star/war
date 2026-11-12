@@ -841,10 +841,6 @@ export class Renderer {
     const ctx = this.ctx;
     const b = this.buckets;
     for (const arr of b.values()) arr.length = 0;
-    const lerp = (u: Unit) => {
-      u.fx = u.fx || 0;
-    };
-    void lerp;
     const add = (key: string, u: Unit) => {
       let a = b.get(key);
       if (!a) {

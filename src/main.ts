@@ -4,7 +4,7 @@ import { browserKV } from './meta/save';
 import { createIAP } from './meta/iap';
 import { App } from './ui/app';
 import { confirmBox, toast } from './ui/dom';
-import { exitNativeApp, lockTextZoom, mirrorToNative, restoreFromNativeBackup, setupNativeBack } from './ui/native';
+import { exitNativeApp, lockTextZoom, mirrorToNative, restoreFromNativeBackup, setupNativeBack, setupNativePause } from './ui/native';
 
 declare global {
   interface Window {
@@ -51,12 +51,19 @@ async function boot() {
     } else app.onVisible();
   });
   window.addEventListener('pagehide', () => {
-    app.persist();
+    app.onPageHide();
+    mirrorToNative(kv, true);
+  });
+  // native app sent to the background: Android may kill it there, so save (and keep a battle resume point) now
+  setupNativePause(() => {
+    app.onHidden();
     mirrorToNative(kv, true);
   });
 
   /** Back gesture: close a dialog, else pause the battle, else go home. Returns false on the home screen. */
   const handleBack = (): boolean => {
+    // a saved battle is being rebuilt: the progress overlay finishes on its own
+    if (app.resuming) return true;
     if (document.querySelector('.modal-back')) {
       // close the open dialog the same way Esc does (resolves its promise)
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));

@@ -963,6 +963,40 @@ textarea.code {
   flex-wrap: wrap;
   margin-top: 10px;
 }
+/* battle resume: replay progress, above everything so nothing can be tapped half-built */
+.resume-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: grid;
+  place-items: center;
+  background: rgba(10, 8, 6, 0.88);
+  padding: calc(10px + var(--sat)) calc(16px + var(--sar)) calc(10px + var(--sab)) calc(16px + var(--sal));
+  animation: fade 0.15s;
+}
+.resume-box {
+  width: min(360px, 100%);
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 14px;
+  padding: 14px 18px 18px;
+  text-align: center;
+}
+.resume-box p {
+  margin: 0 0 10px;
+  font-size: 1.05rem;
+}
+.resume-box .pct {
+  font-variant-numeric: tabular-nums;
+  color: var(--gold);
+}
+.resume-box .bar {
+  height: 9px;
+}
+.resume-box .bar .fill {
+  transition: none;
+  background: var(--accent);
+}
 .toasts {
   position: fixed;
   top: calc(52px + var(--sat));

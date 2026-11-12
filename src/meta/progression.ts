@@ -246,13 +246,17 @@ export function todayKey(d = new Date()) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-/** Apply a finished battle to the save: casualties, wounds, xp, gold, stars, unlocks. */
+/**
+ * Apply a finished battle to the save: casualties, wounds, xp, gold, stars, unlocks. A daily challenge is
+ * credited to `dailyKey`, the day it was the challenge of (today unless given).
+ */
 export function applyBattle(
   s: SaveData,
   st: StageDef,
   res: BattleResult,
   mode: 'campaign' | 'daily' | 'endless',
   now = new Date(),
+  dailyKey = todayKey(now),
 ): Rewards {
   const rw: Rewards = { gold: 0, medals: 0, passXp: 0, firstClear: false, newStars: 0, bonusFirstWin: false, unlocked: [], promoted: [], achievements: [], lines: [] };
   const medLv = s.upgrades.medicine ?? 0;
@@ -335,7 +339,7 @@ export function applyBattle(
     }
     rw.passXp = 80 + 40 * res.wavesCleared + (res.won ? 60 * res.stars : 0) + (rw.firstClear ? 200 : 0);
   } else if (mode === 'daily') {
-    const tk = todayKey(now);
+    const tk = dailyKey;
     if (res.won && tk > s.daily.lastKey) {
       rw.medals += 20;
       rw.gold += 150;

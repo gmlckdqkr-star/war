@@ -4,8 +4,10 @@
  */
 import { SQUAD_TYPES } from '../sim/defs';
 import type { StageDef, Supplies } from '../sim/stages';
+import type { BattleResult } from '../sim/world';
+import type { StageRef } from './resume';
 import type { SaveData } from '../meta/save';
-import { SUPPLY_PRICE, baseSupplies, defaultLineup, foodNeeded, lineupSoldiers, rankOf, readyCount, refillCost, refillSquad, squadCap, treatCost, treatSquad } from '../meta/progression';
+import { SUPPLY_PRICE, applyBattle, baseSupplies, defaultLineup, foodNeeded, lineupSoldiers, rankOf, readyCount, refillCost, refillSquad, squadCap, treatCost, treatSquad, type Rewards } from '../meta/progression';
 
 export const MAX_PACKS = 3;
 
@@ -18,6 +20,39 @@ export function planCost(extra: Partial<Supplies>): number {
   let c = 0;
   for (const k of Object.keys(SUPPLY_PRICE) as (keyof Supplies)[]) c += Math.max(0, packsOf(extra, k)) * SUPPLY_PRICE[k].pack;
   return c;
+}
+
+/**
+ * Apply a battle result to the save: casualties, rewards, and the planned supply packs paid now (never
+ * more than the gold there is). Marks the battle as settled so a leftover resume record of it is ignored.
+ * The one place a result is paid out: the result screen and abandoning a resumed battle both use it.
+ */
+export function settleBattle(
+  s: SaveData,
+  b: { stage: StageDef; mode: 'campaign' | 'daily' | 'endless'; supplyCost?: number; battleId?: string; ref?: StageRef | null },
+  res: BattleResult,
+  now = new Date(),
+): Rewards {
+  // a daily challenge counts for the day it belongs to, even when it is finished (or resumed) a day later
+  const dailyKey = b.mode === 'daily' && b.ref?.kind === 'daily' ? b.ref.key : undefined;
+  const rw = applyBattle(s, b.stage, res, b.mode, now, dailyKey);
+  const cost = Math.min(Math.max(0, Math.round(b.supplyCost ?? 0)), Math.max(0, s.gold));
+  if (cost > 0) {
+    s.gold -= cost;
+    rw.lines.push(`보급품 비용 −◉${Math.round(cost).toLocaleString('ko-KR')}`);
+  }
+  if (b.battleId) s.battleDone = b.battleId;
+  return rw;
+}
+
+/** Everything a settled battle paid out or changed, as list lines (the result screen and the "포기" summary). */
+export function rewardLines(rw: Rewards): { text: string; good: boolean }[] {
+  return [
+    ...rw.lines.map((text) => ({ text, good: false })),
+    ...rw.unlocked.map((l) => ({ text: '🔓 ' + l, good: true })),
+    ...rw.promoted.map((l) => ({ text: '⬆ 진급 ' + l, good: true })),
+    ...rw.achievements.map((l) => ({ text: '🏅 업적: ' + l, good: true })),
+  ];
 }
 
 /**
