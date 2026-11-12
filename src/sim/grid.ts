@@ -102,6 +102,12 @@ export class Grid {
   keepAdj = new Uint8Array(GW * GH);
   /** number of ladders/siege towers docked against this wall tile */
   ladders = new Uint8Array(GW * GH);
+  /**
+   * 1 = tile belongs to the castle's original wall line (wall, tower or gate when the stage was built).
+   * Only these may count as boundary when broken, be rebuilt, or take wall deployments; decorative
+   * rubble scattered in the field is plain outside ground.
+   */
+  wallLine = new Uint8Array(GW * GH);
   keepTiles: number[] = [];
   depots: number[] = [];
   infirmaries: number[] = [];
@@ -131,7 +137,8 @@ export class Grid {
   /** wall line tiles that count as castle boundary (not plain outside ground) */
   isBoundary(i: number) {
     const t = this.tiles[i];
-    return t === Tile.WALL || t === Tile.TOWER || t === Tile.GATE || t === Tile.GATE_BROKEN || t === Tile.RUBBLE;
+    if (t === Tile.RUBBLE) return this.wallLine[i] === 1;
+    return t === Tile.WALL || t === Tile.TOWER || t === Tile.GATE || t === Tile.GATE_BROKEN;
   }
   outsideGround(i: number) {
     return !this.inside[i] && !this.isBoundary(i);
@@ -244,6 +251,11 @@ export class Grid {
         const ny = y + N8[d][1];
         if (inb(nx, ny)) seed(idx(nx, ny));
       }
+    }
+    this.wallLine.fill(0);
+    for (let i = 0; i < this.n; i++) {
+      const t = this.tiles[i];
+      if (t === Tile.WALL || t === Tile.TOWER || t === Tile.GATE || t === Tile.GATE_BROKEN) this.wallLine[i] = 1;
     }
     this.inside.fill(0);
     for (let i = 0; i < this.n; i++) {

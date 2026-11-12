@@ -1411,6 +1411,11 @@ export class World {
       this.supplies.mats = Math.max(0, this.supplies.mats - amt / 22);
       if (this.rng.chance(0.04)) this.fx.push({ k: 'repair', x: cx(tt), y: cy(tt) });
     } else if (kind === 2 || kind === 3) {
+      if (!g.wallLine[tt]) {
+        // only the castle's own wall line can be rebuilt (never decorative field rubble)
+        sq.taskTile = -1;
+        return false;
+      }
       const need = kind === 2 ? 40 : 60;
       if (this.supplies.mats < need) {
         this.alert('nomats', '자재가 부족해 재건할 수 없습니다.', 'warn');

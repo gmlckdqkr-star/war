@@ -221,7 +221,7 @@ export function runCouncil(w: World) {
       if (s.taskKind === 4) return w.fire[t] > 0;
       if (s.taskKind === 1) return g.isStruct(t) && g.hp[t] < g.maxHp[t] * 0.98 && !near(t, 2.2) && w.supplies.mats > 1;
       if (s.taskKind === 2) return g.tiles[t] === Tile.GATE_BROKEN && !near(t, 4) && w.supplies.mats >= 40;
-      if (s.taskKind === 3) return g.tiles[t] === Tile.RUBBLE && !near(t, 4) && w.supplies.mats >= 60;
+      if (s.taskKind === 3) return g.tiles[t] === Tile.RUBBLE && g.wallLine[t] === 1 && !near(t, 4) && w.supplies.mats >= 60;
       return false;
     };
     if (valid()) continue;
@@ -254,23 +254,9 @@ export function runCouncil(w: World) {
   }
 }
 
-/** rubble that sits in a former wall line (has wall/tower neighbours) */
+/** rubble that sits in the castle's original wall line (a collapsed wall, not field debris) */
 function isWallGap(w: World, i: number) {
-  const g = w.grid;
-  let n = 0;
-  for (const [dx, dy] of [
-    [1, 0],
-    [-1, 0],
-    [0, 1],
-    [0, -1],
-  ]) {
-    const x = tx(i) + dx;
-    const y = ty(i) + dy;
-    if (!inb(x, y)) continue;
-    const t = g.tiles[idx(x, y)];
-    if (t === Tile.WALL || t === Tile.TOWER || t === Tile.RUBBLE || t === Tile.GATE) n++;
-  }
-  return n >= 1;
+  return w.grid.wallLine[i] === 1;
 }
 
 /**

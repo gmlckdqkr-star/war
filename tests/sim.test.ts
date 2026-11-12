@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { GH, GW, Tile } from '../src/sim/defs';
-import { Grid } from '../src/sim/grid';
+import { Grid, idx } from '../src/sim/grid';
 import { RNG } from '../src/sim/rng';
 import { STAGES, dailyChallenge, endlessStage } from '../src/sim/stages';
 import { josa } from '../src/sim/josa';
@@ -63,6 +63,39 @@ describe('stages', () => {
     expect(g.structTiles.some((i) => g.tiles[i] === Tile.GATE || g.tiles[i] === Tile.WALL)).toBe(true);
     // waves reference existing bands
     expect(st.waves.length).toBeGreaterThan(0);
+  });
+});
+
+describe('wall line', () => {
+  it('s9 field rubble is outside ground; only collapsed walls of the castle are boundary and rebuildable', () => {
+    const st = STAGES.find((x) => x.id === 's9')!;
+    const s = armyFor(9);
+    const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, 1234));
+    const g = w.grid;
+    let fieldRubble = 0;
+    for (let i = 0; i < g.n; i++) {
+      if (i % GW >= 32) continue; // west wall column of s9
+      if (g.tiles[i] === Tile.RUBBLE) fieldRubble++;
+      expect(g.deployable(i), `tile ${i % GW},${Math.floor(i / GW)}`).toBe(false);
+      expect(g.isBoundary(i)).toBe(false);
+    }
+    expect(fieldRubble).toBeGreaterThan(0);
+    w.start();
+    const gap = idx(32, 14);
+    expect(g.tiles[gap]).toBe(Tile.WALL);
+    w.destroyStruct(gap, 'broken');
+    expect(g.tiles[gap]).toBe(Tile.RUBBLE);
+    expect(g.isBoundary(gap)).toBe(true);
+    expect(g.deployable(gap)).toBe(true);
+    const eng = w.squads.find((q) => q.type.id === 'engineer')!;
+    let picked = false;
+    for (let i = 0; i < 30 * 10 && !picked; i++) {
+      w.step();
+      if (eng.taskTile === gap && eng.taskKind === 3) picked = true;
+      // engineers never target field rubble
+      if (eng.taskTile >= 0) expect(g.wallLine[eng.taskTile]).toBe(1);
+    }
+    expect(picked).toBe(true);
   });
 });
 
