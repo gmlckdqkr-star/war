@@ -55,7 +55,8 @@ import { CANCELLED, MockIAP, type IAPAdapter } from '../meta/iap';
 import { REFUND_NOTICE, sellerLine } from '../meta/legal';
 import { cosmeticCard, cosmeticPreview } from './preview';
 import { audio } from './audio';
-import { BattleView, type BattleMode, type BattleSetup } from './battle';
+import { BattleView, squadNumbers, type BattleMode, type BattleSetup } from './battle';
+import { MAX_PACKS, careAll, careCosts, fitPlan, foodForecast, lineupStrength, packsOf, planCost, readyLineup, setWantedSize, wantedSize } from './prebattle';
 import { bar, clear, confirmBox, fmt, h, modal, stars, toast } from './dom';
 
 export const VERSION = '1.0.0';
@@ -387,32 +388,34 @@ export class App {
     const p = this.pre!;
     const st = p.stage;
     const cap = squadCap(s, st);
+    // remember how many squads the player means to take, before squads with nobody ready drop out
+    setWantedSize(p, wantedSize(p, p.lineup.length));
     p.lineup = p.lineup.filter((id) => s.roster.some((r) => r.id === id && readyCount(r) > 0));
-    // enemy intel
-    const bandIds = [...new Set(st.waves.slice(0, 12).flatMap((w) => w.groups.map((g) => g.band)))];
-    const unitIds = [...new Set(bandIds.flatMap((b) => [...(BANDS[b]?.members.map((m) => m[0]) ?? []), ...(BANDS[b]?.leader ? [BANDS[b].leader!] : [])]))];
-    const intel = h(
-      'div',
-      { class: 'intel' },
-      h('p', { class: 'story' }, st.story),
-      h('p', null, h('b', null, '적: '), st.factions.map((f) => FACTIONS[f].name).join(', '), p.mode === 'endless' ? '' : ` · 물결 ${st.waves.length}`),
-      h('div', { class: 'unit-chips' }, ...unitIds.slice(0, 14).map((u) => h('span', { class: 'chip-s', style: { borderColor: UNITS[u]?.color } }, UNITS[u]?.name ?? u))),
-      p.modName ? h('p', { class: 'mod' }, `오늘의 조건: ${p.modName}`) : null,
-      h('p', { class: 'muted' }, `난이도: ${{ easy: '쉬움', normal: '보통', hard: '어려움' }[s.settings.difficulty]} (설정에서 변경)`),
-    );
-    // lineup
+    // re-render in place: keep the scroll position so taps low on a small screen don't jump to the top
+    const refresh = () => {
+      const top = this.screenRoot.querySelector('.page')?.scrollTop ?? 0;
+      this.go('prebattle');
+      const pg = this.screenRoot.querySelector('.page');
+      if (pg) pg.scrollTop = top;
+    };
+    const jumpTo = (sel: string) => () => this.screenRoot.querySelector(sel)?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    // ---- lineup (with a clear warning and one-tap care after losses)
+    const nums = squadNumbers(s.roster.map((r) => ({ r, type: r.type, name: r.name })));
+    const numOf = new Map([...nums].map(([k, n]) => [k.r, n]));
     const rows = s.roster.map((r) => {
       const ready = readyCount(r);
       const on = p.lineup.includes(r.id);
       const wounded = r.soldiers.filter((x) => x.wounded > 0).length;
       const missing = SQUAD_TYPES[r.type].size - r.soldiers.length;
+      const n = numOf.get(r);
       return h(
         'button',
         {
           class: 'lineup-row' + (on ? ' on' : '') + (ready === 0 ? ' disabled' : ''),
+          'aria-pressed': on ? 'true' : 'false',
           onclick: () => {
             if (ready === 0) {
-              toast('출전 가능한 병사가 없습니다. 병영에서 보충·치료하세요.', 'warn');
+              toast('출전 가능한 병사가 없습니다. 위의 "모두 보충·치료"나 병영을 이용하세요.', 'warn');
               return;
             }
             if (on) p.lineup = p.lineup.filter((x) => x !== r.id);
@@ -420,41 +423,77 @@ export class App {
               toast(`이 성에는 최대 ${cap}개 분대만 출전할 수 있습니다.`, 'warn');
               return;
             } else p.lineup.push(r.id);
-            this.go('prebattle');
+            setWantedSize(p, p.lineup.length);
+            refresh();
           },
         },
         h('span', { class: 'check' }, on ? '✔' : ''),
-        h('span', { class: 'glyph' }, SQUAD_TYPES[r.type].short),
-        h('span', { class: 'nm' }, r.name, h('small', null, ` ${RANK_NAMES[rankOf(r)]}`)),
-        h('span', { class: 'cnt' }, `${ready}/${SQUAD_TYPES[r.type].size}`, wounded ? h('small', { class: 'warn' }, ` 부상 ${wounded}`) : null, missing ? h('small', { class: 'muted' }, ` 결원 ${missing}`) : null),
+        h('span', { class: 'glyph' }, SQUAD_TYPES[r.type].short, n ? h('i', { class: 'num' }, String(n)) : null),
+        h('span', { class: 'nm' }, h('b', null, r.name), h('small', null, RANK_NAMES[rankOf(r)])),
+        h('span', { class: 'cnt' + (ready < SQUAD_TYPES[r.type].size ? ' short' : '') }, `${ready}/${SQUAD_TYPES[r.type].size}`, wounded ? h('small', { class: 'warn' }, ` 부상 ${wounded}`) : null, missing ? h('small', { class: 'muted' }, ` 결원 ${missing}`) : null),
       );
     });
-    // supplies
+    const str = lineupStrength(s, p.lineup);
+    const care = careCosts(s);
+    const idleBroken = s.roster.some((r) => !p.lineup.includes(r.id) && readyCount(r) < SQUAD_TYPES[r.type].size && (refillCost(r) > 0 || treatCost(r) > 0));
+    const short = p.lineup.length > 0 && str.ready < str.full;
+    const thin = p.lineup.length < cap && idleBroken;
+    const weak = (p.lineup.length > 0 && str.ready < str.full * 0.85) || thin;
+    const careBtn = (kind: 'fill' | 'heal', cost: number) =>
+      h(
+        'button',
+        {
+          class: 'btn small' + (s.gold >= cost ? ' primary' : ''),
+          onclick: () => {
+            const r = careAll(s, kind);
+            if (r.err) toast(r.err, 'warn');
+            if (r.done) {
+              audio.play('coin');
+              p.lineup = readyLineup(s, st, p.lineup, wantedSize(p, cap));
+              toast(kind === 'fill' ? `${r.done}개 분대를 보충했습니다.` : `${r.done}개 분대를 치료했습니다.`, 'good', undefined, 1600);
+            }
+            this.persist();
+            refresh();
+          },
+        },
+        `${kind === 'fill' ? '모두 보충' : '모두 치료'} ◉${fmt(cost)}`,
+      );
+    const strengthBox =
+      (short || thin) && (care.fill > 0 || care.heal > 0)
+        ? h(
+            'div',
+            { class: 'pre-alert' + (weak ? ' severe' : '') },
+            h('b', null, weak ? `⚠ 병력 부족 — 출전 ${str.ready}/${str.full}명` : `출전 ${str.ready}/${str.full}명`),
+            h('small', null, [str.missing ? `결원 ${str.missing}` : '', str.wounded ? `부상 ${str.wounded}` : '', thin ? '쉬는 분대 있음' : ''].filter(Boolean).join(' · ')),
+            h('div', { class: 'btn-row' }, care.fill > 0 ? careBtn('fill', care.fill) : null, care.heal > 0 ? careBtn('heal', care.heal) : null),
+          )
+        : null;
+    // ---- supplies: packs are only planned here and paid when the battle result is recorded
     const base = baseSupplies(s, st);
+    const cost = planCost(p.extra);
     const supRows = (Object.keys(SUPPLY_PRICE) as (keyof Supplies)[]).map((k) => {
       const pr = SUPPLY_PRICE[k];
       const extra = p.extra[k] ?? 0;
-      const packs = extra / pr.per;
+      const packs = packsOf(p.extra, k);
+      const affordable = s.gold >= cost + pr.pack;
       return h(
         'div',
         { class: 'sup-row' },
         h('span', null, pr.name),
-        h('b', null, fmt(base[k] + extra)),
+        h('b', null, fmt(base[k] + extra), extra ? h('small', { class: 'plan' }, ` +${extra}`) : null),
         h(
           'button',
           {
             class: 'btn small',
-            disabled: packs >= 3,
+            disabled: packs >= MAX_PACKS,
             onclick: () => {
-              if (s.gold < pr.pack) {
-                toast('금화가 부족합니다.', 'warn');
+              if (!affordable) {
+                toast(`금화가 부족합니다 (보급 계획 ◉${fmt(cost + pr.pack)} / 보유 ◉${fmt(s.gold)}).`, 'warn');
                 return;
               }
-              s.gold -= pr.pack;
               p.extra[k] = extra + pr.per;
-              this.persist();
-              audio.play('coin');
-              this.go('prebattle');
+              audio.play('click');
+              refresh();
             },
           },
           `+${pr.per} (◉${pr.pack})`,
@@ -464,20 +503,73 @@ export class App {
               'button',
               {
                 class: 'btn small ghost',
-                'aria-label': '되돌리기',
+                'aria-label': `${pr.name} 계획 빼기`,
                 onclick: () => {
-                  s.gold += pr.pack;
-                  p.extra[k] = extra - pr.per;
-                  this.persist();
-                  this.go('prebattle');
+                  p.extra[k] = Math.max(0, extra - pr.per);
+                  refresh();
                 },
               },
               '−',
             )
-          : null,
+          : h('span'),
       );
     });
-    // lineup presets
+    const ff = foodForecast(s, st, p.lineup, p.extra, p.mode === 'endless');
+    const foodCost = ff.packs * SUPPLY_PRICE.food.pack;
+    const foodBox =
+      p.mode === 'endless'
+        ? h('div', { class: 'food-cast' }, `🍞 물결마다 식량 ${ff.perWave} · 보유 ${ff.have} (약 ${ff.perWave ? Math.floor(ff.have / ff.perWave) : '∞'}물결분)`)
+        : h(
+            'div',
+            { class: 'food-cast' + (ff.short ? ' short' : '') },
+            h('span', null, `🍞 식량 필요 ${ff.need} / 보유 ${ff.have}`, ff.short ? h('b', { class: 'warn' }, ` ⚠ ${ff.short} 부족`) : h('span', { class: 'good' }, ' ✓')),
+            ff.short && ff.packs > 0
+              ? h(
+                  'button',
+                  {
+                    class: 'btn small' + (s.gold >= cost + foodCost ? ' primary' : ''),
+                    disabled: s.gold < cost + foodCost,
+                    onclick: () => {
+                      p.extra.food = (p.extra.food ?? 0) + ff.packs * SUPPLY_PRICE.food.per;
+                      audio.play('click');
+                      refresh();
+                    },
+                  },
+                  `식량 +${ff.packs * SUPPLY_PRICE.food.per} 담기 (◉${foodCost})`,
+                )
+              : null,
+            ff.short && ff.stillShort
+              ? h('small', { class: 'muted' }, `추가 보급 한도(${MAX_PACKS}묶음)로도 모자랍니다. 마지막 물결에 굶주릴 수 있으니 분대를 줄이거나 "병참" 연구를 올리세요.`)
+              : ff.short && s.gold < cost + foodCost
+                ? h('small', { class: 'muted' }, '금화가 모자랍니다. 다른 보급 계획을 줄이거나 분대를 줄이세요.')
+                : null,
+          );
+    const planLine =
+      cost > 0
+        ? h(
+            'div',
+            { class: 'plan-line' + (cost > s.gold ? ' warn' : '') },
+            h('span', null, `보급 계획 ◉${fmt(cost)} — 전투 결과가 나올 때 지불 (보유 ◉${fmt(s.gold)})`),
+            // over budget (e.g. after a defeat): one tap cuts the plan down to the gold instead of many "−" taps
+            cost > s.gold
+              ? h(
+                  'button',
+                  {
+                    class: 'btn small primary',
+                    onclick: () => {
+                      const fit = fitPlan(p.extra, s.gold);
+                      p.extra = fit.extra;
+                      audio.play('click');
+                      toast(`보급 계획을 ${fit.dropped}묶음 줄였습니다 (◉${fmt(planCost(p.extra))}).`, 'info', undefined, 1800);
+                      refresh();
+                    },
+                  },
+                  '보유 금화에 맞추기',
+                )
+              : null,
+          )
+        : h('p', { class: 'muted small' }, '추가 보급은 계획만 해 두고, 전투 결과가 나올 때 금화를 냅니다.');
+    // ---- lineup presets
     const slots = hasFlag(s, 'presets') ? 5 : 1;
     const presetBar = h(
       'div',
@@ -501,7 +593,7 @@ export class App {
                 toast('편성을 저장했습니다.', 'good');
               } else if (v === 'load') {
                 p.lineup = saved.filter((id) => s.roster.some((r) => r.id === id && readyCount(r) > 0)).slice(0, cap);
-                this.go('prebattle');
+                refresh();
               }
             },
           },
@@ -509,8 +601,27 @@ export class App {
         );
       }),
     );
+    // ---- enemy intel (the only copy of the scouting report: the battle does not repeat it)
+    const bandIds = [...new Set(st.waves.slice(0, 12).flatMap((w) => w.groups.map((g) => g.band)))];
+    const unitIds = [...new Set(bandIds.flatMap((b) => [...(BANDS[b]?.members.map((m) => m[0]) ?? []), ...(BANDS[b]?.leader ? [BANDS[b].leader!] : [])]))];
+    const intel = h(
+      'div',
+      { class: 'intel' },
+      h('p', { class: 'story' }, st.story),
+      h('p', null, h('b', null, '적: '), st.factions.map((f) => FACTIONS[f].name).join(', '), p.mode === 'endless' ? '' : ` · 물결 ${st.waves.length}`),
+      h('div', { class: 'unit-chips' }, ...unitIds.slice(0, 14).map((u) => h('span', { class: 'chip-s', style: { borderColor: UNITS[u]?.color } }, UNITS[u]?.name ?? u))),
+      st.tips?.length ? h('ul', { class: 'tips' }, ...st.tips.map((t) => h('li', null, t))) : null,
+      p.modName ? h('p', { class: 'mod' }, `오늘의 조건: ${p.modName}`) : null,
+      h('p', { class: 'muted' }, `난이도: ${{ easy: '쉬움', normal: '보통', hard: '어려움' }[s.settings.difficulty]} (설정에서 변경)`),
+    );
     const canSweep = p.mode === 'campaign' && (s.stars[st.id] ?? 0) >= 3;
-    const back: Screen = p.mode === 'campaign' ? 'campaign' : 'campaign';
+    const back: Screen = 'campaign';
+    // ---- sticky action bar: warnings stay visible next to the start button on any screen height
+    const notes = [
+      weak ? h('button', { class: 'pre-note warn', onclick: jumpTo('.pre-lineup') }, `⚠ 병력 ${str.ready}/${str.full}`) : null,
+      ff.short ? h('button', { class: 'pre-note warn', onclick: jumpTo('.pre-supply') }, `⚠ 식량 ${ff.have}/${ff.need}`) : null,
+      cost > 0 ? h('button', { class: 'pre-note' + (cost > s.gold ? ' warn' : ''), onclick: jumpTo('.pre-supply') }, `보급 ◉${fmt(cost)}`) : null,
+    ].filter(Boolean);
     return h(
       'div',
       { class: 'page prebattle' },
@@ -518,20 +629,22 @@ export class App {
       h(
         'div',
         { class: 'pre-grid' },
-        h('section', null, h('h2', null, '정찰 보고'), intel),
         h(
           'section',
-          null,
+          { class: 'pre-lineup' },
           h('h2', null, `출전 분대 ${p.lineup.length}/${cap}`),
+          strengthBox,
           h('div', { class: 'lineup' }, ...rows),
           presetBar,
           h('button', { class: 'btn ghost small', onclick: () => this.go('barracks') }, '병영에서 보충·치료·모집 ›'),
         ),
-        h('section', null, h('h2', null, '보급 (출전 시 지급)'), ...supRows, h('p', { class: 'muted small' }, '화살은 성 안 보급소 근처에서 자동 재보급됩니다. 식량은 물결마다 소모됩니다.')),
+        h('section', { class: 'pre-supply' }, h('h2', null, '보급 (출전 시 지급)'), foodBox, ...supRows, planLine, h('p', { class: 'muted small' }, '화살은 성 안 보급소 근처에서 자동 재보급됩니다. 식량은 물결마다 소모됩니다.')),
+        h('section', { class: 'pre-intel' }, h('h2', null, '정찰 보고'), intel),
       ),
       h(
         'div',
         { class: 'pre-actions' },
+        notes.length ? h('div', { class: 'pre-notes' }, ...notes) : null,
         canSweep
           ? h(
               'button',
@@ -571,10 +684,17 @@ export class App {
   private startBattle() {
     const p = this.pre!;
     if (!p.lineup.length) return;
+    // planned packs are paid when the result is recorded, so the plan has to be affordable now
+    const supplyCost = planCost(p.extra);
+    if (supplyCost > this.save.gold) {
+      toast(`금화가 부족합니다: 보급 계획 ◉${fmt(supplyCost)} / 보유 ◉${fmt(this.save.gold)}. 보급을 줄여 주세요.`, 'warn', undefined, 3200);
+      this.screenRoot.querySelector('.pre-supply')?.scrollIntoView({ block: 'start' });
+      return;
+    }
     audio.unlock();
     const cfg = battleConfig(this.save, p.stage, p.lineup, p.extra, p.seed, { mods: p.mods });
     if (p.mode === 'endless') cfg.autoCommand = this.save.settings.autoCommand;
-    const setup: BattleSetup = { mode: p.mode, stage: p.stage, cfg, modName: p.modName };
+    const setup: BattleSetup = { mode: p.mode, stage: p.stage, cfg, modName: p.modName, supplyCost };
     clear(this.screenRoot);
     try {
       this.battle = new BattleView(this, setup);
@@ -586,11 +706,14 @@ export class App {
     }
   }
 
-  /** Called by BattleView when the result screen appears. */
+  /** Called by BattleView when the result screen appears. The planned supplies are paid here, never before. */
   recordBattle(setup: BattleSetup, res: BattleResult): Rewards {
     const rw = applyBattle(this.save, setup.stage, res, setup.mode);
-    // supplies bought for this battle are spent
-    if (this.pre) this.pre.extra = {};
+    const cost = Math.min(Math.max(0, Math.round(setup.supplyCost ?? 0)), Math.max(0, this.save.gold));
+    if (cost > 0) {
+      this.save.gold -= cost;
+      rw.lines.push(`보급품 비용 −◉${fmt(cost)}`);
+    }
     this.persist();
     return rw;
   }
@@ -601,7 +724,17 @@ export class App {
     if (retry && this.pre) {
       if (this.pre.mode !== 'daily') this.pre.seed = (Math.random() * 1e9) | 0;
       if (this.pre.mode === 'endless') this.pre.stage = endlessStage(this.pre.seed);
-      this.pre.lineup = this.pre.lineup.filter((id) => this.save.roster.some((r) => r.id === id && readyCount(r) > 0));
+      // after losses go out with squads that can fight: drop empty ones and swap broken ones, but keep the
+      // number of squads the player chose (a deliberately small lineup stays small)
+      const want = this.pre.lineup.length;
+      setWantedSize(this.pre, want);
+      this.pre.lineup = res ? readyLineup(this.save, this.pre.stage, this.pre.lineup, want) : this.pre.lineup.filter((id) => this.save.roster.some((r) => r.id === id && readyCount(r) > 0));
+      // a defeat can leave too little gold for the same supply plan: cut it to fit rather than refuse the start
+      const fit = fitPlan(this.pre.extra, this.save.gold);
+      if (fit.dropped) {
+        this.pre.extra = fit.extra;
+        toast(`금화가 모자라 보급 계획을 ${fit.dropped}묶음 줄였습니다.`, 'warn', undefined, 3000);
+      }
       this.go('prebattle');
       return;
     }

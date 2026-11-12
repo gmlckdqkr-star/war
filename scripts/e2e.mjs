@@ -12,7 +12,20 @@ mkdirSync(OUT, { recursive: true });
 const PORT = Number(process.env.E2E_PORT ?? 4179);
 const URL = `http://localhost:${PORT}/`;
 
-const server = spawn('npx', ['vite', 'preview', '--port', String(PORT), '--strictPort'], { stdio: 'ignore' });
+// own process group, so stopping it also stops the vite process npx starts (not just the npx wrapper)
+const server = spawn('npx', ['vite', 'preview', '--port', String(PORT), '--strictPort'], { stdio: 'ignore', detached: process.platform !== 'win32' });
+const stopServer = () => {
+  try {
+    if (process.platform !== 'win32' && server.pid) process.kill(-server.pid, 'SIGTERM');
+    else server.kill();
+  } catch {
+    /* already gone */
+  }
+};
+process.on('SIGINT', () => {
+  stopServer();
+  process.exit(130);
+});
 const results = [];
 let failed = 0;
 const check = (name, ok, info = '') => {
@@ -74,6 +87,19 @@ async function run() {
   await closeModals();
   check('tutorial completes', (await save()).tutorialDone === true);
   await shot('04_deploy');
+  // opening view: the whole wall ring sits between the HUD bars; the deploy banner is not cut off
+  const view = await page.evaluate(() => {
+    const b = window.__app.battle;
+    const g = b.world.grid;
+    const c = b.renderer.cam;
+    let y0 = 1e9;
+    let y1 = -1;
+    for (let i = 0; i < g.n; i++) if ([4, 5, 6, 8, 14].includes(g.tiles[i])) ((y0 = Math.min(y0, Math.floor(i / 60))), (y1 = Math.max(y1, Math.floor(i / 60))));
+    const ban = document.querySelector('.hud-banner');
+    return { wallTop: c.toScreenY(y0 * 16), wallBottom: c.toScreenY((y1 + 1) * 16), top: document.querySelector('.hud-top').getBoundingClientRect().bottom, bar: document.querySelector('.hud-bottom').getBoundingClientRect().top, banner: ban.textContent, cut: ban.scrollWidth > ban.clientWidth + 1 };
+  });
+  check('castle walls between the HUD bars at the opening view', view.wallTop >= view.top && view.wallBottom <= view.bar, JSON.stringify(view));
+  check('deploy banner shows the first-wave direction uncut', view.banner.includes('첫 공세') && !view.cut, view.banner);
 
   // drag a squad banner during deployment
   const before = await page.evaluate(() => {
@@ -94,10 +120,56 @@ async function run() {
   await page.waitForTimeout(300);
   check('battle started', (await state()).state === 'battle');
 
+  // soldiers are drawn (debug counter) and show up as pixels next to their banner, at fit zoom too
+  const soldierPx = async () =>
+    page.evaluate(() => {
+      const b = window.__app.battle;
+      const r = b.renderer;
+      const c = b.canvas;
+      const dpr = r.dpr;
+      const ctx = c.getContext('2d');
+      let px = 0;
+      for (const sq of b.world.squads) {
+        if (sq.alive === 0) continue;
+        // a box just below the squad centre: soldiers stand there, the banner hangs above it
+        const x = Math.round((r.cam.toScreenX(sq.cx) - 14) * dpr);
+        const y = Math.round((r.cam.toScreenY(sq.cy) + 1) * dpr);
+        const w = Math.round(28 * dpr);
+        const hh = Math.round(14 * dpr);
+        const d = ctx.getImageData(Math.max(0, x), Math.max(0, y), w, hh).data;
+        // defenders: dye body (blue) or the pale rim
+        for (let i = 0; i < d.length; i += 4) if ((d[i + 2] > 150 && d[i + 2] - d[i] > 70) || (d[i] > 190 && d[i + 2] > 235)) px++;
+      }
+      return { drawn: r.drawnUnits, px, zoom: r.cam.zoom };
+    });
+  const sv = await soldierPx();
+  check('soldiers visible (counter + pixels)', sv.drawn > 20 && sv.px > 40, JSON.stringify(sv));
+  await page.evaluate(() => window.__app.battle.renderer.cam.fit());
+  await page.waitForTimeout(150);
+  const svFit = await soldierPx();
+  check('soldiers visible at fit zoom', svFit.drawn > 20 && svFit.px > 80, JSON.stringify(svFit));
+  await shot('04b_soldiers_fit');
+  // auto fast-forward while the enemy is still walking in
+  check('fast-forward indicator before contact', await page.evaluate(() => window.__app.battle.approaching && document.querySelector('.hud-banner').textContent.includes('적 접근 중')));
+
   // select squad via card, order by tapping ground
   await page.tap('.cards .card:nth-child(2)');
   await page.waitForTimeout(150);
   check('selection strip shown', await page.isVisible('.sel-strip'));
+  const chips = await page.evaluate(() =>
+    [...document.querySelectorAll('.sel-strip .chip')].map((c) => {
+      const r = document.createRange();
+      r.selectNodeContents(c);
+      return { t: c.textContent, h: Math.round(c.getBoundingClientRect().height), lines: r.getClientRects().length };
+    }),
+  );
+  check('selection strip chips on one line', chips.length >= 5 && chips.every((c) => c.lines === 1 && c.h <= 46), JSON.stringify(chips));
+  const stripBox = await page.evaluate(() => {
+    const s = document.querySelector('.sel-strip').getBoundingClientRect();
+    const cam = window.__app.battle.renderer.cam;
+    return { top: s.top, right: s.right, mapBottom: cam.h - cam.insetBottom, vw: innerWidth };
+  });
+  check('selection strip stays off the map', stripBox.top >= stripBox.mapBottom - 2 && stripBox.right <= stripBox.vw, JSON.stringify(stripBox));
   const tgt = await page.evaluate(() => {
     const w = window.__app.battle.world;
     const r = window.__app.battle.renderer;
@@ -137,9 +209,80 @@ async function run() {
     const used = await page.evaluate(() => Object.values(window.__app.battle.world.abilities).some((a) => a.cd > 0));
     check('ability targeting works', !!armed && used);
   }
+  // a burst of alerts: at most two toasts on screen, in a top corner between the side columns, particles fixed
+  await page.evaluate(() => {
+    const w = window.__app.battle.world;
+    for (let i = 0; i < 6; i++) w.events.push({ type: 'test', text: i === 5 ? '징집병 무리이(가) 무너져 달아납니다!' : `시험 알림 ${i + 1}`, level: 'warn', x: 200, y: 200 });
+  });
+  await page.waitForTimeout(150);
+  const toasts = await page.evaluate(() => {
+    const top = document.querySelector('.hud-top').getBoundingClientRect().bottom;
+    return [...document.querySelectorAll('.toasts .toast')].map((t) => {
+      const r = t.getBoundingClientRect();
+      const hitAbove = document.elementFromPoint(r.left + r.width / 2, r.top - 4) === t;
+      return { l: Math.round(r.left), r: Math.round(r.right), t: Math.round(r.top), b: Math.round(r.bottom), top: Math.round(top), text: t.textContent, hitAbove };
+    });
+  });
+  check('battle toasts: at most 2, top corner between the side columns', toasts.length >= 1 && toasts.length <= 2 && toasts.every((q) => q.t >= q.top && q.l >= 64 && q.r <= 844 - 64 && q.b < 390 / 2), JSON.stringify(toasts));
+  check('event particles read naturally ("무리가", not "무리이(가)")', toasts.some((q) => q.text.includes('징집병 무리가 무너져')) && !toasts.some((q) => q.text.includes('(가)')), JSON.stringify(toasts.map((q) => q.text)));
+  check('tappable alert has a touch area beyond its edge', toasts.every((q) => q.hitAbove), JSON.stringify(toasts.map((q) => q.hitAbove)));
+
   await page.click('.speed[data-speed="3"]');
   await page.waitForTimeout(800);
   await shot('05_battle');
+  check('battle speed saved', (await save()).settings.speed === 3);
+
+  // war council: during an intermission, options from the world become big buttons
+  await page.evaluate(() => {
+    const w = window.__app.battle.world;
+    let n = 0;
+    while (w.state === 'battle' && n++ < 30 * 600) w.step();
+    window.__picked = [];
+    w.councilOptions = () =>
+      w.councilPick
+        ? []
+        : [
+            { id: 'a', name: '성벽 보수', desc: '성벽 내구 회복' },
+            { id: 'b', name: '휴식', desc: '전 분대 사기 +20' },
+            { id: 'c', name: '보급 정비', desc: '화살 +150' },
+          ];
+    w.chooseCouncil = (id) => {
+      window.__picked.push(id);
+      w.councilPick = id;
+      return true;
+    };
+  });
+  await page.waitForTimeout(400);
+  if ((await state()).state === 'intermission') {
+    const opts = await page.$$('.council-opt');
+    check('council options shown', opts.length === 3);
+    check('next wave direction announced', ((await page.textContent('.inter-dir')) ?? '').startsWith('다음 공세:'));
+    await shot('05b_council');
+    await page.tap('.council-opt[data-id="b"]');
+    await page.waitForTimeout(200);
+    const picked = await page.evaluate(() => ({ p: window.__picked, label: document.querySelector('.inter-pick')?.textContent, n: document.querySelectorAll('.council-opt').length }));
+    check('council pick applied and shown', picked.p[0] === 'b' && (picked.label ?? '').includes('휴식') && picked.n === 0, JSON.stringify(picked));
+    const goH = await page.evaluate(() => document.querySelector('.inter-go').getBoundingClientRect().height);
+    check('"바로 시작" is a 44 px target', goH >= 44, String(goH));
+    // approach arrows for every edge stay inside the map area and out from under the HUD and the alerts
+    await page.evaluate(() => {
+      const w = window.__app.battle.world;
+      w.nextWaveEdges = () => ['W', 'N', 'S', 'E'];
+      w.events.push({ type: 'test', text: '물결을 막아냈습니다! (시험)', level: 'good' }, { type: 'test', text: '화살을 회수했습니다 (시험)', level: 'info' });
+    });
+    await page.waitForTimeout(300);
+    const ap = await page.evaluate(() => {
+      const b = window.__app.battle;
+      const rect = (el) => el.getBoundingClientRect();
+      const top = rect(document.querySelector('.hud-top')).bottom;
+      const bar = rect(document.querySelector('.hud-bottom')).top;
+      const covers = [...document.querySelectorAll('.toasts .toast, .inter, .hud-left .side-btn, .hud-right .ability')].map(rect);
+      const R = 12;
+      return b.renderer.approachPts.map((a) => ({ e: a.edge, x: Math.round(a.x), y: Math.round(a.y), ok: a.y - R >= top && a.y + R <= bar && a.x - R >= 0 && a.x + R <= innerWidth && !covers.some((q) => a.x + R > q.left && a.x - R < q.right && a.y + R > q.top && a.y - R < q.bottom) }));
+    });
+    await shot('05c_approach_all_edges');
+    check('approach arrows visible on every edge (not under bars, panels or alerts)', ['W', 'N', 'S', 'E'].every((e) => ap.some((a) => a.e === e)) && ap.every((a) => a.ok), JSON.stringify(ap));
+  } else check('council options shown', false, 'no intermission: ' + (await state()).state);
 
   // portrait screenshot of the running battle
   await page.setViewportSize({ width: 390, height: 844 });
@@ -245,6 +388,24 @@ async function run() {
   await shot('14_wardrobe');
   check('wardrobe equip', !!(await page.$('.item.equipped')));
 
+  // ---------------------------------------------------------------- 4b. supply packs are planned, not paid, until a result
+  await page.click('.topbar .back');
+  await page.evaluate(() => {
+    window.__app.save.gold = Math.max(window.__app.save.gold, 200);
+    window.__app.go('campaign');
+  });
+  await (await page.$$('.stage-card'))[0].click();
+  await page.waitForSelector('.prebattle');
+  const gPlan = (await save()).gold;
+  await page.click('.sup-row .btn');
+  await page.waitForTimeout(120);
+  const planText = (await page.textContent('.plan-line')) ?? '';
+  check('supply pack planned, gold untouched', (await save()).gold === gPlan && planText.includes('◉'), planText);
+  await shot('14b_supply_plan');
+  await page.click('.topbar .back');
+  await page.waitForTimeout(120);
+  check('leaving prebattle charges nothing', (await save()).gold === gPlan, `${gPlan} -> ${(await save()).gold}`);
+
   // ---------------------------------------------------------------- 5. settings: export/import strips purchases
   await page.click('.topbar .back');
   await page.click('text=설정');
@@ -282,6 +443,7 @@ async function run() {
   await page.click('.pre-actions .btn.primary');
   await page.waitForSelector('.battle');
   await closeModals();
+  check('battle speed remembered', await page.evaluate(() => window.__app.battle.speed === 3 && document.querySelector('.speed.on')?.dataset.speed === '3'));
   await page.click('.start-btn');
   await page.evaluate(() => {
     const w = window.__app.battle.world;
@@ -346,7 +508,7 @@ try {
 } catch (err) {
   check('e2e run', false, String(err && err.stack ? err.stack.split('\n').slice(0, 3).join(' ') : err));
 } finally {
-  server.kill();
+  stopServer();
   console.log(results.join('\n'));
   console.log(failed ? `\n${failed} FAILED` : '\nALL PASSED');
   process.exit(failed ? 1 : 0);
