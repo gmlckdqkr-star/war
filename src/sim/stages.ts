@@ -38,6 +38,8 @@ export interface StageDef {
   factions: FactionId[];
   squadCap: number;
   level: number; // enemy stat scaling
+  /** extra multiplier on enemy HP and attack alike (daily '정예군'); level alone scales attack by √level */
+  enemyMul?: number;
   supplies: Supplies;
   reward: number; // gold for first clear (3 stars), scaled by stars
   keepHp: number;
@@ -567,7 +569,8 @@ export function dailyChallenge(dateKey: string, maxClearedIndex: number): { stag
     name: `오늘의 공성: ${base.name}`,
     subtitle: mod.name,
     story: `${mod.name} — ${mod.desc}. 하루 한 번 보상을 받을 수 있습니다.`,
-    level: base.level * (mod.id === 'elite' ? 1.3 : 1),
+    level: base.level,
+    enemyMul: mod.id === 'elite' ? 1.3 : undefined,
     supplies: sup,
     waves,
     abilities: ['rally', 'volley', 'oil', 'reserve'],

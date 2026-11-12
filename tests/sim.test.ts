@@ -3,6 +3,7 @@ import { GH, GW, Tile } from '../src/sim/defs';
 import { Grid } from '../src/sim/grid';
 import { RNG } from '../src/sim/rng';
 import { STAGES, dailyChallenge, endlessStage } from '../src/sim/stages';
+import { josa } from '../src/sim/josa';
 import { ST, World } from '../src/sim/world';
 import { newSave, newSquad } from '../src/meta/save';
 import { battleConfig, defaultLineup } from '../src/meta/progression';
@@ -153,6 +154,35 @@ describe('battle simulation', () => {
     w.start();
     for (let i = 0; i < 30 * 120; i++) w.step();
     expect(w.waveIdx).toBeGreaterThanOrEqual(1);
+  });
+
+  it("daily '정예군' raises enemy HP and attack by the advertised 30%", () => {
+    let key = '';
+    for (let d = 1; d <= 28 && !key; d++) if (dailyChallenge(`2027-01-${String(d).padStart(2, '0')}`, 10).mod.id === 'elite') key = `2027-01-${String(d).padStart(2, '0')}`;
+    const dc = dailyChallenge(key, 10);
+    expect(dc.mod.desc).toContain('+30%');
+    const base = STAGES.find((x) => dc.stage.name.endsWith(x.name))!;
+    const s = armyFor(base.index);
+    const wd = new World(battleConfig(s, dc.stage, defaultLineup(s, dc.stage), {}, 1, { mods: [dc.mod.id] }));
+    const wb = new World(battleConfig(s, base, defaultLineup(s, base), {}, 1));
+    expect(wd.hpScale / wb.hpScale).toBeCloseTo(1.3, 5);
+    expect(wd.atkScale / wb.atkScale).toBeCloseTo(1.3, 5);
+  });
+
+  it('battle messages pick Korean particles instead of "이(가)"', () => {
+    const st = STAGES[0];
+    const s = armyFor(1);
+    const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, 3));
+    w.start();
+    const texts: string[] = [];
+    while ((w.state === 'battle' || w.state === 'intermission') && w.t < 400) {
+      w.step();
+      for (const e of w.events.splice(0)) texts.push(e.text);
+    }
+    const broken = texts.filter((t) => t.includes('무너져 달아납니다'));
+    expect(broken.length).toBeGreaterThan(0);
+    for (const t of texts) expect(t).not.toMatch(/\((이|가|을|를|은|는|와|과|으)\)/);
+    expect(broken).toContain(`${josa('징집병 무리', '이/가')} 무너져 달아납니다!`);
   });
 
   it('abilities respect cooldowns and supplies', () => {

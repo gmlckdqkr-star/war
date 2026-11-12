@@ -18,6 +18,7 @@ import {
 } from './defs';
 import { Grid, cx, cy, idx, inb, newField, tileAt, tx, ty, type Field, N8 } from './grid';
 import { SpatialHash } from './hash';
+import { josa } from './josa';
 import { RNG } from './rng';
 import type { Edge, StageDef, Supplies, WaveGroup } from './stages';
 import { CouncilState, runCouncil, autoCommander } from './council';
@@ -299,8 +300,9 @@ export class World {
     this.autoCommand = !!cfg.autoCommand;
     const lvl = cfg.stage.level;
     const diff = cfg.difficulty === 'easy' ? 0.72 : cfg.difficulty === 'hard' ? 1.22 : 1;
-    this.hpScale = lvl * diff;
-    this.atkScale = Math.sqrt(lvl) * diff;
+    const elite = cfg.stage.enemyMul ?? 1;
+    this.hpScale = lvl * diff * elite;
+    this.atkScale = Math.sqrt(lvl) * diff * elite;
     const stageRng = new RNG(cfg.seed ^ 0x5bd1e995);
     cfg.stage.build(this.grid, stageRng);
     let hpMul = 1 + 0.12 * (this.up.masonry ?? 0);
@@ -988,7 +990,7 @@ export class World {
     if (n) {
       x /= n;
       y /= n;
-      this.event('broken', `${b.tpl.name}이(가) 무너져 달아납니다!`, 'good', x, y);
+      this.event('broken', `${josa(b.tpl.name, '이/가')} 무너져 달아납니다!`, 'good', x, y);
       for (const sq of this.squads) if (sq.alive && Math.hypot(sq.cx - x, sq.cy - y) < 10 * T) sq.morale = Math.min(100, sq.morale + 8);
     }
   }
