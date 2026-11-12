@@ -19,6 +19,8 @@ for (let i = 1; i < st.index; i++) s.stars['s' + i] = 2;
 s.upgrades = { drill: 2, logistics: 2, medicine: 1, masonry: 2, fletching: 1, smithing: 2 };
 s.roster.push(newSquad(s, 'engineer'), newSquad(s, 'archer'), newSquad(s, 'spear'));
 const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, seed));
+// this battle's approach plan (bands may swing round to another side, per seed)
+w.stage.waves.forEach((wv, i) => console.log(`wave ${i + 1}: ${wv.groups.map((g) => `${g.band}${(g.n ?? 1) > 1 ? 'x' + g.n : ''}@${g.edge}`).join(' ')}`));
 w.start();
 let next = 0;
 while ((w.state === 'battle' || w.state === 'intermission') && w.t < BATTLE_HARD_CAP + 60) {
@@ -31,4 +33,4 @@ while ((w.state === 'battle' || w.state === 'intermission') && w.t < BATTLE_HARD
     for (const e of w.events.splice(0)) console.log('   ·', e.text);
   }
 }
-console.log(JSON.stringify({ won: w.result?.won, stars: w.result?.stars, dead: w.result?.dead, waves: w.result?.wavesCleared }));
+console.log(JSON.stringify({ won: w.result?.won, stars: w.result?.stars, dead: w.result?.dead, waves: w.result?.wavesCleared, council: w.councilLog, supplies: w.supplies }));

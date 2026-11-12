@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { GH, GW, Tile } from '../src/sim/defs';
-import { Grid, idx } from '../src/sim/grid';
+import { GH, GW, TILE_INFO, Tile } from '../src/sim/defs';
+import { Grid, SPAWN_GAP, idx, tileAt } from '../src/sim/grid';
 import { RNG } from '../src/sim/rng';
-import { STAGES, dailyChallenge, endlessStage } from '../src/sim/stages';
+import { ENDLESS_CASTLES, ENDLESS_RESUPPLY, STAGES, dailyChallenge, endlessStage, planWaves, swarmWave, type Edge, type StageDef } from '../src/sim/stages';
+import { COUNCIL_IDS, COUNCIL_NAMES, GATE_BOOST, REPAIR_FRAC, councilDesc } from '../src/sim/warcouncil';
 import { josa } from '../src/sim/josa';
-import { ACT, BAND_STALL_T, BATTLE_HARD_CAP, DRAGON_MAX_STAY, DRAGON_PAIN_MAX, DRAGON_STAY_ALONE, GATE_SAFE_R, ST, TREB_SPLASH_DMG, World, isEngine, type Unit } from '../src/sim/world';
+import { ACT, BAND_STALL_T, BATTLE_HARD_CAP, CAP_HOLD_N, KEEP_PRESS_MAX, KEEP_PRESS_T, SAPPER_COVER, SAPPER_DIG_T, DRAGON_FLEE_HP, DRAGON_MAX_STAY, DRAGON_PAIN_DMG, DRAGON_PAIN_MAX, GARRISON_GRACE, GATE_SAFE_R, ST, TOWER_EMPTY_T, TREB_SPLASH_DMG, World, isEngine, type Unit } from '../src/sim/world';
 import { newSave, newSquad } from '../src/meta/save';
-import { battleConfig, defaultLineup } from '../src/meta/progression';
+import { LEVY_BELOW, LEVY_MAX_SQUADS, UPGRADES, applyBattle, baseSupplies, battleConfig, defaultLineup, foodNeeded, lineupSoldiers, upgradeCost } from '../src/meta/progression';
 
 function armyFor(stageIdx: number) {
   const s = newSave(0);
@@ -50,11 +51,11 @@ describe('stages', () => {
       g.enemyField('breach', fld);
       return fld;
     })();
-    const edges = new Set(st.waves.flatMap((w) => w.groups.map((x) => x.edge)));
+    const edges = new Set([...st.waves.flatMap((w) => w.groups.map((x) => x.edge)), ...(st.lanes ?? []).map((l) => l.edge)]);
     for (const e of edges) {
       let reachable = false;
-      for (let k = 0; k < (e === 'W' ? GH : GW); k++) {
-        const i = e === 'W' ? k * GW : e === 'N' ? k : (GH - 1) * GW + k;
+      for (let k = 0; k < (e === 'W' || e === 'E' ? GH : GW); k++) {
+        const i = e === 'W' ? k * GW : e === 'E' ? k * GW + GW - 1 : e === 'N' ? k : (GH - 1) * GW + k;
         if (isFinite(f.dist[i])) reachable = true;
       }
       expect(reachable, `edge ${e}`).toBe(true);
@@ -70,7 +71,8 @@ describe('wall line', () => {
   it('s9 field rubble is outside ground; only collapsed walls of the castle are boundary and rebuildable', () => {
     const st = STAGES.find((x) => x.id === 's9')!;
     const s = armyFor(9);
-    const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, 1234));
+    // brittle walls (a daily modifier) on top of masonry research: rebuilt walls must match them
+    const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, 1234, { mods: ['brittle'] }));
     const g = w.grid;
     let fieldRubble = 0;
     for (let i = 0; i < g.n; i++) {
@@ -96,6 +98,11 @@ describe('wall line', () => {
       if (eng.taskTile >= 0) expect(g.wallLine[eng.taskTile]).toBe(1);
     }
     expect(picked).toBe(true);
+    // the rebuilt wall is as strong as the castle's own this battle (masonry research and modifiers)
+    for (let i = 0; i < 30 * 90 && g.tiles[gap] !== Tile.WALL; i++) w.step();
+    expect(g.tiles[gap]).toBe(Tile.WALL);
+    expect(w.structHpMul).toBeCloseTo((1 + 0.12 * 2) * 0.65, 5);
+    expect(g.maxHp[gap]).toBeCloseTo(TILE_INFO[Tile.WALL].maxHp * w.structHpMul, 2);
   });
 });
 
@@ -112,6 +119,34 @@ describe('siege engines', () => {
     const b = w.bands[w.bands.length - 1];
     return { w, b, core: b.core };
   }
+
+  it('a climber whose ladder is pushed away falls to the wall foot outside, never into the wall', () => {
+    const { w } = lone('s3', 'h_escalade', 7);
+    const g = w.grid;
+    let climber: Unit | undefined;
+    for (let i = 0; i < 30 * 120 && !climber; i++) {
+      for (const e of w.enemies) e.hp = e.maxHp; // whatever the castle's strength, let them reach the wall
+      w.step();
+      climber = w.enemies.find((e) => e.state === ST.CLIMB);
+    }
+    expect(climber).toBeDefined();
+    const c = climber!;
+    // let him get well up the ladder (over the wall tile), then the ladder goes
+    for (let i = 0; i < 20 && c.state === ST.CLIMB; i++) w.step();
+    expect(c.state).toBe(ST.CLIMB);
+    // he is over the wall tile itself by now
+    c.x = (c.actTile % GW + 0.5) * 16;
+    c.y = (Math.floor(c.actTile / GW) + 0.5) * 16;
+    const lad = w.ladderAt(c.actTile)!;
+    expect(lad).toBeTruthy();
+    w.removeLadder(lad, true);
+    w.step();
+    expect(c.state).not.toBe(ST.CLIMB);
+    expect(c.elev).toBe(false);
+    const i = tileAt(c.x, c.y);
+    expect(g.isStruct(i)).toBe(false);
+    expect(g.inside[i]).toBe(0);
+  });
 
   it('escorts screen the ram at its pace and the ram hits the gate even after the escort breaks', () => {
     const { w, b, core } = lone('s4', 'w_ram');
@@ -181,6 +216,77 @@ describe('siege engines', () => {
     expect(w.ladders.some((l) => l.tower === tower)).toBe(true);
   });
 
+  it('a digging sapper works under a mantlet: missiles do less damage, a blow from the wall walk full', () => {
+    const { w, core } = lone('s4', 'w_sappers', 3);
+    const sap = core[0];
+    const bow = w.defs.find((u) => u.def.id === 'd_xbow')!;
+    w.step();
+    sap.act = ACT.DIG;
+    sap.screened = false;
+    let h = sap.hp;
+    w.damage(sap, 20, 0, bow, true);
+    const shot = h - sap.hp;
+    h = sap.hp;
+    w.damage(sap, 20, 0, bow, false);
+    const blow = h - sap.hp;
+    expect(shot).toBeCloseTo(blow * SAPPER_COVER, 5);
+    expect(SAPPER_COVER).toBeLessThan(1);
+    expect(SAPPER_DIG_T).toBeGreaterThanOrEqual(8);
+  });
+
+  it('a docked tower nobody climbs any more stops holding its band in the fight', () => {
+    const { w, b, core } = lone('s6', 'h_tower');
+    const tower = core[0];
+    for (let i = 0; i < 30 * 150 && tower.act !== ACT.DOCKED && tower.state === ST.ACTIVE; i++) w.step();
+    expect(tower.act).toBe(ACT.DOCKED);
+    w.waveIdx = w.totalWaves() - 1; // the last wave: only this tower is left
+    for (const u of b.units) if (u !== tower && u.state !== ST.DEAD) w.killEnemy(u, null);
+    // only archers are left on the walls: they find the tower too stout to shoot at
+    for (const u of w.defs) if (u.def.id !== 'd_archer' && u.state !== ST.DEAD) w.killDef(u);
+    tower.hp = tower.maxHp * 0.9;
+    b.contactT = w.t; // the last of its men went up the tower just now
+    const t0 = w.t;
+    let leftAfter = -1;
+    for (let i = 0; i < 30 * (BAND_STALL_T + 20) && w.state === 'battle'; i++) {
+      // nobody hurts it (a stray arrow at most)
+      tower.hp = Math.max(tower.hp, tower.maxHp * 0.9);
+      tower.crew = 100;
+      w.step();
+      if (leftAfter < 0 && tower.fleeing) leftAfter = w.t - t0;
+    }
+    expect(tower.fleeing || tower.state !== ST.ACTIVE).toBe(true);
+    // an empty tower is pulled back soon, not after a full stall
+    expect(leftAfter).toBeGreaterThan(0);
+    expect(leftAfter).toBeLessThan(TOWER_EMPTY_T + 5);
+    expect(w.state).toBe('won');
+    expect(w.t - t0).toBeLessThan(BAND_STALL_T + 20);
+  });
+
+  it('a fleeing ram inside the courtyard leaves the way it came in instead of pressing on the far wall', () => {
+    const { w, core } = lone('s4', 'w_ram');
+    const ram = core[0];
+    const g = w.grid;
+    // put it in the inner courtyard of the pass fort, behind the broken inner gate
+    const gate = idx(42, 17);
+    w.destroyStruct(gate, 'broken');
+    w.destroyStruct(idx(30, 17), 'broken');
+    w.step();
+    ram.x = 46.5 * 16;
+    ram.y = 17.5 * 16;
+    w.engineRetreat(ram);
+    let maxX = ram.x;
+    for (let i = 0; i < 30 * 150 && ram.state === ST.ACTIVE; i++) {
+      ram.hp = ram.maxHp; // let it go: we only follow its way out
+      w.step();
+      maxX = Math.max(maxX, ram.x);
+    }
+    expect(ram.state).toBe(ST.FLED);
+    // out by the west, through both broken gates, not out the back of the pass fort
+    expect(ram.x).toBeLessThan(3 * 16);
+    expect(maxX).toBeLessThan(48 * 16);
+    expect(g.inside[idx(0, Math.floor(ram.y / 16))]).toBe(0);
+  });
+
   it('screened sappers reach the wall and dig, but are exposed while digging', () => {
     const { w, core } = lone('s4', 'w_sappers', 3, ['w_wall']);
     let dug = false;
@@ -194,6 +300,62 @@ describe('siege engines', () => {
     expect(dug).toBe(true);
     for (let i = 0; i < 15; i++) w.step();
     for (const u of core) if (u.act === ACT.DIG) expect(u.screened).toBe(false);
+  });
+
+  it('a mine stays dug when its miner falls: the next sapper at that wall carries on', () => {
+    const { w, core } = lone('s4', 'w_sappers', 3);
+    const g = w.grid;
+    w.step();
+    const wall = idx(30, 14);
+    expect(g.tiles[wall]).toBe(Tile.WALL);
+    const [a, b] = core;
+    w.handleObstacle(a, wall);
+    expect(a.act).toBe(ACT.DIG);
+    const half = SAPPER_DIG_T / 2;
+    for (let i = 0; i < Math.round(30 * half); i++) {
+      a.hp = a.maxHp;
+      w.step();
+    }
+    w.killEnemy(a, null);
+    expect(w.mineProg[wall]).toBeCloseTo(half, 0);
+    expect(g.tiles[wall]).toBe(Tile.WALL);
+    // the second miner needs only what is left of the gallery
+    w.handleObstacle(b, wall);
+    expect(b.act).toBe(ACT.DIG);
+    expect(b.timer).toBeCloseTo(SAPPER_DIG_T - half, 0);
+    let took = 0;
+    for (let i = 0; i < 30 * SAPPER_DIG_T && g.tiles[wall] === Tile.WALL; i++) {
+      b.hp = b.maxHp;
+      w.step();
+      took += 1 / 30;
+    }
+    expect(g.tiles[wall]).toBe(Tile.RUBBLE);
+    expect(took).toBeLessThan(SAPPER_DIG_T - half + 0.5);
+    expect(w.mineProg[wall]).toBe(0);
+  });
+
+  it('crossbowmen who have shot their quivers empty go home instead of hacking at the gate', () => {
+    const { w, b } = lone('s4', 'w_bolts', 1);
+    const g = w.grid;
+    w.step();
+    const wall = idx(30, 14);
+    const men = b.units.filter((u) => u.state === ST.ACTIVE);
+    expect(men.length).toBeGreaterThan(3);
+    // one bolt left among them: the band is still in the fight, and an empty-handed man hits the wall
+    for (const u of men) u.ammo = 0;
+    men[0].ammo = 1;
+    const hp0 = g.hp[wall];
+    men[1].cd = 0;
+    w.handleObstacle(men[1], wall);
+    expect(b.broken).toBe(false);
+    expect(g.hp[wall]).toBeLessThan(hp0);
+    // the last bolt gone: hacking at stone is no siege for them, the band goes home
+    men[0].ammo = 0;
+    men[1].cd = 0;
+    w.handleObstacle(men[1], wall);
+    expect(b.broken).toBe(true);
+    expect(men.every((u) => u.fleeing || u.state !== ST.ACTIVE)).toBe(true);
+    expect(w.events.some((e) => e.type === 'withdraw')).toBe(true);
   });
 });
 
@@ -330,6 +492,72 @@ describe('stalemates', () => {
     expect(w.result!.won).toBe(true);
     expect(w.t).toBeLessThanOrEqual(BATTLE_HARD_CAP + 1 / 30 + 1e-9);
   });
+
+  it('a garrison with nobody left standing loses the castle after a short grace', () => {
+    const st = STAGES.find((x) => x.id === 's3')!;
+    const s = armyFor(st.index);
+    const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, 5));
+    w.start();
+    for (let i = 0; i < 30 * 5; i++) w.step();
+    for (const u of w.defs) if (u.state !== ST.DEAD) w.killDef(u);
+    for (let i = 0; i < 30 * (GARRISON_GRACE - 1); i++) w.step();
+    expect(w.state).toBe('battle');
+    for (let i = 0; i < 30 * 2 && w.state === 'battle'; i++) w.step();
+    expect(w.state).toBe('lost');
+    expect(w.events.some((e) => e.type === 'wiped' && e.level === 'danger')).toBe(true);
+  });
+
+  it('at the hard cap, attackers holding the courtyard take the castle', () => {
+    const { w, b } = lastWaveWith('h_levies');
+    const g = w.grid;
+    const yard: number[] = [];
+    for (let i = 0; i < g.n; i++) if (g.inside[i] && !g.keepAdj[i]) yard.push(i);
+    b.units.slice(0, CAP_HOLD_N + 1).forEach((u, k) => {
+      u.x = ((yard[k * 7] % GW) + 0.5) * 16;
+      u.y = (Math.floor(yard[k * 7] / GW) + 0.5) * 16;
+    });
+    w.t = BATTLE_HARD_CAP - 1 / 30;
+    w.step();
+    expect(w.state).toBe('lost');
+    expect(w.result!.won).toBe(false);
+    expect(w.events.some((e) => e.type === 'siegeend' && e.level === 'danger')).toBe(true);
+  });
+
+  it('an assault on the keep grows stronger the longer it lasts, and is announced without spam', () => {
+    const { w, b } = lastWaveWith('h_levies');
+    // the band stays put at the map edge; its first man stands for 'someone hammering at the keep door'
+    const pin = b.units.map((u) => [u.x, u.y]);
+    const hammer = b.units[0];
+    w.keepMax = w.keepHp = 1e6; // never falls here
+    const lossOver = (secs: number, hitting = true) => {
+      const k0 = w.keepHp;
+      for (let i = 0; i < 30 * secs; i++) {
+        b.units.forEach((u, k) => {
+          u.x = pin[k][0];
+          u.y = pin[k][1];
+        });
+        if (hitting && i % 30 === 0) {
+          hammer.cd = 0;
+          w.attackKeep(hammer);
+        }
+        w.step();
+      }
+      return k0 - w.keepHp;
+    };
+    const first = lossOver(15);
+    lossOver(KEEP_PRESS_T * 2);
+    const later = lossOver(15);
+    expect(first).toBeGreaterThan(0);
+    expect(later / first).toBeGreaterThan(2);
+    expect(w.keepPressMul()).toBeLessThanOrEqual(1 + KEEP_PRESS_MAX);
+    // one alert opens the assault; no fresh alert every few seconds while it goes on
+    expect(w.events.filter((e) => e.type === 'keep').length).toBe(1);
+    // driven off, the pressure ebbs; a new assault after a lull is announced again
+    lossOver(60, false);
+    expect(w.keepPressMul()).toBeLessThan(1 + KEEP_PRESS_MAX);
+    lossOver(3);
+    expect(w.events.filter((e) => e.type === 'keep').length).toBe(2);
+  });
 });
 
 describe('dragon', () => {
@@ -348,17 +576,49 @@ describe('dragon', () => {
     for (let i = 0; i < 30 * maxS && !d.fleeing && d.state === ST.ACTIVE; i++) w.step();
   };
 
-  it('ignores the collapse of its retinue, but does not linger alone forever', () => {
+  it('ignores the collapse of its retinue: unhurt, it stays and keeps burning', () => {
     const { w, d } = dragonWorld();
     for (let i = 0; i < 30 * 20; i++) w.step();
     const band = d.band!;
     for (const u of band.units) if (u !== d && u.state === ST.ACTIVE) w.killEnemy(u, null);
     w.breakBand(band);
-    for (let i = 0; i < 30 * 10; i++) w.step();
-    expect(d.fleeing).toBe(false); // fearless: still fighting 10 s after its band broke
-    flee(w, d, DRAGON_STAY_ALONE + 5);
+    // keep it unhurt: only wounds or ballista bolts may send it away
+    let breath = 0;
+    for (let i = 0; i < 30 * 60 && w.state === 'battle'; i++) {
+      d.hp = d.maxHp;
+      d.pain = 0;
+      w.step();
+      if (d.fState === 1) breath += 1 / 30;
+    }
+    expect(d.fleeing).toBe(false);
+    expect(d.state).toBe(ST.ACTIVE);
+    expect(breath).toBeGreaterThan(10);
+  });
+
+  it('a storm of arrows harries it off long before it is badly hurt; stray shots never do', () => {
+    const { w, d } = dragonWorld();
+    const bow = w.defs.find((u) => u.def.id === 'd_archer' || u.def.id === 'd_xbow')!;
+    // only the test's own shots reach it: the garrison's missile troops stand down
+    for (const u of w.defs) if (u.def.range > 0 && u !== bow) u.state = ST.DEAD;
+    bow.x = bow.y = -999;
+    for (let i = 0; i < 30 * 15; i++) w.step();
+    // stray shots: 1% of its HP every 3 s wears off faster than it builds
+    for (let k = 0; k < 20 && !d.fleeing; k++) {
+      w.damage(d, d.maxHp * 0.01, 1, bow, true);
+      for (let i = 0; i < 90; i++) w.step();
+    }
+    expect(d.fleeing).toBe(false);
+    expect(d.pain).toBeLessThan(1);
+    // a storm: the same arrows all at once
+    const hp0 = d.hp;
+    for (let k = 0; k < 60 && d.pain < DRAGON_PAIN_MAX + 0.5; k++) w.damage(d, d.maxHp * 0.01, 1, bow, true);
+    const lost = (hp0 - d.hp) / d.maxHp;
+    expect(lost).toBeGreaterThanOrEqual(DRAGON_PAIN_MAX * DRAGON_PAIN_DMG - 0.001);
+    expect(lost).toBeLessThan((DRAGON_PAIN_MAX + 1) * DRAGON_PAIN_DMG);
+    flee(w, d, 1);
     expect(d.fleeing).toBe(true);
-    expect(w.t - band.brokenT).toBeLessThan(DRAGON_STAY_ALONE + 2);
+    expect(d.hp / d.maxHp).toBeGreaterThan(DRAGON_FLEE_HP);
+    expect(w.stats.dragons).toBe(1);
   });
 
   it('is driven off by sustained ballista hits and counts once in stats.dragons', () => {
@@ -562,5 +822,353 @@ describe('battle simulation', () => {
     expect(w.abilities.rally.cd).toBeGreaterThan(0);
     expect(w.useAbility('reserve', 0, 0)).toBeNull();
     expect(w.useAbility('reserve', 0, 0)).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------- balance & depth
+
+/** a world of `stageId` brought to its first intermission (wave 1 swept away) */
+function atCouncil(stageId: string, seed: number, auto: boolean) {
+  const st = STAGES.find((x) => x.id === stageId)!;
+  const s = armyFor(st.index);
+  s.settings.autoCommand = auto;
+  const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, seed));
+  w.start();
+  w.pending = [];
+  for (const e of w.enemies) e.state = ST.DEAD;
+  w.step();
+  expect(w.state).toBe('intermission');
+  return w;
+}
+
+describe('war council', () => {
+  it('offers three named options each intermission, the same for the same seed and wave', () => {
+    const a = atCouncil('s6', 11, false);
+    const b = atCouncil('s6', 11, false);
+    const oa = a.councilOptions();
+    expect(oa.length).toBe(3);
+    expect(new Set(oa.map((o) => o.id)).size).toBe(3);
+    expect(oa).toEqual(b.councilOptions());
+    // names <= 6 characters, descriptions <= 30, for every option of the pool
+    for (const id of COUNCIL_IDS) {
+      expect([...COUNCIL_NAMES[id]].length, id).toBeLessThanOrEqual(6);
+      const d = councilDesc(a, id);
+      expect(d.length, id).toBeGreaterThan(0);
+      expect([...d].length, d).toBeLessThanOrEqual(30);
+    }
+    // different seeds draw different offers, and the whole pool shows up
+    const seen = new Set<string>();
+    const sets = new Set<string>();
+    for (let seed = 1; seed <= 24; seed++) {
+      const w = atCouncil('s6', seed, false);
+      const ids = w.councilOptions().map((o) => o.id);
+      ids.forEach((i) => seen.add(i));
+      sets.add(ids.join(','));
+    }
+    expect(sets.size).toBeGreaterThan(5);
+    expect([...seen].sort()).toEqual([...COUNCIL_IDS].sort());
+    // not outside an intermission
+    const w = atCouncil('s6', 11, false);
+    w.skipIntermission();
+    expect(w.state).toBe('battle');
+    expect(w.councilOptions()).toEqual([]);
+    expect(w.chooseCouncil(oa[0].id)).toBe(false);
+  });
+
+  it('allows one pick per intermission, which takes effect at once and is announced', () => {
+    const w = atCouncil('s6', 11, false);
+    w.councilOffer = ['resupply', 'repair', 'rest'];
+    w.events.length = 0;
+    const arrows = w.supplies.arrows;
+    expect(w.chooseCouncil('scout')).toBe(false); // not on offer
+    expect(w.chooseCouncil('resupply')).toBe(true);
+    expect(w.supplies.arrows).toBe(arrows + w.councilAmt.resupply);
+    expect(w.councilOptions(), 'none left after a pick').toEqual([]);
+    expect(w.councilPick).toBe('resupply');
+    expect(w.chooseCouncil('repair')).toBe(false);
+    expect(w.events.filter((e) => e.type === 'council').length).toBe(1);
+
+    // repair: damaged walls and gates get REPAIR_FRAC of their strength back
+    const r = atCouncil('s6', 11, false);
+    const g = r.grid;
+    const wall = g.structTiles.find((i) => g.tiles[i] === Tile.WALL)!;
+    const gate = g.structTiles.find((i) => g.tiles[i] === Tile.GATE)!;
+    g.hp[wall] = g.maxHp[wall] * 0.1;
+    g.hp[gate] = g.maxHp[gate] * 0.5;
+    r.councilOffer = ['repair', 'rest', 'scout'];
+    expect(r.chooseCouncil('repair')).toBe(true);
+    expect(g.hp[wall] / g.maxHp[wall]).toBeCloseTo(0.1 + REPAIR_FRAC, 5);
+    expect(g.hp[gate] / g.maxHp[gate]).toBeCloseTo(Math.min(1, 0.5 + REPAIR_FRAC), 5);
+
+    // gate: a broken gate stands again, an intact one is stronger than before
+    const q = atCouncil('s6', 11, false);
+    const gq = q.grid;
+    const gates = gq.structTiles.filter((i) => gq.tiles[i] === Tile.GATE);
+    const full = gq.maxHp[gates[1]];
+    q.destroyStruct(gates[0], 'broken');
+    expect(gq.tiles[gates[0]]).toBe(Tile.GATE_BROKEN);
+    q.councilOffer = ['gate', 'rest', 'scout'];
+    expect(q.chooseCouncil('gate')).toBe(true);
+    expect(gq.tiles[gates[0]]).toBe(Tile.GATE);
+    expect(gq.maxHp[gates[1]]).toBeCloseTo(full * GATE_BOOST, 3);
+    expect(gq.maxHp[gates[0]]).toBeCloseTo(q.gateBaseHp() * GATE_BOOST, 3);
+    expect(gq.hp[gates[1]]).toBeCloseTo(gq.maxHp[gates[1]], 3);
+
+    // scout: a report of the next wave, by side
+    const sc = atCouncil('s6', 11, false);
+    sc.councilOffer = ['scout', 'rest', 'repair'];
+    sc.events.length = 0;
+    expect(sc.chooseCouncil('scout')).toBe(true);
+    const rep = sc.events.find((e) => e.type === 'scout')!;
+    expect(rep.text).toContain('정찰 보고');
+    for (const e of sc.nextWaveEdges()) expect(rep.text).toContain({ W: '서쪽', N: '북쪽', S: '남쪽', E: '동쪽' }[e]!);
+  });
+
+  it('the auto-commander decides an untaken council when the next wave starts; without it nothing happens', () => {
+    const a = atCouncil('s6', 11, true);
+    const n = atCouncil('s6', 11, false);
+    for (const w of [a, n]) {
+      w.events.length = 0;
+      w.skipIntermission();
+      expect(w.state).toBe('battle');
+    }
+    expect(a.councilLog.length).toBe(1);
+    const ev = a.events.find((e) => e.type === 'council')!;
+    expect(ev.text).toContain('작전 회의가');
+    expect(ev.text).toContain(COUNCIL_NAMES[a.councilLog[0]]);
+    expect(n.councilLog.length).toBe(0);
+    expect(n.events.some((e) => e.type === 'council')).toBe(false);
+    // the auto pick answers the castle's need: with the stores empty of food, it forages
+    const f = atCouncil('s6', 12, true);
+    f.councilOffer = ['scout', 'forage', 'rest'];
+    f.supplies.food = 0;
+    f.skipIntermission();
+    expect(f.councilLog).toEqual(['forage']);
+    expect(f.starving).toBe(false);
+  });
+});
+
+/** where a band of `lane` would appear on a castle built from `seed` */
+function laneCheck(st: StageDef, seed: number) {
+  const g = new Grid();
+  st.build(g, new RNG(seed));
+  g.finalize(1);
+  const fld = () => ({ dist: new Float64Array(GW * GH), next: new Int32Array(GW * GH) });
+  const breach = fld();
+  const esc = fld();
+  g.enemyField('breach', breach);
+  g.enemyField('escalade', esc);
+  const lanes: { edge: Edge; span: [number, number] }[] = [...(st.lanes ?? []), ...st.waves.flatMap((w) => w.groups)];
+  for (const l of lanes)
+    for (const along of [l.span[0], (l.span[0] + l.span[1]) / 2, l.span[1]]) {
+      const t = g.spawnTile(l.edge, along);
+      const where = `${st.id} ${l.edge} ${along}`;
+      expect(t, where).toBeGreaterThanOrEqual(0);
+      const x = t % GW;
+      const y = Math.floor(t / GW);
+      const off = l.edge === 'W' ? x : l.edge === 'E' ? GW - 1 - x : l.edge === 'N' ? y : GH - 1 - y;
+      expect(off, `${where}: spawns ${off} tiles in from its edge`).toBeLessThanOrEqual(6);
+      expect(g.wallDist[t], `${where}: spawns ${g.wallDist[t].toFixed(1)} tiles from the walls`).toBeGreaterThanOrEqual(SPAWN_GAP);
+      expect(isFinite(breach.dist[t]) && isFinite(esc.dist[t]), `${where} reaches the keep`).toBe(true);
+    }
+}
+
+describe('approaches', () => {
+  it.each(STAGES.map((s) => [s.id, s]))('%s: every lane spawns outside, near its edge, clear of the walls, and reaches the keep', (_id, st) => {
+    for (const seed of [1, 2, 3, 123]) laneCheck(st, seed);
+  });
+
+  it('the endless siege rotates through castles whose lanes all reach the keep', () => {
+    const ids = new Set<string>();
+    for (let seed = 0; seed < ENDLESS_CASTLES.length * 3; seed++) {
+      const st = endlessStage(seed);
+      ids.add(st.name + '|' + st.subtitle);
+      if (seed < ENDLESS_CASTLES.length) laneCheck({ ...st, waves: st.waves.slice(0, 12) }, seed);
+    }
+    expect(ids.size).toBe(ENDLESS_CASTLES.length);
+  });
+
+  it('the plan is fixed per seed, keeps every band, and spreads the attack over several sides', () => {
+    const count = (ws: { groups: { n?: number }[] }[]) => ws.map((w) => w.groups.reduce((a, g) => a + (g.n ?? 1), 0));
+    let west = 0;
+    let all = 0;
+    for (const st of STAGES.filter((s) => s.index >= 5)) {
+      expect(planWaves(st, 5)).toEqual(planWaves(st, 5));
+      const differs = [6, 7, 8, 9].some((s) => JSON.stringify(planWaves(st, s)) !== JSON.stringify(planWaves(st, 5)));
+      expect(differs, st.id).toBe(true);
+      for (let seed = 1; seed <= 20; seed++) {
+        const p = planWaves(st, seed);
+        expect(count(p)).toEqual(count(st.waves));
+        for (const w of p)
+          for (const g of w.groups) {
+            all += g.n ?? 1;
+            if (g.edge === 'W') west += g.n ?? 1;
+          }
+      }
+    }
+    // before: about 3 in 4 bands came from the west
+    expect(west / all).toBeLessThan(0.6);
+    // the first wave of the first castle always comes the scripted way
+    for (let seed = 1; seed <= 20; seed++) expect(planWaves(STAGES[0], seed)[0]).toEqual(STAGES[0].waves[0]);
+  });
+
+  it('nextWaveEdges announces exactly the sides each wave then comes from', () => {
+    const st = STAGES.find((x) => x.id === 's8')!;
+    const s = armyFor(8);
+    s.settings.autoCommand = true;
+    const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, 5));
+    const announced: string[][] = [];
+    announced[0] = w.nextWaveEdges();
+    w.start();
+    let wasInter = false;
+    while ((w.state === 'battle' || w.state === 'intermission') && w.t < BATTLE_HARD_CAP) {
+      w.step();
+      if (w.state === 'intermission' && !wasInter) announced[w.waveIdx + 1] = w.nextWaveEdges();
+      wasInter = w.state === 'intermission';
+      if (w.state === 'battle' && !announced[w.waveIdx]) announced[w.waveIdx] = w.nextWaveEdges();
+    }
+    const sideOf = (u: Unit): Edge => (u.spawnX < 0 ? 'W' : u.spawnX > 960 ? 'E' : u.spawnY < 0 ? 'N' : 'S');
+    const came: Set<string>[] = [];
+    for (const b of w.bands) (came[b.wave] ??= new Set()).add(sideOf(b.units[0]));
+    expect(came.length).toBeGreaterThan(2);
+    const sides = new Set<string>();
+    came.forEach((c, i) => {
+      expect([...c].sort(), `wave ${i + 1}`).toEqual([...announced[i]].sort());
+      c.forEach((e) => sides.add(e));
+    });
+    expect(sides.size).toBeGreaterThan(1);
+  });
+});
+
+describe('levy', () => {
+  it('a wiped-out army still fields the castle militia, which costs nothing and is not kept', () => {
+    const st = STAGES.find((x) => x.id === 's4')!;
+    const s = newSave(0);
+    const full = battleConfig(s, st, defaultLineup(s, st), {}, 5);
+    expect(full.squads.some((q) => q.type === 'militia')).toBe(false);
+    for (const r of s.roster) r.soldiers = [];
+    const ids = defaultLineup(s, st);
+    expect(lineupSoldiers(s, ids)).toBe(0);
+    const cfg = battleConfig(s, st, ids, {}, 5);
+    expect(cfg.squads.length).toBe(LEVY_MAX_SQUADS);
+    expect(cfg.squads.every((q) => q.type === 'militia')).toBe(true);
+    expect(cfg.squads.reduce((n, q) => n + q.soldiers.length, 0)).toBeGreaterThanOrEqual(LEVY_BELOW);
+    const w = new World(cfg);
+    w.start();
+    while ((w.state === 'battle' || w.state === 'intermission') && w.t < 120) w.step();
+    if (!w.result) w.surrender();
+    const roster = JSON.stringify(s.roster);
+    applyBattle(s, st, w.result!, 'campaign', new Date(2027, 0, 1));
+    expect(JSON.stringify(s.roster)).toBe(roster);
+    expect(s.gold).toBeGreaterThan(0);
+  });
+});
+
+describe('supplies', () => {
+  it('foodNeeded is the ration the sim hands out: half a ration per soldier per wave', () => {
+    const st = STAGES.find((x) => x.id === 's5')!;
+    const s = armyFor(5);
+    const ids = defaultLineup(s, st);
+    const w = new World(battleConfig(s, st, ids, {}, 3));
+    const n = lineupSoldiers(s, ids);
+    const f0 = w.supplies.food;
+    w.start();
+    expect(f0 - w.supplies.food).toBe(Math.ceil(n / 2));
+    expect(foodNeeded(st, n)).toBe(st.waves.length * Math.ceil(n / 2));
+  });
+
+  it('the first two castles feed their army; later castles need packs or the council', () => {
+    const s = newSave(0);
+    for (const id of ['s1', 's2']) {
+      const st = STAGES.find((x) => x.id === id)!;
+      if (id === 's2') s.roster.push(newSquad(s, 'archer')); // free squad for the first win
+      const n = lineupSoldiers(s, defaultLineup(s, st));
+      expect(baseSupplies(s, st).food, id).toBeGreaterThanOrEqual(foodNeeded(st, n));
+    }
+    for (const st of STAGES.filter((x) => x.index >= 3)) {
+      const a = armyFor(st.index);
+      const n = lineupSoldiers(a, defaultLineup(a, st));
+      expect(baseSupplies(a, st).food, st.id).toBeLessThan(foodNeeded(st, n));
+    }
+  });
+
+  it('research tops out expensive: the last levels cost far more than the first', () => {
+    let total = 0;
+    for (const u of UPGRADES) for (let lv = 0; lv < u.max; lv++) total += upgradeCost(u, lv);
+    expect(total).toBeGreaterThan(20000);
+    const masonry = UPGRADES.find((u) => u.id === 'masonry')!;
+    expect(upgradeCost(masonry, 4) / upgradeCost(masonry, 3)).toBeGreaterThan(2.5);
+  });
+});
+
+describe('daily and endless', () => {
+  it("'대군' brings 1.5x the bands of every wave, as it says", () => {
+    for (const st of STAGES)
+      for (const w of st.waves) {
+        const n = w.groups.reduce((a, g) => a + (g.n ?? 1), 0);
+        const m = swarmWave(w).groups.reduce((a, g) => a + (g.n ?? 1), 0);
+        expect(m, st.id).toBe(Math.round(n * 1.5));
+      }
+  });
+
+  it('endless waves grow in number and strength', () => {
+    const st = endlessStage(7);
+    // bands per wave, not counting the dragon of every tenth wave
+    const bands = st.waves.map((w) => w.groups.filter((g) => g.band !== 'c_dragon').length);
+    for (let i = 1; i < st.waves.length; i++) {
+      expect(st.waves[i].mul!).toBeGreaterThan(st.waves[i - 1].mul!);
+      expect(bands[i]).toBeGreaterThanOrEqual(bands[i - 1]);
+    }
+    expect(bands[24]).toBeGreaterThanOrEqual(bands[0] * 3);
+    // a later wave's soldiers are tougher than the same soldiers in the first wave
+    const s = armyFor(8);
+    const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, 7));
+    w.start();
+    const g = { band: 'h_levies', edge: 'W' as Edge, span: [16, 18] as [number, number], delay: 0 };
+    w.waveIdx = 0;
+    w.spawnBand(g, 0);
+    const first = w.enemies[w.enemies.length - 1];
+    w.waveIdx = 20;
+    w.spawnBand(g, 0);
+    const late = w.enemies[w.enemies.length - 1];
+    expect(late.def).toBe(first.def);
+    expect(late.maxHp / first.maxHp).toBeCloseTo(st.waves[20].mul! / st.waves[0].mul!, 5);
+    expect(late.atkMul / first.atkMul).toBeCloseTo(st.waves[20].mul! / st.waves[0].mul!, 5);
+  });
+
+  it('a supply train reaches the endless castle before every later wave, and the food forecast counts it', () => {
+    const st = endlessStage(3);
+    const s = armyFor(8);
+    s.settings.autoCommand = false; // no council pick in between (forage would add food too)
+    const ids = defaultLineup(s, st);
+    const w = new World(battleConfig(s, st, ids, {}, 11));
+    w.start();
+    expect(w.events.some((e) => e.type === 'resupply')).toBe(false);
+    let food = w.supplies.food;
+    let mats = w.supplies.mats;
+    while (w.waveIdx === 0 && w.t < 400) {
+      food = w.supplies.food;
+      mats = w.supplies.mats;
+      w.events.length = 0;
+      w.step();
+    }
+    expect(w.waveIdx).toBe(1);
+    expect(w.events.some((e) => e.type === 'resupply')).toBe(true);
+    const mouths = Math.ceil(w.defs.filter((u) => u.state === ST.ACTIVE).length / 2);
+    // the train fills the stores up to what they held at the start, no further
+    const cap = (k: 'food' | 'mats', before: number) => Math.floor(Math.min(ENDLESS_RESUPPLY[k]!, w.startSupplies[k] - before));
+    expect(cap('food', food)).toBeGreaterThan(0);
+    expect(w.supplies.food).toBe(food + cap('food', food) - mouths);
+    expect(w.supplies.mats).toBeGreaterThanOrEqual(mats + Math.max(0, cap('mats', mats)) - 1);
+    for (const k of ['food', 'arrows', 'mats', 'meds'] as const) expect(w.supplies[k]).toBeLessThanOrEqual(w.startSupplies[k]);
+    // a full army eats more than a train carries: the granary runs down over the waves
+    const n = lineupSoldiers(s, ids);
+    const r = Math.ceil(n / 2);
+    expect(r).toBeGreaterThan(ENDLESS_RESUPPLY.food!);
+    // the forecast: one ration in store, then what the train does not cover, over the first 10 waves
+    expect(foodNeeded(st, n)).toBe(r + 9 * Math.max(0, r - ENDLESS_RESUPPLY.food!));
+    expect(foodNeeded(st, 2 * ENDLESS_RESUPPLY.food!)).toBe(ENDLESS_RESUPPLY.food!);
+    // campaign castles get no train
+    expect(STAGES.every((x) => !x.resupply)).toBe(true);
   });
 });
