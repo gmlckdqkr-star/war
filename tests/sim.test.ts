@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { GH, GW, Tile } from '../src/sim/defs';
-import { Grid, SPAWN_GAP, idx } from '../src/sim/grid';
+import { GH, GW, TILE_INFO, Tile } from '../src/sim/defs';
+import { Grid, SPAWN_GAP, idx, tileAt } from '../src/sim/grid';
 import { RNG } from '../src/sim/rng';
 import { ENDLESS_CASTLES, ENDLESS_RESUPPLY, STAGES, dailyChallenge, endlessStage, planWaves, swarmWave, type Edge, type StageDef } from '../src/sim/stages';
 import { COUNCIL_IDS, COUNCIL_NAMES, GATE_BOOST, REPAIR_FRAC, councilDesc } from '../src/sim/warcouncil';
 import { josa } from '../src/sim/josa';
-import { ACT, BAND_STALL_T, BATTLE_HARD_CAP, CAP_HOLD_N, KEEP_PRESS_MAX, KEEP_PRESS_T, SAPPER_COVER, SAPPER_DIG_T, DRAGON_FLEE_HP, DRAGON_MAX_STAY, DRAGON_PAIN_DMG, DRAGON_PAIN_MAX, GATE_SAFE_R, ST, TOWER_EMPTY_T, TREB_SPLASH_DMG, World, isEngine, type Unit } from '../src/sim/world';
+import { ACT, BAND_STALL_T, BATTLE_HARD_CAP, CAP_HOLD_N, KEEP_PRESS_MAX, KEEP_PRESS_T, SAPPER_COVER, SAPPER_DIG_T, DRAGON_FLEE_HP, DRAGON_MAX_STAY, DRAGON_PAIN_DMG, DRAGON_PAIN_MAX, GARRISON_GRACE, GATE_SAFE_R, ST, TOWER_EMPTY_T, TREB_SPLASH_DMG, World, isEngine, type Unit } from '../src/sim/world';
 import { newSave, newSquad } from '../src/meta/save';
 import { LEVY_BELOW, LEVY_MAX_SQUADS, UPGRADES, applyBattle, baseSupplies, battleConfig, defaultLineup, foodNeeded, lineupSoldiers, upgradeCost } from '../src/meta/progression';
 
@@ -71,7 +71,8 @@ describe('wall line', () => {
   it('s9 field rubble is outside ground; only collapsed walls of the castle are boundary and rebuildable', () => {
     const st = STAGES.find((x) => x.id === 's9')!;
     const s = armyFor(9);
-    const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, 1234));
+    // brittle walls (a daily modifier) on top of masonry research: rebuilt walls must match them
+    const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, 1234, { mods: ['brittle'] }));
     const g = w.grid;
     let fieldRubble = 0;
     for (let i = 0; i < g.n; i++) {
@@ -97,6 +98,11 @@ describe('wall line', () => {
       if (eng.taskTile >= 0) expect(g.wallLine[eng.taskTile]).toBe(1);
     }
     expect(picked).toBe(true);
+    // the rebuilt wall is as strong as the castle's own this battle (masonry research and modifiers)
+    for (let i = 0; i < 30 * 90 && g.tiles[gap] !== Tile.WALL; i++) w.step();
+    expect(g.tiles[gap]).toBe(Tile.WALL);
+    expect(w.structHpMul).toBeCloseTo((1 + 0.12 * 2) * 0.65, 5);
+    expect(g.maxHp[gap]).toBeCloseTo(TILE_INFO[Tile.WALL].maxHp * w.structHpMul, 2);
   });
 });
 
@@ -113,6 +119,33 @@ describe('siege engines', () => {
     const b = w.bands[w.bands.length - 1];
     return { w, b, core: b.core };
   }
+
+  it('a climber whose ladder is pushed away falls to the wall foot outside, never into the wall', () => {
+    const { w } = lone('s3', 'h_escalade', 7);
+    const g = w.grid;
+    let climber: Unit | undefined;
+    for (let i = 0; i < 30 * 120 && !climber; i++) {
+      w.step();
+      climber = w.enemies.find((e) => e.state === ST.CLIMB);
+    }
+    expect(climber).toBeDefined();
+    const c = climber!;
+    // let him get well up the ladder (over the wall tile), then the ladder goes
+    for (let i = 0; i < 20 && c.state === ST.CLIMB; i++) w.step();
+    expect(c.state).toBe(ST.CLIMB);
+    // he is over the wall tile itself by now
+    c.x = (c.actTile % GW + 0.5) * 16;
+    c.y = (Math.floor(c.actTile / GW) + 0.5) * 16;
+    const lad = w.ladderAt(c.actTile)!;
+    expect(lad).toBeTruthy();
+    w.removeLadder(lad, true);
+    w.step();
+    expect(c.state).not.toBe(ST.CLIMB);
+    expect(c.elev).toBe(false);
+    const i = tileAt(c.x, c.y);
+    expect(g.isStruct(i)).toBe(false);
+    expect(g.inside[i]).toBe(0);
+  });
 
   it('escorts screen the ram at its pace and the ram hits the gate even after the escort breaks', () => {
     const { w, b, core } = lone('s4', 'w_ram');
@@ -267,6 +300,62 @@ describe('siege engines', () => {
     for (let i = 0; i < 15; i++) w.step();
     for (const u of core) if (u.act === ACT.DIG) expect(u.screened).toBe(false);
   });
+
+  it('a mine stays dug when its miner falls: the next sapper at that wall carries on', () => {
+    const { w, core } = lone('s4', 'w_sappers', 3);
+    const g = w.grid;
+    w.step();
+    const wall = idx(30, 14);
+    expect(g.tiles[wall]).toBe(Tile.WALL);
+    const [a, b] = core;
+    w.handleObstacle(a, wall);
+    expect(a.act).toBe(ACT.DIG);
+    const half = SAPPER_DIG_T / 2;
+    for (let i = 0; i < Math.round(30 * half); i++) {
+      a.hp = a.maxHp;
+      w.step();
+    }
+    w.killEnemy(a, null);
+    expect(w.mineProg[wall]).toBeCloseTo(half, 0);
+    expect(g.tiles[wall]).toBe(Tile.WALL);
+    // the second miner needs only what is left of the gallery
+    w.handleObstacle(b, wall);
+    expect(b.act).toBe(ACT.DIG);
+    expect(b.timer).toBeCloseTo(SAPPER_DIG_T - half, 0);
+    let took = 0;
+    for (let i = 0; i < 30 * SAPPER_DIG_T && g.tiles[wall] === Tile.WALL; i++) {
+      b.hp = b.maxHp;
+      w.step();
+      took += 1 / 30;
+    }
+    expect(g.tiles[wall]).toBe(Tile.RUBBLE);
+    expect(took).toBeLessThan(SAPPER_DIG_T - half + 0.5);
+    expect(w.mineProg[wall]).toBe(0);
+  });
+
+  it('crossbowmen who have shot their quivers empty go home instead of hacking at the gate', () => {
+    const { w, b } = lone('s4', 'w_bolts', 1);
+    const g = w.grid;
+    w.step();
+    const wall = idx(30, 14);
+    const men = b.units.filter((u) => u.state === ST.ACTIVE);
+    expect(men.length).toBeGreaterThan(3);
+    // one bolt left among them: the band is still in the fight, and an empty-handed man hits the wall
+    for (const u of men) u.ammo = 0;
+    men[0].ammo = 1;
+    const hp0 = g.hp[wall];
+    men[1].cd = 0;
+    w.handleObstacle(men[1], wall);
+    expect(b.broken).toBe(false);
+    expect(g.hp[wall]).toBeLessThan(hp0);
+    // the last bolt gone: hacking at stone is no siege for them, the band goes home
+    men[0].ammo = 0;
+    men[1].cd = 0;
+    w.handleObstacle(men[1], wall);
+    expect(b.broken).toBe(true);
+    expect(men.every((u) => u.fleeing || u.state !== ST.ACTIVE)).toBe(true);
+    expect(w.events.some((e) => e.type === 'withdraw')).toBe(true);
+  });
 });
 
 describe('wall tops', () => {
@@ -401,6 +490,20 @@ describe('stalemates', () => {
     expect(w.state).toBe('won');
     expect(w.result!.won).toBe(true);
     expect(w.t).toBeLessThanOrEqual(BATTLE_HARD_CAP + 1 / 30 + 1e-9);
+  });
+
+  it('a garrison with nobody left standing loses the castle after a short grace', () => {
+    const st = STAGES.find((x) => x.id === 's3')!;
+    const s = armyFor(st.index);
+    const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, 5));
+    w.start();
+    for (let i = 0; i < 30 * 5; i++) w.step();
+    for (const u of w.defs) if (u.state !== ST.DEAD) w.killDef(u);
+    for (let i = 0; i < 30 * (GARRISON_GRACE - 1); i++) w.step();
+    expect(w.state).toBe('battle');
+    for (let i = 0; i < 30 * 2 && w.state === 'battle'; i++) w.step();
+    expect(w.state).toBe('lost');
+    expect(w.events.some((e) => e.type === 'wiped' && e.level === 'danger')).toBe(true);
   });
 
   it('at the hard cap, attackers holding the courtyard take the castle', () => {

@@ -271,7 +271,7 @@ export const DRAGON_FLEE_HP = 0.35;
  */
 export const DRAGON_PAIN_MAX = 8;
 export const DRAGON_PAIN_DECAY = 6;
-export const DRAGON_PAIN_DMG = 0.025;
+export const DRAGON_PAIN_DMG = 0.03;
 /**
  * The dragon answers to nothing but its wounds: it stays, whatever becomes of its retinue, until it is
  * badly hurt (DRAGON_FLEE_HP) or harried by bolts and arrows (DRAGON_PAIN_MAX). Only a castle that can
@@ -287,7 +287,8 @@ export const DRAGON_BREATH = 0.13;
 /**
  * A sapper's mine takes this long to dig (s). He works at the wall foot under a timber mantlet that
  * catches a good part of the missiles (ranged damage x SAPPER_COVER), so archers must keep at him or
- * catch him on the way in; boiling oil and men striking down from the wall walk do the rest.
+ * catch him on the way in; boiling oil and men striking down from the wall walk do the rest. The gallery
+ * stays dug when he falls (World.mineProg): the next miner at that stretch of wall carries on.
  */
 export const SAPPER_DIG_T = 12;
 export const SAPPER_COVER = 0.6;
@@ -353,6 +354,8 @@ export class World {
   ladders: Ladder[] = [];
   projectiles: Projectile[] = [];
   fire: Float32Array = new Float32Array(GW * GH);
+  /** seconds of mining already dug under each wall tile: a gallery stays dug when its miner falls */
+  mineProg: Float32Array = new Float32Array(GW * GH);
   fx: Fx[] = [];
   events: GameEvent[] = [];
   dirtyTiles: number[] = [];
@@ -433,7 +436,7 @@ export class World {
     this.mods = new Set(cfg.mods ?? []);
     this.autoCommand = !!cfg.autoCommand;
     const lvl = cfg.stage.level;
-    const diff = cfg.difficulty === 'easy' ? 0.72 : cfg.difficulty === 'hard' ? 1.22 : 1;
+    const diff = cfg.difficulty === 'easy' ? 0.72 : cfg.difficulty === 'hard' ? 1.18 : 1;
     const elite = cfg.stage.enemyMul ?? 1;
     this.hpScale = lvl * diff * elite;
     this.atkScale = Math.sqrt(lvl) * diff * elite;
@@ -1268,6 +1271,40 @@ export class World {
     this.event('withdraw', `${josa(b.tpl.name, '이/가')} 싸움을 포기하고 물러납니다.`, 'good', x, y);
   }
 
+  /** Every man of the band still in the fight is a missile trooper with an empty quiver. */
+  bandShotOut(b: Band) {
+    let men = 0;
+    for (const u of b.units) {
+      if ((u.state !== ST.ACTIVE && u.state !== ST.CLIMB) || u.fleeing || isEngine(u)) continue;
+      if (!(u.def.role === 'ranged' && u.ammo < 1)) return false;
+      men++;
+    }
+    return men > 0;
+  }
+
+  /**
+   * Missile troops who have shot their quivers empty come forward to fight hand to hand, but hacking at a
+   * wall or gate with a bow or a crossbow butt would take them all day: a band with nothing left to shoot
+   * and nobody to fight goes home.
+   */
+  bandSpent(b: Band) {
+    let x = 0;
+    let y = 0;
+    let n = 0;
+    for (const u of b.units) {
+      if (u.state !== ST.ACTIVE || u.fleeing) continue;
+      x += u.x;
+      y += u.y;
+      n++;
+      if (isEngine(u)) this.engineRetreat(u);
+      else u.fleeing = true;
+    }
+    b.broken = true;
+    b.brokenT = this.t;
+    this.endConvoy(b);
+    if (n) this.event('withdraw', `${josa(b.tpl.name, '이/가')} 화살을 다 쏘고 물러납니다.`, 'good', x / n, y / n);
+  }
+
   /** Convoy bookkeeping: anchor on the core, forward direction along its path, pace of the slowest member. */
   updateConvoy(b: Band) {
     if (b.broken) {
@@ -1685,6 +1722,8 @@ export class World {
         // a miner at work is under his mantlet: no longer the easy mark he was on the way in
         if ((r === 'ladder' || r === 'sapper') && !e.screened && e.act !== ACT.DIG) s *= 0.6;
         if (e.def.leader) s *= 0.8;
+        // the dragon is the one target worth an armoured hide's worth of arrows: every wound harries it
+        if (e.def.role === 'dragon') s *= 0.4;
         if (e.def.role === 'healer') s *= 0.75;
         if (e.fleeing) s *= 1.8;
         if (e.screened && e !== sq.focus) s *= 2.5; // hidden behind the escort's shields
@@ -2344,7 +2383,7 @@ export class World {
     }
     if (role === 'sapper' && (t === Tile.WALL || t === Tile.TOWER)) {
       e.act = ACT.DIG;
-      e.timer = SAPPER_DIG_T;
+      e.timer = Math.max(0.5, SAPPER_DIG_T - this.mineProg[n]);
       e.actTile = n;
       this.alert('sapper' + n, '갱도병이 성벽 밑을 파고 있습니다!', 'danger', cx(n), cy(n));
       return;
@@ -2371,6 +2410,10 @@ export class World {
       return;
     }
     if (role === 'ram' && e.band) this.endConvoy(e.band); // at the gate: escorts join the assault
+    if (role === 'ranged' && e.ammo < 1 && e.band && !e.band.broken && this.bandShotOut(e.band)) {
+      this.bandSpent(e.band);
+      return;
+    }
     if (e.band) e.band.contactT = this.t;
     if (e.cd <= 0) {
       e.cd = e.def.cd * this.rng.range(0.9, 1.1);
@@ -2407,6 +2450,7 @@ export class World {
         return;
       }
       e.timer -= dt;
+      this.mineProg[n] += dt;
       if (this.rng.chance(0.08)) this.fx.push({ k: 'dust', x: e.x, y: e.y });
       if (e.timer <= 0) {
         e.act = ACT.NONE;
@@ -2434,9 +2478,16 @@ export class World {
     if (e.band) e.band.contactT = this.t;
     const lad = this.ladderAt(e.actTile);
     if (!lad) {
-      // ladder pushed or tower destroyed: fall
+      // ladder pushed or tower destroyed: he falls to the foot of the wall, on the outside
       e.state = ST.ACTIVE;
       e.elev = false;
+      const g = this.grid;
+      const here = tileAt(e.x, e.y);
+      const foot = g.nearestTile(here, (k) => g.openGround(k) && !g.inside[k], 3);
+      if (foot >= 0 && foot !== here) {
+        e.x = cx(foot);
+        e.y = cy(foot);
+      }
       this.damage(e, 25, 1, null, false);
       return;
     }
@@ -2688,7 +2739,7 @@ export class World {
           const py = e.y + Math.sin(ang + this.rng.range(-0.35, 0.35)) * s * T;
           if (px < 0 || py < 0 || px >= WORLD_W || py >= WORLD_H) continue;
           const i = tileAt(px, py);
-          this.fire[i] = Math.max(this.fire[i], 3.5);
+          this.fire[i] = Math.max(this.fire[i], 4.5);
         }
         this.fx.push({ k: 'breath', x: e.x, y: e.y, a: ang });
         if (Math.hypot(g.keepX - e.x, g.keepY - e.y) < 5 * T) {
@@ -2803,6 +2854,7 @@ export class World {
     if (!TILE_INFO[t].struct) return;
     g.tiles[i] = t === Tile.GATE ? Tile.GATE_BROKEN : Tile.RUBBLE;
     g.hp[i] = 0;
+    this.mineProg[i] = 0;
     g.refreshStructs();
     this.fieldsDirty = true;
     this.dirtyTiles.push(i);
