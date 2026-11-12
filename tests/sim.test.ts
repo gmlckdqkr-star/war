@@ -4,7 +4,7 @@ import { Grid, idx } from '../src/sim/grid';
 import { RNG } from '../src/sim/rng';
 import { STAGES, dailyChallenge, endlessStage } from '../src/sim/stages';
 import { josa } from '../src/sim/josa';
-import { ST, World } from '../src/sim/world';
+import { ACT, DRAGON_MAX_STAY, DRAGON_PAIN_MAX, DRAGON_STAY_ALONE, ST, World, isEngine, type Unit } from '../src/sim/world';
 import { newSave, newSquad } from '../src/meta/save';
 import { battleConfig, defaultLineup } from '../src/meta/progression';
 
@@ -96,6 +96,144 @@ describe('wall line', () => {
       if (eng.taskTile >= 0) expect(g.wallLine[eng.taskTile]).toBe(1);
     }
     expect(picked).toBe(true);
+  });
+});
+
+describe('siege engines', () => {
+  /** a stage with only the given band attacking (the scripted waves are cleared) */
+  function lone(stageId: string, band: string, seed = 7, alongside: string[] = []) {
+    const st = STAGES.find((x) => x.id === stageId)!;
+    const s = armyFor(st.index);
+    const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, seed));
+    w.start();
+    w.pending = [];
+    for (const o of alongside) w.spawnBand({ band: o, edge: 'W', span: [16, 18], delay: 0 }, 0);
+    w.spawnBand({ band, edge: 'W', span: [16, 18], delay: 0 }, 0);
+    const b = w.bands[w.bands.length - 1];
+    return { w, b, core: b.core };
+  }
+
+  it('escorts screen the ram at its pace and the ram hits the gate even after the escort breaks', () => {
+    const { w, b, core } = lone('s4', 'w_ram');
+    const ram = core[0];
+    expect(isEngine(ram)).toBe(true);
+    const g = w.grid;
+    const kd = (u: Unit) => Math.hypot(u.x - g.keepX, u.y - g.keepY);
+    let ahead = 0;
+    let samples = 0;
+    for (let i = 0; i < 30 * 40; i++) {
+      w.step();
+      if (!b.convoy) break;
+      for (const u of b.units) {
+        if (u === ram || u.state !== ST.ACTIVE) continue;
+        samples++;
+        if (kd(u) < kd(ram) - 3 * 16) ahead++;
+      }
+    }
+    expect(samples).toBeGreaterThan(100);
+    expect(ahead / samples).toBeLessThan(0.05);
+    // the escort scatters: the ram keeps rolling
+    for (const u of b.units) if (u !== ram && u.state === ST.ACTIVE) w.killEnemy(u, null);
+    w.breakBand(b);
+    expect(ram.fleeing).toBe(false);
+    const gates = g.structTiles.filter((i) => g.tiles[i] === Tile.GATE);
+    const hp0 = gates.reduce((a, i) => a + g.hp[i], 0);
+    for (let i = 0; i < 30 * 120 && ram.state === ST.ACTIVE && !ram.fleeing; i++) w.step();
+    const hp1 = gates.reduce((a, i) => a + g.hp[i], 0);
+    expect(hp1).toBeLessThan(hp0 - 200);
+  });
+
+  it('a trebuchet whose escort is gone still sets up and fires', () => {
+    const { w, b, core } = lone('s8', 'h_treb');
+    const treb = core[0];
+    for (const u of b.units) if (u !== treb) w.killEnemy(u, null);
+    w.breakBand(b);
+    let stones = 0;
+    for (let i = 0; i < 30 * 90; i++) {
+      w.step();
+      for (const p of w.projectiles) if (p.kind === 'stone' && p.src === treb && p.t === 1 / 30) stones++;
+    }
+    expect(treb.fleeing).toBe(false);
+    expect(stones).toBeGreaterThan(2);
+  });
+
+  it('a siege tower docks against the wall', () => {
+    const { w, core } = lone('s8', 'h_tower');
+    const tower = core[0];
+    for (let i = 0; i < 30 * 120 && tower.act !== ACT.DOCKED && tower.state === ST.ACTIVE; i++) w.step();
+    expect(tower.act).toBe(ACT.DOCKED);
+    expect(w.ladders.some((l) => l.tower === tower)).toBe(true);
+  });
+
+  it('screened sappers reach the wall and dig', () => {
+    const { w, core } = lone('s4', 'w_sappers', 3, ['w_wall']);
+    let dug = false;
+    for (let i = 0; i < 30 * 120 && !dug; i++) {
+      w.step();
+      dug = core.some((u) => u.act === ACT.DIG);
+    }
+    expect(dug).toBe(true);
+  });
+});
+
+describe('dragon', () => {
+  /** s9 with the dragon band spawned straight away (other bands skipped) */
+  function dragonWorld() {
+    const st = STAGES.find((x) => x.id === 's9')!;
+    const s = armyFor(9);
+    const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, 99));
+    w.start();
+    w.pending = [];
+    w.spawnBand({ band: 'c_dragon', edge: 'W', span: [16, 18], delay: 0 }, 0);
+    const d = w.enemies.find((e) => e.def.role === 'dragon')!;
+    return { w, d };
+  }
+  const flee = (w: World, d: Unit, maxS: number) => {
+    for (let i = 0; i < 30 * maxS && !d.fleeing && d.state === ST.ACTIVE; i++) w.step();
+  };
+
+  it('ignores the collapse of its retinue, but does not linger alone forever', () => {
+    const { w, d } = dragonWorld();
+    for (let i = 0; i < 30 * 20; i++) w.step();
+    const band = d.band!;
+    for (const u of band.units) if (u !== d && u.state === ST.ACTIVE) w.killEnemy(u, null);
+    w.breakBand(band);
+    for (let i = 0; i < 30 * 10; i++) w.step();
+    expect(d.fleeing).toBe(false); // fearless: still fighting 10 s after its band broke
+    flee(w, d, DRAGON_STAY_ALONE + 5);
+    expect(d.fleeing).toBe(true);
+    expect(w.t - band.brokenT).toBeLessThan(DRAGON_STAY_ALONE + 2);
+  });
+
+  it('is driven off by sustained ballista hits and counts once in stats.dragons', () => {
+    const { w, d } = dragonWorld();
+    const bal = w.defs.find((u) => u.def.id === 'd_ballista')!;
+    for (let i = 0; i < 30 * 15; i++) w.step();
+    for (let k = 0; k < DRAGON_PAIN_MAX + 1; k++) w.damage(d, 1, 0, bal, true);
+    expect(d.hp / d.maxHp).toBeGreaterThan(0.9);
+    flee(w, d, 1);
+    expect(d.fleeing).toBe(true);
+    expect(w.stats.dragons).toBe(1);
+    // finishing it off on the way out does not count it twice
+    w.damage(d, d.hp * 10, 1, bal, true);
+    expect(d.state).toBe(ST.DEAD);
+    expect(w.stats.dragons).toBe(1);
+    expect(w.computeResult(true).dragons).toBe(1);
+  });
+
+  it('withdraws when badly wounded and never stays longer than the cap', () => {
+    const a = dragonWorld();
+    for (let i = 0; i < 30 * 15; i++) a.w.step();
+    a.d.hp = a.d.maxHp * 0.3;
+    flee(a.w, a.d, 1);
+    expect(a.d.fleeing).toBe(true);
+    expect(a.w.stats.dragons).toBe(1);
+    const b = dragonWorld();
+    b.d.hp = b.d.maxHp * 0.9; // barely scratched
+    b.d.band!.units = [b.d]; // retinue irrelevant
+    flee(b.w, b.d, DRAGON_MAX_STAY + 5);
+    expect(b.d.fleeing).toBe(true);
+    expect(b.w.t - b.d.bornT).toBeLessThan(DRAGON_MAX_STAY + 2);
   });
 });
 

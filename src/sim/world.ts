@@ -75,6 +75,16 @@ export interface Unit {
   spawnY: number;
   kills: number;
   fireDeath: boolean;
+  /** siege-engine crew morale 0..100 (engines only, 0 for everyone else); engines ignore band collapse */
+  crew: number;
+  /** escort slot index inside a convoy band (-1 = not an escort) */
+  escortIdx: number;
+  /** battle time the unit appeared */
+  bornT: number;
+  /** recent heavy hits (dragon: ballista bolts), decays over time */
+  pain: number;
+  /** a convoy core unit with escorts close around it: harder to pick out and hit with missiles */
+  screened: boolean;
 }
 
 export interface Squad {
@@ -122,6 +132,21 @@ export interface Band {
   broken: boolean;
   field: FieldKind;
   wave: number;
+  /** units the band escorts: siege engines, or sappers screened by shields */
+  core: Unit[];
+  /** escorts keep formation around the core instead of running ahead */
+  convoy: boolean;
+  /** convoy anchor (core centroid) and its forward direction */
+  ax: number;
+  ay: number;
+  fdx: number;
+  fdy: number;
+  /** convoy pace in px/s (slowest living member) */
+  pace: number;
+  /** most escorts are in their screen slots */
+  formed: boolean;
+  /** battle time the band broke (-1 while it holds) */
+  brokenT: number;
 }
 
 export interface Ladder {
@@ -232,6 +257,21 @@ export const ABILITY_INFO: Record<AbilityId, { name: string; cd: number; desc: s
 
 const T = TILE;
 
+/** the dragon withdraws below this HP fraction */
+export const DRAGON_FLEE_HP = 0.35;
+/** ...or after this many ballista hits in quick succession (each decays over DRAGON_PAIN_DECAY s) */
+export const DRAGON_PAIN_MAX = 8;
+export const DRAGON_PAIN_DECAY = 6;
+/** longest a dragon stays over the battlefield, and how long it lingers once its retinue has broken (s) */
+export const DRAGON_MAX_STAY = 150;
+export const DRAGON_STAY_ALONE = 45;
+
+/** rams, siege towers and trebuchets: crewed machines with their own morale */
+export function isEngine(u: Unit) {
+  const r = u.def.role;
+  return r === 'ram' || r === 'tower' || r === 'treb';
+}
+
 export class World {
   cfg: BattleConfig;
   stage: StageDef;
@@ -286,6 +326,8 @@ export class World {
   alertCd: Record<string, number> = {};
   mods: Set<string>;
   hasDragonEver = false;
+  /** dragons already counted in stats.dragons (driven off or slain), by unit id */
+  dragonsCounted = new Set<number>();
   lastKeepAlert = -10;
   result: BattleResult | null = null;
   /** per-world id counter keeps battles reproducible for a given seed */
@@ -431,6 +473,11 @@ export class World {
       spawnY: y,
       kills: 0,
       fireDeath: false,
+      crew: 0,
+      escortIdx: -1,
+      bornT: this.t,
+      pain: 0,
+      screened: false,
     };
     this.units.push(u);
     return u;
@@ -851,6 +898,15 @@ export class World {
       broken: false,
       field: tpl.field,
       wave: this.waveIdx,
+      core: [],
+      convoy: false,
+      ax: bx,
+      ay: by,
+      fdx: 1,
+      fdy: 0,
+      pace: 0,
+      formed: false,
+      brokenT: -1,
     };
     const list: string[] = [];
     if (tpl.leader) list.push(tpl.leader);
@@ -888,6 +944,16 @@ export class World {
       this.enemies.push(u);
     }
     band.startCount = band.units.length;
+    // convoy: siege engines (and sappers) travel inside a screen of escorts at the slowest member's pace
+    for (const u of band.units) {
+      if (isEngine(u)) {
+        u.crew = 100;
+        band.core.push(u);
+      } else if (u.def.role === 'sapper') band.core.push(u);
+    }
+    let escorts = 0;
+    if (band.core.length) for (const u of band.units) if (!band.core.includes(u)) u.escortIdx = escorts++;
+    band.convoy = band.core.length > 0 && escorts > 0;
     this.bands.push(band);
     if (tpl.faction === 'wyrm' && tpl.leader === 'c_dragon') this.event('dragon', '잿불 고룡이 나타났습니다!', 'danger', bx, by);
   }
@@ -965,6 +1031,7 @@ export class World {
   }
 
   updateBandMorale(b: Band, dt: number) {
+    if (b.convoy) this.updateConvoy(b);
     if (b.broken) return;
     let alive = 0;
     for (const u of b.units) if (u.state === ST.ACTIVE || u.state === ST.CLIMB) alive++;
@@ -973,9 +1040,138 @@ export class World {
     if (b.morale < 15) this.breakBand(b);
   }
 
+  /** Convoy bookkeeping: anchor on the core, forward direction along its path, pace of the slowest member. */
+  updateConvoy(b: Band) {
+    if (b.broken) {
+      this.endConvoy(b);
+      return;
+    }
+    let lead: Unit | null = null;
+    let ld = Infinity;
+    for (const c of b.core) {
+      if (c.state !== ST.ACTIVE || c.fleeing) continue;
+      if (c.def.role === 'tower' && c.act === ACT.DOCKED) {
+        this.endConvoy(b); // docked: the escort storms the tower
+        return;
+      }
+      // anchor on the most advanced core unit so the screen walks in front of all of them
+      const d = this.fieldFor(c).dist[tileAt(c.x, c.y)];
+      if (!lead || d < ld) {
+        lead = c;
+        ld = d;
+      }
+    }
+    let esc = 0;
+    let pace = Infinity;
+    for (const u of b.units) {
+      if (u.escortIdx < 0 || u.state !== ST.ACTIVE || u.fleeing) continue;
+      esc++;
+      pace = Math.min(pace, u.def.speed);
+    }
+    if (!lead || !esc) {
+      this.endConvoy(b);
+      return;
+    }
+    b.ax = lead.x;
+    b.ay = lead.y;
+    b.pace = pace * T;
+    let fx: number;
+    let fy: number;
+    if (lead.def.role === 'treb' && lead.act === ACT.SET && lead.actTile >= 0) {
+      fx = cx(lead.actTile) - b.ax;
+      fy = cy(lead.actTile) - b.ay;
+    } else {
+      const f = this.fieldFor(lead);
+      let i = tileAt(b.ax, b.ay);
+      for (let k = 0; k < 3; k++) {
+        const nx = f.next[i];
+        if (nx < 0) break;
+        i = nx;
+      }
+      fx = cx(i) - b.ax;
+      fy = cy(i) - b.ay;
+    }
+    const m = Math.hypot(fx, fy);
+    if (m > 1) {
+      const nx = b.fdx * 0.85 + (fx / m) * 0.15;
+      const ny = b.fdy * 0.85 + (fy / m) * 0.15;
+      const mm = Math.hypot(nx, ny) || 1;
+      b.fdx = nx / mm;
+      b.fdy = ny / mm;
+    }
+    // formed: most escorts hold their slots; screened: a core unit with two escorts right next to it
+    let inSlot = 0;
+    for (const u of b.units) {
+      if (u.escortIdx < 0 || u.state !== ST.ACTIVE || u.fleeing) continue;
+      const [sx, sy] = this.convoySlot(u, b);
+      if (Math.hypot(u.x - sx, u.y - sy) < 1.5 * T) inSlot++;
+    }
+    b.formed = inSlot * 2 >= esc;
+    const R2 = (2 * T) ** 2;
+    for (const c of b.core) {
+      let near = 0;
+      if (c.state === ST.ACTIVE && !c.fleeing)
+        for (const u of b.units)
+          if (u.escortIdx >= 0 && u.state === ST.ACTIVE && !u.fleeing && (u.x - c.x) ** 2 + (u.y - c.y) ** 2 < R2 + c.def.r * c.def.r * 4) near++;
+      c.screened = near >= 2;
+    }
+  }
+
+  endConvoy(b: Band) {
+    b.convoy = false;
+    for (const c of b.core) c.screened = false;
+  }
+
+  /** Where an escort stands: an arc screening the front and flanks of its core. */
+  convoySlot(e: Unit, b: Band): [number, number] {
+    const per = 5;
+    const total = b.startCount - b.core.length;
+    const k = e.escortIdx;
+    const row = Math.floor(k / per);
+    const inRow = Math.max(1, Math.min(per, total - row * per));
+    const j = k % per;
+    const A = 1.35;
+    const ang = inRow > 1 ? -A + (2 * A * j) / (inRow - 1) : 0;
+    let coreR = 0;
+    for (const c of b.core) coreR = Math.max(coreR, c.def.r);
+    const R = coreR + (0.9 + row * 0.85) * T;
+    const lx = -b.fdy;
+    const ly = b.fdx;
+    const ca = Math.cos(ang);
+    const sa = Math.sin(ang);
+    const g = this.grid;
+    const at = tileAt(b.ax, b.ay);
+    const ok = (px: number, py: number) => {
+      if (px < 2 || py < 2 || px > WORLD_W - 2 || py > WORLD_H - 2) return false;
+      const t = tileAt(px, py);
+      return g.openGround(t) && g.inside[t] === g.inside[at];
+    };
+    let sx = b.ax + R * (ca * b.fdx + sa * lx);
+    let sy = b.ay + R * (ca * b.fdy + sa * ly);
+    if (ok(sx, sy)) return [sx, sy];
+    // the front is blocked (wall, cliff): close in behind the core instead
+    sx = b.ax + R * (-ca * b.fdx + sa * lx);
+    sy = b.ay + R * (-ca * b.fdy + sa * ly);
+    if (ok(sx, sy)) return [sx, sy];
+    return [b.ax + ((e.id % 5) - 2) * 3, b.ay + ((e.id % 3) - 1) * 3];
+  }
+
+  /** A crewed engine gives up: too damaged or its crew lost heart. */
+  engineRetreat(e: Unit) {
+    if (e.fleeing) return;
+    e.fleeing = true;
+    e.act = ACT.NONE;
+    if (e.def.role === 'tower') {
+      const lad = this.ladders.find((l) => l.tower === e);
+      if (lad) this.removeLadder(lad, false);
+    }
+    this.event('enginefled', `${josa(e.def.name, '이/가')} 물러납니다!`, 'good', e.x, e.y);
+  }
+
   breakBand(b: Band) {
     if (b.broken) return;
     b.broken = true;
+    b.brokenT = this.t;
     let x = 0;
     let y = 0;
     let n = 0;
@@ -984,6 +1180,13 @@ export class World {
       x += u.x;
       y += u.y;
       n++;
+      if (isEngine(u)) {
+        // the crew is shaken when its escort scatters, but keeps working the machine
+        u.crew = Math.max(0, u.crew - 30);
+        continue;
+      }
+      if (u.def.role === 'sapper' && u.act === ACT.DIG) continue; // committed to the mine
+      if (u.def.role === 'dragon') continue; // a dragon does not care whether its kobolds run
       const cornered = u.elev || this.grid.inside[tileAt(u.x, u.y)] === 1;
       if (!(u.def.fearless && u.hp > u.maxHp * 0.4) && !cornered) u.fleeing = true;
     }
@@ -1230,10 +1433,11 @@ export class World {
         if (e.state === ST.CLIMB || (e.elev && g.inside[tileAt(u.x, u.y)] !== 1)) s *= 0.55;
         if (e.elev) s *= 0.6;
         const r = e.def.role;
-        if (r === 'ladder' || r === 'sapper') s *= 0.6;
+        if ((r === 'ladder' || r === 'sapper') && !e.screened) s *= 0.6;
         if (e.def.leader) s *= 0.8;
         if (e.def.role === 'healer') s *= 0.75;
         if (e.fleeing) s *= 1.8;
+        if (e.screened && e !== sq.focus) s *= 2.5; // hidden behind the escort's shields
       }
       return s;
     });
@@ -1346,6 +1550,7 @@ export class World {
     if (sq && sq.morale < 40) acc *= 0.8;
     if (t.def.big) acc = Math.min(0.97, acc * 1.3);
     if (t.state === ST.CLIMB) acc *= 1.1;
+    if (t.screened && !t.def.big) acc *= 0.55;
     const hit = this.rng.chance(acc);
     const dmg = u.def.atk * u.rangedMul * this.moraleMul(sq);
     this.launch(u, t, hit, dmg, u.def.ap ?? 0, u.def.proj ?? 'arrow');
@@ -1611,6 +1816,11 @@ export class World {
     e.retarget -= dt;
     if (e.def.regen && e.hp < e.maxHp) e.hp = Math.min(e.maxHp, e.hp + e.def.regen * dt);
     const role = e.def.role;
+    if (e.crew > 0 && !e.fleeing) {
+      // engines answer to their own crew, not to the escort band: they leave only when wrecked or shattered
+      e.crew = Math.min(100, e.crew + 0.6 * dt);
+      if (e.hp < e.maxHp * 0.25 || e.crew < 20) this.engineRetreat(e);
+    }
     if (role === 'dragon' || role === 'flyer') {
       this.flyerAI(e, dt);
       return;
@@ -1642,6 +1852,7 @@ export class World {
     }
     const ranged = e.def.range > 0;
     const noFight = role === 'ram' || role === 'tower';
+    const convoy = e.escortIdx >= 0 && e.band && e.band.convoy ? e.band : null;
     if (!noFight && (e.retarget <= 0 || (e.target && e.target.state !== ST.ACTIVE))) {
       e.retarget = 0.35 + this.rng.next() * 0.25;
       e.target = ranged ? this.enemyRangedTarget(e) : this.enemyMeleeTarget(e);
@@ -1685,11 +1896,17 @@ export class World {
           }
           return;
         }
-        if (d < 3.5 * T) {
+        if (d < 3.5 * T && !(convoy && Math.hypot(t.x - convoy.ax, t.y - convoy.ay) > 5 * T)) {
           this.moveToward(e, t.x, t.y);
           return;
         }
       }
+    }
+    if (convoy) {
+      // escort: keep the screen around the engine / sappers, at their pace
+      const [sx, sy] = this.convoySlot(e, convoy);
+      this.moveToward(e, sx, sy);
+      return;
     }
     // advance along the path field
     const f = this.fieldFor(e);
@@ -1703,6 +1920,7 @@ export class World {
       this.moveToward(e, this.grid.keepX, this.grid.keepY);
       return;
     }
+    if (role === 'tower' && this.grid.wallLine[n] && !this.grid.isStruct(n) && this.towerBesideBreach(e, n)) return;
     const inf = TILE_INFO[this.grid.tiles[n]];
     if (inf.struct && !(e.elev && inf.elev)) {
       const d = Math.hypot(cx(n) - e.x, cy(n) - e.y);
@@ -1716,7 +1934,36 @@ export class World {
     }
     const j = ((e.id * 7919) % 9) - 4;
     const k = ((e.id * 104729) % 9) - 4;
-    this.moveToward(e, cx(n) + j * 1.1, cy(n) + k * 1.1);
+    // screened sappers walk a little slower than their shield escort so the screen stays in front
+    const b = e.band;
+    const mul = role === 'sapper' && b && b.convoy ? Math.min(1, ((b.formed ? 0.85 : 0.35) * b.pace) / (e.def.speed * T)) : 1;
+    this.moveToward(e, cx(n) + j * 1.1, cy(n) + k * 1.1, mul);
+  }
+
+  /** A siege tower reaching a breach docks against the intact wall beside it rather than rolling inside. */
+  towerBesideBreach(e: Unit, n: number): boolean {
+    const g = this.grid;
+    let best = -1;
+    let bd = Infinity;
+    for (let dy = -2; dy <= 2; dy++)
+      for (let dx = -2; dx <= 2; dx++) {
+        const x = tx(n) + dx;
+        const y = ty(n) + dy;
+        if (!inb(x, y)) continue;
+        const j = idx(x, y);
+        if (g.tiles[j] !== Tile.WALL || this.ladders.some((l) => l.tile === j && l.tower)) continue;
+        const d = Math.hypot(cx(j) - e.x, cy(j) - e.y);
+        if (d < bd) {
+          bd = d;
+          best = j;
+        }
+      }
+    if (best < 0) return false;
+    if (bd > T * 0.5 + e.def.r + 4.5) {
+      this.moveToward(e, cx(best), cy(best));
+      if (Math.hypot(e.x - e.px, e.y - e.py) < 0.05) this.handleObstacle(e, best);
+    } else this.handleObstacle(e, best);
+    return true;
   }
 
   enemyMeleeTarget(e: Unit): Unit | null {
@@ -1771,7 +2018,7 @@ export class World {
       return;
     }
     if (role === 'tower') {
-      if (t === Tile.WALL && !this.ladderAt(n)) {
+      if (t === Tile.WALL && !this.ladders.some((l) => l.tile === n && l.tower)) {
         e.act = ACT.DOCKED;
         e.actTile = n;
         this.addLadder(n, e.x, e.y, e);
@@ -1791,6 +2038,7 @@ export class World {
       }
       return;
     }
+    if (role === 'ram' && e.band) this.endConvoy(e.band); // at the gate: escorts join the assault
     if (e.cd <= 0) {
       e.cd = e.def.cd * this.rng.range(0.9, 1.1);
       let dmg = this.structDamageOf(e);
@@ -1826,6 +2074,7 @@ export class World {
       if (this.rng.chance(0.08)) this.fx.push({ k: 'dust', x: e.x, y: e.y });
       if (e.timer <= 0) {
         e.act = ACT.NONE;
+        if (e.band) this.endConvoy(e.band); // breach blown: everyone rushes it
         this.destroyStruct(n, 'sapped');
         // collapse an adjacent wall tile too
         for (let d = 0; d < 4; d++) {
@@ -1962,17 +2211,26 @@ export class World {
   flyerAI(e: Unit, dt: number) {
     const g = this.grid;
     const dragon = e.def.role === 'dragon';
-    if (e.fleeing || (dragon && e.hp < e.maxHp * 0.18)) {
-      if (!e.fleeing) {
+    if (dragon && !e.fleeing) {
+      e.pain = Math.max(0, e.pain - dt / DRAGON_PAIN_DECAY);
+      const hurt = e.hp < e.maxHp * DRAGON_FLEE_HP;
+      const harried = e.pain >= DRAGON_PAIN_MAX;
+      // it will not circle forever: a long stay, or its retinue long gone, sends it home
+      const b = e.band;
+      const tired = this.t - e.bornT > DRAGON_MAX_STAY || (!!b && b.broken && b.brokenT >= 0 && this.t - b.brokenT > DRAGON_STAY_ALONE);
+      if (hurt || harried || tired) {
         e.fleeing = true;
-        this.event('dragonflee', '고룡이 상처를 입고 물러갑니다!', 'good', e.x, e.y);
-        if (dragon) {
-          this.stats.dragons++;
+        const driven = hurt || harried || e.hp <= e.maxHp * 0.8;
+        if (driven) {
+          this.countDragon(e);
           this.stats.bounty += Math.round(e.def.gold * 0.6);
-        }
-        for (const b of this.bands) if (b.tpl.faction === 'wyrm' && b !== e.band) b.morale -= 45;
-        if (e.band) e.band.morale -= 60;
+          this.event('dragonflee', harried && !hurt ? '노포 세례에 고룡이 물러갑니다!' : '고룡이 상처를 입고 물러갑니다!', 'good', e.x, e.y);
+        } else this.event('dragonleave', '고룡이 하늘 높이 날아갑니다.', 'warn', e.x, e.y);
+        for (const o of this.bands) if (o.tpl.faction === 'wyrm' && o !== b) o.morale -= 45;
+        if (b) b.morale -= 60;
       }
+    }
+    if (e.fleeing) {
       this.moveToward(e, -60, e.y, 1.2);
       if (e.x < -30) {
         e.state = ST.FLED;
@@ -2107,9 +2365,12 @@ export class World {
     const armor = Math.min(0.85, t.def.armor + t.armorAdd);
     let eff = dmg * (1 - armor * (1 - ap));
     if (ranged && t.def.rangedResist) eff *= t.def.rangedResist;
+    if (ranged && t.screened) eff *= 0.5; // the escort's shields catch half of it
     if (t.side === 0 && t.squad && t.squad.routing) eff *= 1.25;
     if (t.fleeing) eff *= 1.2;
     t.hp -= eff;
+    if (t.crew > 0) t.crew = Math.max(0, t.crew - (eff / t.maxHp) * 60);
+    if (t.def.role === 'dragon' && src && src.def.id === 'd_ballista') t.pain += 1;
     t.hitFlash = 0.12;
     if (this.rng.chance(0.25)) this.fx.push({ k: 'blood', x: t.x, y: t.y, a: t.side });
     if (t.hp <= 0) {
@@ -2146,13 +2407,20 @@ export class World {
     }
     if (e.def.role === 'dragon') {
       this.event('dragonslain', '잿불 고룡을 쓰러뜨렸습니다!', 'good', e.x, e.y);
-      this.stats.dragons++;
+      this.countDragon(e);
       for (const o of this.bands) if (o.tpl.faction === 'wyrm') o.morale -= 50;
     }
     if (e.def.role === 'tower') {
       const lad = this.ladders.find((l) => l.tower === e);
       if (lad) this.removeLadder(lad, false);
     }
+  }
+
+  /** stats.dragons counts each dragon once, whether driven off or slain */
+  countDragon(e: Unit) {
+    if (this.dragonsCounted.has(e.id)) return;
+    this.dragonsCounted.add(e.id);
+    this.stats.dragons++;
   }
 
   damageStruct(i: number, dmg: number) {
