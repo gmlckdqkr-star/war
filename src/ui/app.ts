@@ -54,7 +54,7 @@ import { CANCELLED, MockIAP, type IAPAdapter } from '../meta/iap';
 import { REFUND_NOTICE, sellerLine } from '../meta/legal';
 import { cosmeticCard, cosmeticPreview } from './preview';
 import { audio } from './audio';
-import { BattleView, squadNumbers, type BattleMode, type BattleSetup } from './battle';
+import { BattleView, nameJosa, squadNumbers, type BattleMode, type BattleSetup } from './battle';
 import { MAX_PACKS, careAll, careCosts, fitPlan, foodForecast, lineupStrength, packsOf, planCost, readyLineup, setWantedSize, settleBattle, wantedSize } from './prebattle';
 import { bar, clear, confirmBox, fmt, h, modal, stars, toast } from './dom';
 import { RESUME_KEY, clearRecord, loadRecord, newBattleId, replay, resolveStage, stageRefFor, stageSig, type BattleRecord, type ReplayStats } from './resume';
@@ -822,7 +822,7 @@ export class App {
               class: 'btn small ghost',
               'aria-label': '분대 해산',
               onclick: async () => {
-                if (await confirmBox('분대 해산', `${r.name}을(를) 해산합니다. 되돌릴 수 없습니다.`, '해산', true)) {
+                if (await confirmBox('분대 해산', `${nameJosa(r.name, '을/를')} 해산합니다. 되돌릴 수 없습니다.`, '해산', true)) {
                   const err = dismissSquad(s, r.id);
                   if (err) toast(err, 'warn');
                   this.persist();
