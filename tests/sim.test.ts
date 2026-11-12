@@ -176,6 +176,42 @@ describe('siege engines', () => {
   });
 });
 
+describe('wall tops', () => {
+  /** one spearman on the s3 west wall walk, one orc right beside the wall (inside or outside), nobody else */
+  function hurt(side: 'inside' | 'outside') {
+    const st = STAGES.find((x) => x.id === 's3')!;
+    const s = armyFor(3);
+    const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, 8));
+    const sq = w.squads.find((q) => q.type.id === 'spear')!;
+    w.placeSquad(sq, idx(38, 14));
+    sq.auto = false;
+    sq.stance = 'hold';
+    w.start();
+    w.pending = [];
+    w.spawnBand({ band: 'o_warband', edge: 'W', span: [16, 18], delay: 0 }, 0);
+    const grunt = w.enemies.find((e) => e.def.id === 'o_grunt')!;
+    for (const e of w.enemies) if (e !== grunt) e.state = ST.FLED;
+    const top = sq.units.find((u) => u.elev)!;
+    for (const u of w.defs) if (u !== top) u.state = ST.EVAC;
+    grunt.x = grunt.px = side === 'inside' ? 39 * 16 + 4 : 38 * 16 - 4;
+    grunt.y = grunt.py = top.y;
+    expect(w.grid.inside[idx(Math.floor(grunt.x / 16), Math.floor(grunt.y / 16))]).toBe(side === 'inside' ? 1 : 0);
+    const hp0 = top.hp;
+    for (let i = 0; i < 30 * 4; i++) {
+      top.cd = 99; // the spearman holds his blows so the orc lives
+      w.step();
+    }
+    expect(grunt.state).toBe(ST.ACTIVE);
+    expect(top.elev).toBe(true);
+    return hp0 - top.hp;
+  }
+
+  it('an enemy inside the walls strikes a defender on the wall top beside it; one outside cannot', () => {
+    expect(hurt('inside')).toBeGreaterThan(10);
+    expect(hurt('outside')).toBe(0);
+  });
+});
+
 describe('stalemates', () => {
   function lastWaveWith(band: string) {
     const st = STAGES.find((x) => x.id === 's5')!;

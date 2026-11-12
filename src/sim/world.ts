@@ -278,6 +278,10 @@ export const TREB_STONES = 24;
 /** no battle runs longer than this (game seconds): the attackers lift the siege (endless mode excepted) */
 export const BATTLE_HARD_CAP = 900;
 
+/** extra reach (px) and damage multiplier for enemies inside the walls striking defenders on the wall top */
+export const WALLTOP_REACH = 6;
+export const WALLTOP_HIT_MUL = 0.7;
+
 /** rams, siege towers and trebuchets: crewed machines with their own morale */
 export function isEngine(u: Unit) {
   const r = u.def.role;
@@ -1938,14 +1942,20 @@ export class World {
           if (!assault) return; // storming: shoot on the move
         }
       } else {
-        const reach = e.def.r + t.def.r + e.def.reach + 1;
-        if (d <= reach) {
+        const up = t.elev && !e.elev && e.def.role !== 'giant';
+        if (up && !this.reachesWallTop(e, t)) {
+          // a wall-top defender is only reachable from right beside the wall, inside the castle
+          e.target = null;
+        }
+        const reach = e.def.r + t.def.r + e.def.reach + (up ? WALLTOP_REACH : 1);
+        if (e.target && d <= reach) {
           e.fx = (t.x - e.x) / (d || 1);
           e.fy = (t.y - e.y) / (d || 1);
           if (e.cd <= 0) {
             e.cd = e.def.cd * this.rng.range(0.9, 1.1);
             let dmg = e.def.atk * e.atkMul;
             if (e.elev && !t.elev) dmg *= 0.8;
+            if (up) dmg *= WALLTOP_HIT_MUL; // striking up at the wall walk
             if (e.def.cavalry && e.moveT > 0.8) dmg *= 1.8;
             if (t.def.cavalry && e.def.antiCav) dmg *= e.def.antiCav;
             if (e.band && e.band.broken) dmg *= 0.8;
@@ -1956,7 +1966,7 @@ export class World {
           }
           return;
         }
-        if (d < 3.5 * T && !(convoy && Math.hypot(t.x - convoy.ax, t.y - convoy.ay) > 5 * T)) {
+        if (e.target && d < 3.5 * T && !(convoy && Math.hypot(t.x - convoy.ax, t.y - convoy.ay) > 5 * T)) {
           this.moveToward(e, t.x, t.y);
           return;
         }
@@ -2026,11 +2036,20 @@ export class World {
     return true;
   }
 
+  /** An enemy on the ground inside the walls (courtyard or breach) can reach defenders on the wall top beside it. */
+  reachesWallTop(e: Unit, d: Unit): boolean {
+    if (e.elev || !d.elev) return false;
+    const g = this.grid;
+    const et = tileAt(e.x, e.y);
+    if (g.inside[et] !== 1 && !g.isBoundary(et)) return false;
+    return Math.hypot(d.x - e.x, d.y - e.y) <= e.def.r + d.def.r + e.def.reach + WALLTOP_REACH;
+  }
+
   enemyMeleeTarget(e: Unit): Unit | null {
     const R = e.def.role === 'ladder' || e.def.role === 'sapper' ? 1.1 * T : e.def.role === 'giant' ? 2 * T : 2.6 * T;
     const giant = e.def.role === 'giant';
     return this.dHash.best(e.x, e.y, R, (d, d2) => {
-      if (d.elev && !e.elev && !giant) return Infinity;
+      if (d.elev && !e.elev && !giant) return this.reachesWallTop(e, d) ? d2 * 1.6 : Infinity;
       if (!d.elev && !e.elev && this.blockedBetween(e.x, e.y, d.x, d.y)) return Infinity;
       return d2;
     });
