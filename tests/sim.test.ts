@@ -4,7 +4,7 @@ import { Grid, idx } from '../src/sim/grid';
 import { RNG } from '../src/sim/rng';
 import { STAGES, dailyChallenge, endlessStage } from '../src/sim/stages';
 import { josa } from '../src/sim/josa';
-import { ACT, BAND_STALL_T, BATTLE_HARD_CAP, DRAGON_MAX_STAY, DRAGON_PAIN_MAX, DRAGON_STAY_ALONE, ST, World, isEngine, type Unit } from '../src/sim/world';
+import { ACT, BAND_STALL_T, BATTLE_HARD_CAP, DRAGON_MAX_STAY, DRAGON_PAIN_MAX, DRAGON_STAY_ALONE, GATE_SAFE_R, ST, World, isEngine, type Unit } from '../src/sim/world';
 import { newSave, newSquad } from '../src/meta/save';
 import { battleConfig, defaultLineup } from '../src/meta/progression';
 
@@ -209,6 +209,54 @@ describe('wall tops', () => {
   it('an enemy inside the walls strikes a defender on the wall top beside it; one outside cannot', () => {
     expect(hurt('inside')).toBeGreaterThan(10);
     expect(hurt('outside')).toBe(0);
+  });
+});
+
+describe('gates', () => {
+  it('a gate is barred to defenders while an enemy is within reach of it, and opens again once it is clear', () => {
+    const st = STAGES.find((x) => x.id === 's3')!;
+    const s = armyFor(3);
+    const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, 11));
+    const gate = idx(38, 17);
+    expect(w.grid.tiles[gate]).toBe(Tile.GATE);
+    const sq = w.squads.find((q) => q.type.id === 'spear')!;
+    sq.auto = false;
+    w.start();
+    w.pending = [];
+    w.spawnBand({ band: 'o_warband', edge: 'W', span: [16, 18], delay: 0 }, 0);
+    const grunt = w.enemies.find((e) => e.def.id === 'o_grunt')!;
+    for (const e of w.enemies) if (e !== grunt) e.state = ST.FLED;
+    const pin = (x: number) => {
+      grunt.x = grunt.px = x * 16;
+      grunt.y = grunt.py = 17.5 * 16;
+      grunt.cd = 99;
+      grunt.hp = grunt.maxHp; // the archers on the wall may shoot at it, it stays
+    };
+    pin(38 - (GATE_SAFE_R - 1)); // two tiles outside the gate
+    for (let i = 0; i < 15; i++) {
+      pin(38 - (GATE_SAFE_R - 1));
+      w.step();
+    }
+    expect(w.gateOpen(gate)).toBe(false);
+    expect(w.gatesShut).toBe(1);
+    expect(w.grid.defCanMove(idx(39, 17), gate)).toBe(false);
+    // ordered out through it: the spearmen wait inside
+    w.commandMove(sq, 33 * 16 + 8, 17 * 16 + 8);
+    for (let i = 0; i < 30 * 6; i++) {
+      pin(38 - (GATE_SAFE_R - 1));
+      w.step();
+      for (const u of sq.units) if (u.state === ST.ACTIVE) expect(u.x / 16).toBeGreaterThan(38);
+    }
+    const waiting = sq.units.filter((u) => u.state === ST.ACTIVE && Math.hypot(u.x - 38.5 * 16, u.y - 17.5 * 16) < 4 * 16).length;
+    expect(waiting).toBeGreaterThan(sq.units.length / 2);
+    // the orc walks off: the gate opens and they get out
+    for (let i = 0; i < 30 * 8; i++) {
+      pin(20);
+      w.step();
+    }
+    expect(w.gateOpen(gate)).toBe(true);
+    expect(w.gatesShut).toBe(0);
+    expect(sq.units.filter((u) => u.state === ST.ACTIVE && u.x / 16 < 38).length).toBeGreaterThan(sq.units.length / 2);
   });
 });
 

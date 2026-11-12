@@ -282,6 +282,9 @@ export const BATTLE_HARD_CAP = 900;
 export const WALLTOP_REACH = 6;
 export const WALLTOP_HIT_MUL = 0.7;
 
+/** defenders may use a gate only while no enemy is within this many tiles of it */
+export const GATE_SAFE_R = 3;
+
 /** rams, siege towers and trebuchets: crewed machines with their own morale */
 export function isEngine(u: Unit) {
   const r = u.def.role;
@@ -322,6 +325,11 @@ export class World {
   infirmField = newField();
   fieldsDirty = true;
   lastFieldT = -10;
+  /** gate state changed: squads' approach fields need a refresh (throttled) */
+  defFieldsDirty = false;
+  lastDefFieldT = -10;
+  /** number of intact gates currently barred to defenders */
+  gatesShut = 0;
   councilT = 0;
   /** per-world council scratch state (keeps battles independent of each other) */
   council = new CouncilState();
@@ -745,7 +753,9 @@ export class World {
       this.moraleT = 0.25;
       this.terrorUnits = this.activeEnemies.filter((e) => e.def.terror);
       for (const sq of this.squads) this.updateSquadCentroid(sq);
+      this.updateGates();
     }
+    if (this.defFieldsDirty && this.t - this.lastDefFieldT >= 0.5) this.refreshSquadFields();
     this.councilT -= dt;
     if (this.councilT <= 0) {
       this.councilT = 0.5;
@@ -770,6 +780,53 @@ export class World {
     if (this.t >= BATTLE_HARD_CAP && this.stage.id !== 'endless' && (this.state === 'battle' || this.state === 'intermission')) this.liftSiege();
     if (this.fx.length > 3000) this.fx.splice(0, this.fx.length - 1500);
     if (this.events.length > 200) this.events.splice(0, this.events.length - 100);
+  }
+
+  /**
+   * A gate opens for defenders only while no enemy is within GATE_SAFE_R tiles of it (a little more to
+   * reopen, so it does not flicker). A barred gate blocks defenders like a wall; fields refresh on change.
+   */
+  updateGates() {
+    const g = this.grid;
+    let shut = 0;
+    let changed = false;
+    for (const i of g.structTiles) {
+      if (g.tiles[i] !== Tile.GATE) continue;
+      const r = (g.gateShut[i] ? GATE_SAFE_R + 0.5 : GATE_SAFE_R) * T;
+      const x = cx(i);
+      const y = cy(i);
+      const danger = !!this.eHash.best(x, y, r, (e) => (e.fleeing || e.def.flying || e.state !== ST.ACTIVE ? Infinity : 0));
+      if (danger !== !!g.gateShut[i]) {
+        g.gateShut[i] = danger ? 1 : 0;
+        changed = true;
+      }
+      if (danger) shut++;
+    }
+    // gates that were rebuilt from rubble or broken since: never left barred
+    if (this.gatesShut > 0 || changed)
+      for (let i = 0; i < g.n; i++)
+        if (g.gateShut[i] && g.tiles[i] !== Tile.GATE) {
+          g.gateShut[i] = 0;
+          changed = true;
+        }
+    this.gatesShut = shut;
+    if (changed) this.defFieldsDirty = true;
+  }
+
+  /** Is this gate tile open to defenders right now? */
+  gateOpen(i: number) {
+    return this.grid.tiles[i] === Tile.GATE && !this.grid.gateShut[i];
+  }
+
+  refreshSquadFields() {
+    this.defFieldsDirty = false;
+    this.lastDefFieldT = this.t;
+    this.computeDefenderFields();
+    for (const sq of this.squads) {
+      if (sq.alive === 0 || !sq.slots.length) continue;
+      this.grid.defenderField(sq.slots, sq.field);
+      sq.tfieldTile = -1;
+    }
   }
 
   recomputeFields() {
@@ -1320,12 +1377,32 @@ export class World {
   walkField(u: Unit, f: Field, gx: number, gy: number, mul = 1) {
     const i = tileAt(u.x, u.y);
     const d = f.dist[i];
+    if (!isFinite(d) && this.gatesShut > 0 && u.side === 0) {
+      // cut off by a barred gate: wait at it until it opens (walking straight would just hug the wall)
+      const gt = this.nearestShutGate(u);
+      if (gt >= 0 && Math.hypot(cx(gt) - gx, cy(gt) - gy) > 1.5 * T) return this.moveToward(u, cx(gt), cy(gt), mul);
+    }
     if (d <= 1.5 || !isFinite(d)) return this.moveToward(u, gx, gy, mul);
     const n = f.next[i];
     if (n < 0) return this.moveToward(u, gx, gy, mul);
     const j = ((u.id * 13) % 7) - 3;
     this.moveToward(u, cx(n) + j * 0.9, cy(n) + ((u.id * 7) % 5 - 2) * 0.9, mul);
     return false;
+  }
+
+  nearestShutGate(u: Unit): number {
+    const g = this.grid;
+    let best = -1;
+    let bd = Infinity;
+    for (const i of g.structTiles) {
+      if (g.tiles[i] !== Tile.GATE || !g.gateShut[i]) continue;
+      const d = Math.hypot(cx(i) - u.x, cy(i) - u.y);
+      if (d < bd) {
+        bd = d;
+        best = i;
+      }
+    }
+    return best;
   }
 
   moveToSlot(u: Unit) {
@@ -1660,7 +1737,9 @@ export class World {
     const wx = cx(tt) + ((u.id % 5) - 2) * 2.5;
     const wy = cy(tt) + ((u.id % 3) - 1) * 3;
     const d = Math.hypot(wx - u.x, wy - u.y);
-    if (d > 0.9 * T) {
+    // a barred gate is mended from behind it (the crew cannot stand in the gateway)
+    const barred = g.tiles[tt] === Tile.GATE && g.gateShut[tt] === 1;
+    if (d > (barred ? 1.6 : 0.9) * T) {
       if (this.walkTo(u, tt, wx, wy)) return true;
       return true;
     }
@@ -1715,10 +1794,18 @@ export class World {
   /** Defender walk to a tile using a cached per-unit approach (squad field if same, else direct). */
   walkTo(u: Unit, tile: number, gx: number, gy: number): boolean {
     const sq = u.squad!;
+    const g = this.grid;
     if (!sq.tfield) sq.tfield = newField();
     if (sq.tfieldTile !== tile || this.fieldsDirty) {
       sq.tfieldTile = tile;
-      this.grid.defenderField([tile], sq.tfield);
+      const goals = [tile];
+      if (g.tiles[tile] === Tile.GATE && g.gateShut[tile])
+        for (let k = 0; k < 4; k++) {
+          const x = tx(tile) + N8[k][0];
+          const y = ty(tile) + N8[k][1];
+          if (inb(x, y) && g.inside[idx(x, y)]) goals.push(idx(x, y));
+        }
+      g.defenderField(goals, sq.tfield);
     }
     return this.walkField(u, sq.tfield, gx, gy);
   }

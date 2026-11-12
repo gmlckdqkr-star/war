@@ -108,6 +108,8 @@ export class Grid {
    * rubble scattered in the field is plain outside ground.
    */
   wallLine = new Uint8Array(GW * GH);
+  /** 1 = this intact gate is barred: enemies are at it, so defenders cannot pass either */
+  gateShut = new Uint8Array(GW * GH);
   keepTiles: number[] = [];
   depots: number[] = [];
   infirmaries: number[] = [];
@@ -294,6 +296,7 @@ export class Grid {
     const ib = TILE_INFO[tb];
     if (!ib.dpass) return false;
     if (a === b) return true;
+    if (tb === Tile.GATE && this.gateShut[b]) return false; // barred: step off it, never onto it
     const elevA = this.isElev(a);
     const elevB = ib.elev;
     // cannot climb a wall from outside ground, cannot jump off a wall to outside ground
@@ -438,7 +441,11 @@ export class Grid {
     let qi = 0;
     while (qi < q.length && out.length < count) {
       const i = q[qi++];
-      const ok = TILE_INFO[this.tiles[i]].dpass && this.isElev(i) === elev && (insideDest ? this.inside[i] || this.isBoundary(i) : true);
+      const ok =
+        TILE_INFO[this.tiles[i]].dpass &&
+        this.isElev(i) === elev &&
+        (insideDest ? this.inside[i] || this.isBoundary(i) : true) &&
+        !(this.tiles[i] === Tile.GATE && this.gateShut[i]);
       if (ok) out.push(i);
       else if (i !== dest) continue;
       const x = tx(i);
