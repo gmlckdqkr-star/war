@@ -57,6 +57,14 @@ async function run() {
   //  - on pagehide (after the app wrote its resume point) the fingerprint + step count go to sessionStorage
   //  - the replay overlay's texts and the long tasks while it is up
   await page.addInitScript(() => {
+    // "storage full" for the save only (the record still fits), switched on by a sessionStorage flag
+    if (sessionStorage.getItem('e2e.saveFull')) {
+      const set = Storage.prototype.setItem;
+      Storage.prototype.setItem = function (k, v) {
+        if (this === localStorage && String(k).startsWith('ashen.save')) throw new DOMException('quota', 'QuotaExceededError');
+        return set.call(this, k, v);
+      };
+    }
     window.__fp = (w) => {
       let h = 0;
       for (const u of w.units) h = (h * 31 + Math.round(u.x * 100) * 7 + Math.round(u.y * 100) * 13 + Math.round(u.hp * 100) + u.state * 17 + (u.fleeing ? 5 : 0)) | 0;
@@ -106,7 +114,7 @@ async function run() {
   });
   const errors = [];
   // failures the resume section provokes on purpose (logged locally by the app, then handled)
-  const expectedErrors = [/rebuilt stage differs/];
+  const expectedErrors = [/rebuilt stage differs/, /replayed state differs/];
   page.on('console', (m) => {
     if (m.type() === 'error' && !expectedErrors.some((r) => r.test(m.text()))) errors.push(m.text());
   });
@@ -571,9 +579,32 @@ async function run() {
       await b.click();
       await page.waitForTimeout(150);
     }
+    // a lineup picked while every squad was wounded is empty: pick ready squads with the rows themselves
+    for (let i = 0; i < 4; i++) {
+      if ((await page.$$('.lineup-row.on')).length >= 3) break;
+      const r = await page.$('.lineup-row:not(.on):not(.disabled)');
+      if (!r) break;
+      await r.click();
+      await page.waitForTimeout(100);
+    }
   };
-  // The stage 9 battle from section 8 is still running. Give orders through the real controls first.
+  // A fresh, fully manned battle on the last stage (section 8's army may already be spent, depending on
+  // how many frames ran). Give orders through the real controls first.
   const recRaw = () => page.evaluate(() => localStorage.getItem('ashen.battle'));
+  await page.evaluate(() => window.__app.exitBattle(window.__app.battle, null, false));
+  await page.evaluate(() => window.__app.go('campaign'));
+  const cards9 = await page.$$('.stage-card:not(.locked)');
+  await cards9[cards9.length - 1].click();
+  await page.waitForSelector('.prebattle');
+  await careUp();
+  await page.click('.pre-actions .btn.primary');
+  await page.waitForSelector('.battle');
+  await closeModals();
+  await page.click('.start-btn');
+  await page.evaluate(() => {
+    const w = window.__app.battle.world;
+    for (let i = 0; i < 30 * 20; i++) w.step();
+  });
   const stage9 = await page.evaluate(() => window.__app.battle.setup.stage.name);
   await page.click('.speed[data-speed="3"]');
   await page.tap('.cards .card:nth-child(1)');
@@ -663,6 +694,9 @@ async function run() {
       cmds: b.recorder.cmds.length,
       paused: b.paused,
       banner: document.querySelector('.hud-banner').textContent,
+      // during a wave break the intermission panel shows the pause (⏸) instead of the banner
+      inter: document.querySelector('.inter:not(.hidden)')?.textContent ?? '',
+      wstate: b.world.state,
       toast: document.querySelector('.toasts')?.textContent ?? '',
       replay: app.lastReplay,
       overlay: ov.texts,
@@ -675,8 +709,19 @@ async function run() {
   check('resumed battle is identical at the saved step (world fingerprint)', resumed.steps === stash.steps && JSON.stringify(resumed.fp) === JSON.stringify(stash.fp), `steps ${stash.steps} -> ${resumed.steps}; ${JSON.stringify(stash.fp).slice(0, 160)} vs ${JSON.stringify(resumed.fp).slice(0, 160)}`);
   check('resumed recorder carries the earlier orders', resumed.cmds === stash.cmds, `${stash.cmds} -> ${resumed.cmds}`);
   check('replay progress is shown ("전투 복원 중… n%")', resumed.overlay.some((t) => /전투 복원 중… \d+%/.test(t)), JSON.stringify(resumed.overlay.slice(0, 6)));
-  check('replay never freezes the screen for long', resumed.replay && resumed.replay.maxChunkMs <= 50, JSON.stringify(resumed.replay) + ' long tasks during replay: ' + JSON.stringify(resumed.long));
-  check('resumed battle waits paused, with a toast', resumed.paused && resumed.banner.includes('일시정지') && resumed.toast.includes('이어갑니다'), `${resumed.banner} | ${resumed.toast}`);
+  // every piece of work between two paints is timed by the app: building the world, each replay chunk,
+  // the final state check and building the battle screen (the browser's long tasks are listed alongside)
+  const blocks = resumed.replay && [resumed.replay.prepMs, resumed.replay.maxChunkMs, resumed.replay.hashMs, resumed.replay.viewMs];
+  check(
+    'replay never freezes the screen for long (world, chunks, check, battle screen each <= 50 ms)',
+    !!blocks && blocks.every((x) => typeof x === 'number' && x <= 50),
+    JSON.stringify(resumed.replay) + ' long tasks while the overlay was up: ' + JSON.stringify(resumed.long),
+  );
+  check(
+    'resumed battle waits paused, with a toast',
+    resumed.paused && (resumed.wstate === 'intermission' ? resumed.inter.includes('⏸') : resumed.banner.includes('일시정지')) && resumed.toast.includes('이어갑니다'),
+    `${resumed.wstate}: ${resumed.banner || resumed.inter} | ${resumed.toast}`,
+  );
   check('pre-battle state restored for retry / exit', JSON.stringify(resumed.pre) === JSON.stringify(stash.pre) && resumed.supplyCost === stash.supplyCost, JSON.stringify(resumed.pre));
   // the continued battle keeps recording after the old orders
   await page.click('.hud-top .speeds .hud-btn:first-child');
@@ -835,6 +880,74 @@ async function run() {
   const failToast = await page.evaluate(() => document.querySelector('.toasts')?.textContent ?? '');
   await shot('24_resume_failed');
   check('a record that does not rebuild: toast, home, nothing charged', failToast.includes('복원하지 못해') && (await recRaw()) === null && !(await state()).battle && (await save()).gold === ga4.gold, failToast);
+
+  // ---- a replay that does not reach the saved state (e.g. a WebView update changed Math results): same failure path
+  for (const choice of ['primary', 'ghost']) {
+    await page.evaluate((r) => localStorage.setItem('ashen.battle', JSON.stringify({ ...r, h: 'drifted', savedAt: Date.now() })), good);
+    await page.reload();
+    await page.waitForSelector('.modal');
+    await page.click(`.modal-buttons .btn.${choice}`);
+    if (choice === 'ghost') {
+      await page.waitForSelector('.modal-buttons .btn.danger');
+      await page.click('.modal-buttons .btn.danger');
+    }
+    await page.waitForFunction(() => !window.__app.resuming && !!document.querySelector('.home') && !document.querySelector('.resume-overlay'), null, { timeout: 20000 });
+    await page.waitForTimeout(200);
+    const t = await page.evaluate(() => document.querySelector('.toasts')?.textContent ?? '');
+    const g = await save();
+    check(`a drifted replay is caught (${choice === 'primary' ? '이어하기' : '포기'}): toast, home, nothing charged`, t.includes('복원하지 못해') && (await recRaw()) === null && !(await state()).battle && g.gold === ga4.gold && g.stats.battles === ga4.stats.battles, t);
+  }
+
+  // ---- boot while the save can't be written (storage full): the interrupted battle is still offered and kept
+  const diskSave = () => page.evaluate(() => localStorage.getItem('ashen.save'));
+  const recFull = JSON.stringify({ ...good, savedAt: Date.now() });
+  await page.evaluate((r) => {
+    localStorage.setItem('ashen.battle', r);
+    sessionStorage.setItem('e2e.saveFull', '1');
+  }, recFull);
+  await page.reload();
+  await page.waitForSelector('.modal');
+  await page.waitForTimeout(300);
+  const bootFull = await page.evaluate(() => ({
+    prompt: document.querySelector('.modal')?.textContent ?? '',
+    banner: !!document.querySelector('.storage-banner'),
+    rec: localStorage.getItem('ashen.battle'),
+  }));
+  await shot('25_boot_storage_full');
+  // what is on disk now (the page before wrote it while unloading; this one can't write the save)
+  const gb0 = await save();
+  const disk0 = await diskSave();
+  check('storage full at boot: the interrupted battle is still offered, its record kept', bootFull.prompt.includes('중단된 전투') && bootFull.banner && bootFull.rec === recFull, `banner=${bootFull.banner} kept=${bootFull.rec === recFull}`);
+  // 포기 settles in memory but can't reach the disk: the record must stay, so nothing is lost if the app dies now
+  await page.click('.modal-buttons .btn.ghost');
+  await page.waitForSelector('.modal-buttons .btn.danger');
+  await page.click('.modal-buttons .btn.danger');
+  await page.waitForFunction(() => !window.__app.resuming && document.querySelector('.modal h2')?.textContent.includes('후퇴'), null, { timeout: 60000 });
+  await page.click('.modal-buttons .btn.primary');
+  await page.waitForTimeout(200);
+  check('포기 while the save can not be written: the save on disk is untouched and the record stays', (await diskSave()) === disk0 && (await recRaw()) === recFull);
+  // space again: the battle is offered once more and settled exactly once
+  await page.evaluate(() => sessionStorage.removeItem('e2e.saveFull'));
+  await page.reload();
+  await page.waitForSelector('.modal');
+  await page.click('.modal-buttons .btn.ghost');
+  await page.waitForSelector('.modal-buttons .btn.danger');
+  await page.click('.modal-buttons .btn.danger');
+  await page.waitForFunction(() => !window.__app.resuming && document.querySelector('.modal h2')?.textContent.includes('후퇴'), null, { timeout: 60000 });
+  const sumFull = (await page.textContent('.modal')) ?? '';
+  await page.click('.modal-buttons .btn.primary');
+  await page.waitForTimeout(200);
+  const gb1 = await save();
+  const rewardFull = Number((/보상: 금화 ([\d,]+)/.exec(sumFull) ?? [])[1]?.replace(/,/g, '') ?? NaN);
+  await page.reload();
+  await page.waitForSelector('.home');
+  await page.waitForTimeout(300);
+  const gb2 = await save();
+  check(
+    'once storage has room: the battle is settled exactly once',
+    gb1.stats.battles === gb0.stats.battles + 1 && gb1.gold === gb0.gold + rewardFull && gb2.gold === gb1.gold && gb2.stats.battles === gb1.stats.battles && !(await page.$('.modal')) && (await recRaw()) === null,
+    `battles ${gb0.stats.battles} -> ${gb1.stats.battles} -> ${gb2.stats.battles}, gold ${gb0.gold} -> ${gb1.gold} -> ${gb2.gold}, reward ${rewardFull}`,
+  );
 
   check('no console errors', errors.length === 0, errors.slice(0, 5).join(' | '));
   await browser.close();

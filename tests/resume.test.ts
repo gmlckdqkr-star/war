@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { STAGES, dailyChallenge, endlessStage, type StageDef } from '../src/sim/stages';
-import { World, type BattleConfig } from '../src/sim/world';
-import { memoryKV, newSave, newSquad, type SaveData } from '../src/meta/save';
+import { World, type BattleConfig, type BattleResult } from '../src/sim/world';
+import { memoryKV, newSave, newSquad, type KV, type SaveData } from '../src/meta/save';
 import { battleConfig, defaultLineup } from '../src/meta/progression';
 import {
   BattleRecorder,
@@ -13,13 +13,15 @@ import {
   saveRecord,
   stageRefFor,
   stageSig,
+  stateHash,
   storableCfg,
+  writeSaveMakingRoom,
   type BattleRecord,
   type RecordBase,
   type StageRef,
 } from '../src/ui/resume';
 import { Charges } from '../src/ui/orders';
-import { settleBattle } from '../src/ui/prebattle';
+import { rewardLines, settleBattle } from '../src/ui/prebattle';
 import { RESUME_VER } from '../src/ui/version';
 
 /** Everything that matters about a battle state, down to the RNG. */
@@ -264,7 +266,7 @@ describe('battle resume (record + deterministic replay)', () => {
     w.surrender();
     const s2 = saveWithArmy();
     s2.gold = 1000;
-    const rw2 = settleBattle(s2, { stage: w.stage, mode: saved.mode, supplyCost, battleId: saved.id }, w.result!, now);
+    const rw2 = settleBattle(s2, { stage: resolveStage(saved.ref)!, mode: saved.mode, supplyCost, battleId: saved.id }, w.result!, now);
     expect(w.result).toEqual(live.result);
     expect(s2).toEqual(s1);
     expect(rw2).toEqual(rw1);
@@ -450,5 +452,190 @@ describe('only World commands change the battle from the UI', () => {
         });
     }
     expect(hits).toEqual([]);
+  });
+});
+
+describe('replay drift check (state hash)', () => {
+  it('every record carries the hash of its last step; the replay must reach it, a drifted one does not', async () => {
+    const { st, cfg, ref } = setup(2, 5150);
+    const live = new World(cfg);
+    const rec = new BattleRecorder(live, base(st, cfg, ref, live));
+    const ch = new Charges();
+    run(live, ch, 0, 30 * 60);
+    const saved = roundTrip(rec.record({ charges: ch.save() }));
+    expect(saved.h).toBe(stateHash(live));
+    const again = await rebuild(saved);
+    expect(stateHash(again)).toBe(saved.h);
+    // the same record with one order missing replays into another battle: the hash tells
+    const i = saved.cmds.findIndex((c) => c.m === 'commandStance');
+    expect(i).toBeGreaterThan(-1);
+    const drifted = { ...saved, cmds: saved.cmds.filter((_, j) => j !== i) };
+    const w2 = await rebuild(drifted);
+    expect(stateHash(w2)).not.toBe(saved.h);
+    // and so does a world that ran one step more
+    w2.step();
+    const w3 = await rebuild(saved);
+    w3.step();
+    expect(stateHash(w3)).not.toBe(saved.h);
+  });
+
+  it('is read-only: hashing changes nothing (RNG, units, map) and gives the same value twice', () => {
+    const { cfg } = setup(4, 8);
+    const w = new World(cfg);
+    w.start();
+    for (let i = 0; i < 30 * 50; i++) w.step();
+    const fp = fingerprint(w);
+    const a = stateHash(w);
+    expect(stateHash(w)).toBe(a);
+    expect(fingerprint(w)).toEqual(fp);
+    // the buffers the battle screen drains are not part of the state
+    w.events.length = 0;
+    w.fx.length = 0;
+    w.dirtyTiles.length = 0;
+    expect(stateHash(w)).toBe(a);
+  });
+
+  it('a record without a hash is not resumed', () => {
+    const { st, cfg, ref } = setup(0, 3);
+    const w = new World(cfg);
+    const rec = new BattleRecorder(w, base(st, cfg, ref, w));
+    const kv = memoryKV();
+    const { h: _h, ...noHash } = rec.record();
+    kv.set(RESUME_KEY, JSON.stringify(noHash));
+    expect(loadRecord(kv, RESUME_VER)).toBeNull();
+    kv.set(RESUME_KEY, JSON.stringify({ ...noHash, h: 7 }));
+    expect(loadRecord(kv, RESUME_VER)).toBeNull();
+  });
+});
+
+describe('storage full: the save comes first, the record is only given up when that helps', () => {
+  /** A KV store with a size limit (characters), like localStorage's quota. */
+  function quotaKV(limit: number): KV & { used(): number } {
+    const m = new Map<string, string>();
+    const used = () => [...m].reduce((n, [k, v]) => n + k.length + v.length, 0);
+    return {
+      get: (k) => m.get(k) ?? null,
+      set: (k, v) => {
+        const old = m.get(k);
+        if (used() - (old !== undefined ? k.length + old.length : 0) + k.length + v.length > limit) throw new Error('QuotaExceededError');
+        m.set(k, v);
+      },
+      remove: (k) => void m.delete(k),
+      used,
+      mode: 'ok',
+    };
+  }
+  const RECORD = JSON.stringify({ pad: 'r'.repeat(3000) });
+
+  it('save fits: the record stays', () => {
+    const kv = quotaKV(20000);
+    kv.set(RESUME_KEY, RECORD);
+    expect(writeSaveMakingRoom(kv, () => (kv.set('save', 's'.repeat(5000)), true))).toBe(true);
+    expect(kv.get(RESUME_KEY)).toBe(RECORD);
+  });
+
+  it('save fits only without the record: the record goes, the save is written', () => {
+    const kv = quotaKV(9000);
+    kv.set(RESUME_KEY, RECORD);
+    const write = () => {
+      try {
+        kv.set('save', 's'.repeat(7000));
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    expect(writeSaveMakingRoom(kv, write)).toBe(true);
+    expect(kv.get('save')?.length).toBe(7000);
+    expect(kv.get(RESUME_KEY)).toBeNull();
+  });
+
+  it('save does not fit even without the record: the record is kept (the interrupted battle is not lost for nothing)', () => {
+    const kv = quotaKV(9000);
+    kv.set(RESUME_KEY, RECORD);
+    const write = () => {
+      try {
+        kv.set('save', 's'.repeat(20000));
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    expect(writeSaveMakingRoom(kv, write)).toBe(false);
+    expect(kv.get(RESUME_KEY)).toBe(RECORD);
+    expect(kv.get('save')).toBeNull();
+    // nothing to give up: just reports the failure
+    const empty = quotaKV(10);
+    expect(writeSaveMakingRoom(empty, write)).toBe(false);
+  });
+});
+
+describe('settlement details', () => {
+  const won = (s: SaveData): BattleResult => ({
+    won: true,
+    stars: 3,
+    keepPct: 1,
+    wavesCleared: 3,
+    totalWaves: 3,
+    kills: 40,
+    routed: 3,
+    dead: 0,
+    wounded: 0,
+    evacuated: 0,
+    deployed: 24,
+    bounty: 80,
+    time: 300,
+    dragons: 0,
+    squads: s.roster.slice(0, 2).map((r) => ({ rosterId: r.id, dead: [], wounded: [], survivors: r.soldiers.map((x) => x.id), kills: 20 })),
+  });
+
+  it('a daily counts for its own day even when it is finished days later (resumed), and today\'s daily stays open', () => {
+    const s = saveWithArmy();
+    const st = dailyChallenge('2026-11-12', 2).stage;
+    const ref: StageRef = { kind: 'daily', key: '2026-11-12', maxIdx: 2 };
+    const later = new Date(2026, 10, 14, 9);
+    const rw = settleBattle(s, { stage: st, mode: 'daily', ref, battleId: 'd1' }, won(s), later);
+    expect(rw.lines).toContain('오늘의 공성 완료: 금화 150, 훈장 20');
+    expect(s.daily.lastKey).toBe('2026-11-12');
+    // the 11-14 daily is still there to be won on 11-14
+    const st14 = dailyChallenge('2026-11-14', 2).stage;
+    const rw14 = settleBattle(s, { stage: st14, mode: 'daily', ref: { kind: 'daily', key: '2026-11-14', maxIdx: 2 }, battleId: 'd2' }, won(s), later);
+    expect(rw14.lines).toContain('오늘의 공성 완료: 금화 150, 훈장 20');
+    expect(s.daily.lastKey).toBe('2026-11-14');
+    // a day already credited (or a later one) is never paid twice, whatever the clock says
+    const again = settleBattle(s, { stage: st, mode: 'daily', ref, battleId: 'd3' }, won(s), new Date(2026, 10, 20));
+    expect(again.lines).not.toContain('오늘의 공성 완료: 금화 150, 훈장 20');
+    expect(s.daily.lastKey).toBe('2026-11-14');
+  });
+
+  it('the reward list shows unlocks, promotions and achievements (result screen and the "포기" summary alike)', () => {
+    const rw = { gold: 10, medals: 0, passXp: 5, firstClear: false, newStars: 0, bonusFirstWin: false, lines: ['전리품 10'], unlocked: ['석궁대 모집 가능'], promoted: ['창병대 I: 하사'], achievements: ['빛나는 방패'] };
+    expect(rewardLines(rw)).toEqual([
+      { text: '전리품 10', good: false },
+      { text: '🔓 석궁대 모집 가능', good: true },
+      { text: '⬆ 진급 창병대 I: 하사', good: true },
+      { text: '🏅 업적: 빛나는 방패', good: true },
+    ]);
+  });
+
+  it('after a resume, "다시 도전" starts from a stage that gives the same reference again (every mode)', () => {
+    const s = saveWithArmy();
+    const d = dailyChallenge('2026-11-12', 3);
+    for (const [mode, st, seed, daily] of [
+      ['campaign', STAGES[3], 77, undefined],
+      ['daily', d.stage, d.seed, { key: '2026-11-12', maxIdx: 3 }],
+      ['endless', endlessStage(4321), 4321, undefined],
+    ] as const) {
+      const ref = stageRefFor(mode, st, seed, daily)!;
+      expect(ref).toBeTruthy();
+      const cfg = battleConfig(s, st, defaultLineup(s, st), {}, seed);
+      const w = new World(cfg);
+      const rec = new BattleRecorder(w, { ...base(st, cfg, ref, w), mode });
+      const saved = roundTrip(rec.record());
+      // what App.restorePre keeps: the stage rebuilt from the reference (not world.stage), seed and daily inputs
+      const again = resolveStage(saved.ref)!;
+      const pre = { mode: saved.mode, stage: again, seed: saved.cfg.seed, daily: saved.ref.kind === 'daily' ? { key: saved.ref.key, maxIdx: saved.ref.maxIdx } : undefined };
+      expect(stageRefFor(pre.mode, pre.stage, pre.seed, pre.daily)).toEqual(ref);
+    }
   });
 });

@@ -56,6 +56,8 @@ export interface BattleRecord {
   name: string;
   steps: number;
   cmds: Cmd[];
+  /** stateHash() of the world at `steps` (after the commands given there): the replay must reach it */
+  h: string;
   savedAt: number;
   /** sim time, wave and state when saved (shown in the prompt) */
   t?: number;
@@ -66,7 +68,7 @@ export interface BattleRecord {
 }
 
 /** Everything about a record except what the recorder fills in. */
-export type RecordBase = Omit<BattleRecord, 'steps' | 'cmds' | 'savedAt' | 't' | 'wave' | 'waves' | 'state' | 'charges'>;
+export type RecordBase = Omit<BattleRecord, 'steps' | 'cmds' | 'h' | 'savedAt' | 't' | 'wave' | 'waves' | 'state' | 'charges'>;
 
 /** World methods the UI uses to give orders. Anything else the UI does must not change the simulation. */
 export const COMMAND_METHODS = [
@@ -135,6 +137,52 @@ export function stageSig(w: World): string {
   return checksum(JSON.stringify(data) + '|' + Array.from(w.grid.tiles).join(','));
 }
 
+/**
+ * Cheap fingerprint of the battle state: the RNG, the clock, every unit, squad and map tile, the keep and
+ * the stores. Stored with each record and compared after the replay, so a replay that drifts (say, a
+ * WebView update that changes Math results under the same app version) is caught instead of resuming a
+ * different battle. Read-only: no world state is changed and nothing is drawn from world.rng. The buffers
+ * the screen drains (events, fx, dirtyTiles) are left out.
+ */
+export function stateHash(w: World): string {
+  let h = 0x811c9dc5;
+  const mix = (v: number) => {
+    h = Math.imul(h ^ (v | 0), 0x01000193);
+  };
+  const q = (v: number) => mix(Math.round(v * 100));
+  mix((w.rng as unknown as { s: number }).s);
+  q(w.t);
+  mix(w.waveIdx);
+  mix(['deploy', 'battle', 'intermission', 'won', 'lost'].indexOf(w.state));
+  q(w.keepHp);
+  for (const k of Object.keys(w.supplies) as (keyof typeof w.supplies)[]) q(w.supplies[k]);
+  mix(w.units.length);
+  for (const u of w.units) {
+    mix(u.id);
+    q(u.x);
+    q(u.y);
+    q(u.hp);
+    mix(u.state);
+    mix(u.fleeing ? 1 : 0);
+  }
+  for (const sq of w.squads) {
+    mix(sq.id);
+    mix(['hold', 'defend', 'aggressive'].indexOf(sq.stance));
+    mix(sq.auto ? 1 : 0);
+    mix(sq.focus ? sq.focus.id : -1);
+    mix(sq.destTile);
+    q(sq.morale);
+    mix(sq.alive);
+  }
+  const g = w.grid;
+  for (let i = 0; i < g.n; i++) {
+    mix(g.tiles[i]);
+    q(g.hp[i]);
+  }
+  for (const k of Object.keys(w.stats) as (keyof typeof w.stats)[]) q(w.stats[k]);
+  return (h >>> 0).toString(36) + '.' + w.units.length;
+}
+
 /** The config as stored in a record: plain data, without the stage (which holds a function). */
 export function storableCfg(cfg: BattleConfig): Omit<BattleConfig, 'stage'> {
   const { stage: _stage, ...rest } = cfg;
@@ -152,11 +200,14 @@ export class BattleRecorder {
   /** >0 while a command runs: commands it calls internally (e.g. preset -> commandAuto) aren't recorded */
   private depth = 0;
 
+  private readonly world: World;
+
   constructor(
     world: World,
     readonly base: RecordBase,
     resume?: { steps: number; cmds: Cmd[] },
   ) {
+    this.world = world;
     if (resume) {
       this.steps = resume.steps;
       this.cmds = resume.cmds.slice();
@@ -193,8 +244,9 @@ export class BattleRecorder {
     }
   }
 
+  /** The record as of now; `h` fingerprints the world at this very step (see stateHash). */
   record(live: Partial<Pick<BattleRecord, 't' | 'wave' | 'waves' | 'state' | 'charges'>> = {}): BattleRecord {
-    return { ...this.base, ...live, steps: this.steps, cmds: this.cmds.slice(), savedAt: Date.now() };
+    return { ...this.base, ...live, steps: this.steps, cmds: this.cmds.slice(), h: stateHash(this.world), savedAt: Date.now() };
   }
 }
 
@@ -214,6 +266,30 @@ export function clearRecord(kv: KV) {
   } catch {
     /* ignore */
   }
+}
+
+/**
+ * Write the save with `write`. When storage is full and a resume record takes space, the record makes
+ * room: it is dropped and the save tried once more. If the save still does not fit, the record is put
+ * back, since dropping it would lose the interrupted battle and gain nothing.
+ */
+export function writeSaveMakingRoom(kv: KV, write: () => boolean): boolean {
+  if (write()) return true;
+  let raw: string | null = null;
+  try {
+    raw = kv.get(RESUME_KEY);
+  } catch {
+    raw = null;
+  }
+  if (raw === null) return false;
+  clearRecord(kv);
+  if (write()) return true;
+  try {
+    kv.set(RESUME_KEY, raw);
+  } catch {
+    /* not even that fits any more: the record is gone either way */
+  }
+  return false;
 }
 
 const MODES: readonly string[] = ['campaign', 'daily', 'endless'];
@@ -251,7 +327,7 @@ export function loadRecord(kv: KV, ver: string, now = Date.now()): BattleRecord 
     if (typeof r.id !== 'string' || !MODES.includes(r.mode) || !validRef(r.ref) || typeof r.sig !== 'string') return null;
     if (!r.cfg || typeof r.cfg !== 'object' || !Array.isArray(r.cfg.squads) || !Number.isFinite(r.cfg.seed)) return null;
     if (!Array.isArray(r.lineup) || !r.lineup.every((x) => typeof x === 'string')) return null;
-    if (!Number.isInteger(r.steps) || r.steps < 0 || !validCmds(r.cmds, r.steps)) return null;
+    if (!Number.isInteger(r.steps) || r.steps < 0 || !validCmds(r.cmds, r.steps) || typeof r.h !== 'string') return null;
     if (typeof r.savedAt !== 'number' || now - r.savedAt > RESUME_MAX_AGE) return null;
     if (r.charges !== undefined && !(Array.isArray(r.charges) && r.charges.every((c) => c && Number.isInteger(c.sq) && Number.isInteger(c.t) && STANCES.includes(c.prev)))) return null;
     if (typeof r.name !== 'string') r.name = '';
@@ -272,7 +348,7 @@ export interface ReplayStats {
 const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 
 /** Let the browser paint and handle input. A message is not clamped like a nested setTimeout(0). */
-function yieldToBrowser(): Promise<void> {
+export function yieldToBrowser(): Promise<void> {
   return new Promise((resolve) => {
     if (typeof MessageChannel === 'undefined') {
       setTimeout(resolve, 0);
