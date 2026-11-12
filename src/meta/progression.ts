@@ -190,6 +190,10 @@ export function lineupSoldiers(s: SaveData, squadIds: string[]): number {
 
 // ---------------------------------------------------------------- battle setup
 
+/** below this many ready soldiers the castle adds militia squads to the lineup (at most LEVY_MAX_SQUADS) */
+export const LEVY_BELOW = 30;
+export const LEVY_MAX_SQUADS = 3;
+
 export function battleConfig(
   s: SaveData,
   st: StageDef,
@@ -209,6 +213,11 @@ export function battleConfig(
     if (ready.length === 0) continue;
     squads.push({ rosterId: r.id, type: r.type, name: r.name, rank: rankOf(r), xp: r.xp, soldiers: ready, color: dye, tile: opts.placement?.[r.id] });
   }
+  // a beaten, penniless army is never left with nobody to send: the castle levies militia (free, not kept)
+  const fielded = squads.reduce((n, q) => n + q.soldiers.length, 0);
+  const levies = Math.min(LEVY_MAX_SQUADS, Math.ceil(Math.max(0, LEVY_BELOW - fielded) / SQUAD_TYPES.militia.size));
+  for (let k = 0; k < levies; k++)
+    squads.push({ rosterId: `levy${k + 1}`, type: 'militia', name: '성 민병대', rank: 0, xp: 0, soldiers: Array.from({ length: SQUAD_TYPES.militia.size }, (_, j) => -2000 - k * 100 - j), color: dye });
   return {
     stage: st,
     seed,

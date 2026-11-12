@@ -7,7 +7,7 @@ import { COUNCIL_IDS, COUNCIL_NAMES, GATE_BOOST, REPAIR_FRAC, councilDesc } from
 import { josa } from '../src/sim/josa';
 import { ACT, BAND_STALL_T, BATTLE_HARD_CAP, DRAGON_MAX_STAY, DRAGON_PAIN_MAX, DRAGON_STAY_ALONE, GATE_SAFE_R, ST, TREB_SPLASH_DMG, World, isEngine, type Unit } from '../src/sim/world';
 import { newSave, newSquad } from '../src/meta/save';
-import { UPGRADES, baseSupplies, battleConfig, defaultLineup, foodNeeded, lineupSoldiers, upgradeCost } from '../src/meta/progression';
+import { LEVY_BELOW, LEVY_MAX_SQUADS, UPGRADES, applyBattle, baseSupplies, battleConfig, defaultLineup, foodNeeded, lineupSoldiers, upgradeCost } from '../src/meta/progression';
 
 function armyFor(stageIdx: number) {
   const s = newSave(0);
@@ -777,6 +777,30 @@ describe('approaches', () => {
       c.forEach((e) => sides.add(e));
     });
     expect(sides.size).toBeGreaterThan(1);
+  });
+});
+
+describe('levy', () => {
+  it('a wiped-out army still fields the castle militia, which costs nothing and is not kept', () => {
+    const st = STAGES.find((x) => x.id === 's4')!;
+    const s = newSave(0);
+    const full = battleConfig(s, st, defaultLineup(s, st), {}, 5);
+    expect(full.squads.some((q) => q.type === 'militia')).toBe(false);
+    for (const r of s.roster) r.soldiers = [];
+    const ids = defaultLineup(s, st);
+    expect(lineupSoldiers(s, ids)).toBe(0);
+    const cfg = battleConfig(s, st, ids, {}, 5);
+    expect(cfg.squads.length).toBe(LEVY_MAX_SQUADS);
+    expect(cfg.squads.every((q) => q.type === 'militia')).toBe(true);
+    expect(cfg.squads.reduce((n, q) => n + q.soldiers.length, 0)).toBeGreaterThanOrEqual(LEVY_BELOW);
+    const w = new World(cfg);
+    w.start();
+    while ((w.state === 'battle' || w.state === 'intermission') && w.t < 120) w.step();
+    if (!w.result) w.surrender();
+    const roster = JSON.stringify(s.roster);
+    applyBattle(s, st, w.result!, 'campaign', new Date(2027, 0, 1));
+    expect(JSON.stringify(s.roster)).toBe(roster);
+    expect(s.gold).toBeGreaterThan(0);
   });
 });
 
