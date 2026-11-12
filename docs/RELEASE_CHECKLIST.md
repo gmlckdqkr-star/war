@@ -8,7 +8,8 @@
 | 휴대폰 화면 UI·터치 조작 | **테스트됨 (헤드리스 Chromium, 844×390 터치)** | `npm run e2e` 25개 항목 |
 | 저장·백업·손상 복구·저장 코드 | **테스트됨** | 단위 테스트 + E2E(손상 → 백업 복구) |
 | 웹 체험판 결제(테스트용 MockIAP) | **테스트됨** | E2E: 연대기·후원 구매 → 권한 부여 |
-| 실제 스토어 결제 (`NativeIAP`, cordova-plugin-purchase v13) | **구현됨 · 미검증** | 스토어 계정·테스트 트랙이 있어야 검증 가능 |
+| 실제 스토어 결제 (`NativeIAP`, cordova-plugin-purchase v13) | **구현됨 · 미검증** | 스토어 계정·테스트 트랙이 있어야 검증 가능. 네이티브에서는 테스트 결제로 절대 대체되지 않음(플러그인 없으면 구매 비활성화), 플랫폼은 Capacitor로 판별(iPad 안전), 지난 시즌 패스 포함 전체 상품 등록·복원, 오프라인·취소·오류 한국어 안내 |
+| 네이티브 보조 기능 (뒤로 가기, 글꼴 배율 고정, 저장 사본) | **구현됨 · 미검증** | `src/ui/native.ts`: 플러그인이 있을 때만 동작(기능 감지). 웹에서는 history 방식 뒤로 가기가 동작함(E2E) |
 | Android/iOS 앱 포장 (Capacitor) | **설계됨** | `capacitor.config.json`만 준비. 클라우드 환경에 Android SDK 없음 |
 | 실제 휴대폰 성능 | **미검증** | 데스크톱 Chromium: 시뮬 평균 0.14–0.26 ms/스텝, 렌더 ~0.5 ms/프레임 (휴대폰은 수 배 느림 추정) |
 
@@ -19,10 +20,12 @@
 3. **서명 키 생성·보관**: Android 업로드 키(keystore). 분실하면 업데이트 불가 → 안전한 곳에 백업.
 4. **인앱 상품 등록** (모두 *비소모성*):
    - `supporter_small`, `supporter_large`, `bundle_castles`, `commander_kit`
-   - `chronicle_s01` … `chronicle_s24` (시즌 프리미엄, 시즌 1 = 2026-12-01 시작, 6주 간격)
-5. **개인정보처리방침 URL**: 수집 항목 없음 문구로 충분 (아래 초안). 스토어 등록 시 필수.
-6. **콘텐츠 등급 설문**: 판타지 전투 폭력(피 표현 있음, 도형 수준), 확률형 아이템 없음, 광고 없음.
-7. **실기기 테스트**: 저가형 Android 1대 + iPhone 1대에서 10분 플레이, 결제 테스트 트랙에서 구매→삭제→재설치→구매 복원.
+   - `chronicle_s01` … `chronicle_s24` (시즌 프리미엄, 시즌 1 = 2026-12-01 시작, 6주 간격). 지난 시즌 상품도 **판매 중지만 하고 삭제하지 말 것**(구매 복원에 필요).
+   - 상품 설명 예: "시즌 N 한정 외관 5종 영구 지급 + 시즌 훈장 보너스". 애플 심사 메모에 "구매한 외관은 영구 보유·복원 가능(비소모성)"이라고 적어 두면 기간제 상품 오해를 줄일 수 있음(추론).
+5. **판매자 정보 입력**: `src/meta/legal.ts`의 `SELLER`(상호/이름, 문의 이메일, 해당 시 사업자·통신판매업 신고번호). 상점·설정 화면에 표시됨. 청약철회 제한 안내 문구는 이미 들어가 있음(법률 자문 아님, 추론).
+6. **개인정보처리방침 URL**: 수집 항목 없음 문구로 충분 (아래 초안). 스토어 등록 시 필수.
+7. **콘텐츠 등급 설문**: 판타지 전투 폭력(피 표현 있음, 도형 수준), 확률형 아이템 없음, 광고 없음.
+8. **실기기 테스트**: 저가형 Android 1대 + iPhone 1대(+ 가능하면 iPad)에서 10분 플레이, 결제 테스트 트랙에서 구매→삭제→재설치→구매 복원, 비행기 모드에서 구매 복원(안내 문구 확인), 하드웨어 뒤로 가기, 시스템 글꼴 최대 크기.
 
 ## 앱으로 포장하기 (Android 기준, 개발 PC에서)
 
@@ -31,7 +34,8 @@ npm ci
 npm run build
 npm i -D @capacitor/cli @capacitor/core @capacitor/android
 npx cap add android
-npm i cordova-plugin-purchase && npx cap sync android
+npm i cordova-plugin-purchase @capacitor/app @capacitor/text-zoom @capacitor/preferences && npx cap sync android
+# (@capacitor/app: 뒤로 가기 버튼, text-zoom: 시스템 글꼴 배율 무시, preferences: 저장 사본 → 기기 백업으로 새 폰에 이전)
 # android/app/src/main/AndroidManifest.xml 의 MainActivity 에 가로 고정:
 #   android:screenOrientation="sensorLandscape"
 # android:allowBackup="true" 유지 (기기 백업으로 진행 상황 자동 이전)
@@ -50,4 +54,5 @@ iOS도 동일하게 `@capacitor/ios` → `npx cap add ios` → Xcode에서 가�
 
 - 정기 작업 없음. 시즌·주간 진열·오늘의 공성은 날짜로 자동 회전.
 - 2029년 하반기(시즌 24 종료) 이후 프리미엄 시즌을 계속하려면: 상품 ID 추가 등록 + `MAX_REGISTERED_SEASONS` 상향 업데이트 1회.
-- 문의 대응 표준 답변: ① 상점/설정의 "구매 복원" ② 설정 → "저장 코드 복사/불러오기" ③ 설정 → "오류 기록 복사".
+- 문의 대응 표준 답변: ① 상점/설정의 "구매 복원" ② 설정 → "저장 코드 복사/불러오기"(약 1,100자, 공유 버튼으로 나에게 보내기) ③ 설정 → "오류 기록 복사".
+- 웹 버전을 공개 배포할 때 테스트 결제를 끄려면 `VITE_WEB_SHOP=off npm run build`.
