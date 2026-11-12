@@ -28,6 +28,8 @@ export function particle(word: string, pair: JosaPair): string {
   const [withFinal, withoutFinal] = pair.split('/');
   const f = hasFinal(word);
   if (pair === '으로/로') return f && !finalIsRieul(word) ? '으로' : '로';
+  // the pair is written vowel-first ('와' after a vowel, '과' after a final consonant)
+  if (pair === '와/과') return f === false ? '와' : f ? '과' : '와';
   if (f === null) return withoutFinal; // best effort for unknown scripts
   return f ? withFinal : withoutFinal;
 }

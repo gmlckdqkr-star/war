@@ -71,3 +71,15 @@ describe('retry lineup', () => {
     expect(wantedSize(pre, 4)).toBe(2);
   });
 });
+
+describe('Korean particle pairs', () => {
+  it('와/과 follows the final consonant (과 after 받침, 와 after a vowel)', async () => {
+    const { josa } = await import('../src/sim/josa');
+    expect(josa('창병', '와/과')).toBe('창병과');
+    expect(josa('궁병대', '와/과')).toBe('궁병대와');
+    expect(josa('칼', '와/과')).toBe('칼과');
+    expect(josa('오크', '와/과')).toBe('오크와');
+    expect(josa('창병', '이/가')).toBe('창병이');
+    expect(josa('칼', '으로/로')).toBe('칼로');
+  });
+});
