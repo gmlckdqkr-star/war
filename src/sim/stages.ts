@@ -272,7 +272,7 @@ export const STAGES: StageDef[] = [
     story: '불탄 숲의 복수를 외치는 실반 무리. 숲에서 쏘는 척후궁수는 성벽 궁수보다 멀리 쏜다. 노포와 탑을 활용하라.',
     factions: ['elf'],
     squadCap: 6,
-    level: 1.04,
+    level: 1.0,
     supplies: supplies(5),
     reward: 320,
     keepHp: 4000,
