@@ -35,12 +35,12 @@ export function fmt(n: number) {
 // ------------------------------------------------------------------ toasts
 
 let toastRoot: HTMLElement | null = null;
-export function toast(text: string, level: 'info' | 'good' | 'warn' | 'danger' = 'info', onTap?: () => void, ms = 2600) {
+export function toast(text: string, level: 'info' | 'good' | 'warn' | 'danger' = 'info', onTap?: () => void, ms = 2600, cls = '') {
   if (!toastRoot) {
     toastRoot = h('div', { class: 'toasts', 'aria-live': 'polite' });
     document.body.append(toastRoot);
   }
-  const t = h('div', { class: `toast ${level}`, role: 'status' }, text);
+  const t = h('div', { class: `toast ${level}${cls ? ' ' + cls : ''}`, role: 'status' }, text);
   if (onTap) {
     t.classList.add('tappable');
     t.addEventListener('pointerdown', (e) => {
@@ -50,7 +50,9 @@ export function toast(text: string, level: 'info' | 'good' | 'warn' | 'danger' =
     });
   }
   toastRoot.append(t);
-  while (toastRoot.children.length > 3) toastRoot.firstElementChild?.remove();
+  // in battle the map matters more than the log: at most two alerts at a time
+  const max = document.body.classList.contains('in-battle') ? 2 : 3;
+  while (toastRoot.children.length > max) toastRoot.firstElementChild?.remove();
   setTimeout(() => t.classList.add('out'), ms);
   setTimeout(() => t.remove(), ms + 400);
 }

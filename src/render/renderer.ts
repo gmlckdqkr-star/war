@@ -83,6 +83,10 @@ export class Renderer {
   targeting: string | null = null;
   dragLine: { x0: number; y0: number; x1: number; y1: number } | null = null;
   pings: { x: number; y: number; t: number; c: string }[] = [];
+  /** banner text per squad id (type glyph + number when several squads share a type) */
+  labels = new Map<number, string>();
+  /** soldiers drawn in the last frame (debug / e2e) */
+  drawnUnits = 0;
   private buckets = new Map<string, Unit[]>();
   private tileRng = new RNG(1);
   onSound: (k: string, x: number, y: number) => void = () => {};
@@ -579,6 +583,7 @@ export class Renderer {
     ctx.drawImage(this.decals, 0, 0, WORLD_W, WORLD_H);
     this.drawStructOverlays(w);
     if (this.deployMode) this.drawDeployZones(w);
+    if (this.deployMode || w.state === 'intermission') this.drawApproach(w);
     this.drawFires(w);
     this.drawLadders(w);
     this.drawSelection(w);
@@ -637,16 +642,55 @@ export class Renderer {
   private drawDeployZones(w: World) {
     const ctx = this.ctx;
     const g = w.grid;
-    ctx.fillStyle = 'rgba(120,180,255,0.10)';
-    for (let i = 0; i < g.n; i++) if (g.deployable(i)) ctx.fillRect(tx(i) * T, ty(i) * T, T, T);
-    // enemy approach arrows
-    const edges = new Set<string>();
-    for (const wv of w.stage.waves) for (const gr of wv.groups) edges.add(gr.edge);
-    ctx.fillStyle = 'rgba(230,70,60,0.55)';
+    const z = this.cam.zoom;
+    ctx.fillStyle = 'rgba(90,160,255,0.32)';
+    ctx.beginPath();
+    for (let i = 0; i < g.n; i++) if (g.deployable(i)) ctx.rect(tx(i) * T, ty(i) * T, T, T);
+    ctx.fill();
+    // outline the edge of the deployable area so it reads on grey stone and green grass alike
+    const out = (nx: number, ny: number) => !inb(nx, ny) || !g.deployable(idx(nx, ny));
+    ctx.beginPath();
+    for (let i = 0; i < g.n; i++) {
+      if (!g.deployable(i)) continue;
+      const x = tx(i);
+      const y = ty(i);
+      if (out(x - 1, y)) {
+        ctx.moveTo(x * T, y * T);
+        ctx.lineTo(x * T, y * T + T);
+      }
+      if (out(x + 1, y)) {
+        ctx.moveTo(x * T + T, y * T);
+        ctx.lineTo(x * T + T, y * T + T);
+      }
+      if (out(x, y - 1)) {
+        ctx.moveTo(x * T, y * T);
+        ctx.lineTo(x * T + T, y * T);
+      }
+      if (out(x, y + 1)) {
+        ctx.moveTo(x * T, y * T + T);
+        ctx.lineTo(x * T + T, y * T + T);
+      }
+    }
+    ctx.strokeStyle = 'rgba(150,200,255,0.95)';
+    ctx.lineWidth = Math.max(1, 1.6 / z);
+    ctx.stroke();
+  }
+
+  /** Red arrows on the map edge for the edges the next wave comes from (deploy and intermission only). */
+  private drawApproach(w: World) {
+    const ctx = this.ctx;
+    const edges = w.nextWaveEdges();
+    if (!edges.length) return;
+    // place arrows where that wave's groups enter when the stage data says so
+    const waves = w.stage.waves;
+    const wi = w.state === 'deploy' ? 0 : w.state === 'intermission' ? w.waveIdx + 1 : Math.max(0, w.waveIdx);
+    const wave = waves[Math.min(Math.max(0, wi), waves.length - 1)];
+    const s = Math.max(1, 0.9 / this.cam.zoom);
     const arrow = (x: number, y: number, ang: number) => {
       ctx.save();
       ctx.translate(x, y);
       ctx.rotate(ang);
+      ctx.scale(s, s);
       ctx.beginPath();
       ctx.moveTo(14, 0);
       ctx.lineTo(-6, -10);
@@ -654,12 +698,26 @@ export class Renderer {
       ctx.lineTo(-6, 10);
       ctx.closePath();
       ctx.fill();
+      ctx.stroke();
       ctx.restore();
     };
-    const pulse = 4 * Math.sin(this.time * 4);
-    if (edges.has('W')) for (const yy of [0.3, 0.5, 0.7]) arrow(18 + pulse, WORLD_H * yy, 0);
-    if (edges.has('N')) arrow(WORLD_W * 0.55, 18 + pulse, Math.PI / 2);
-    if (edges.has('S')) arrow(WORLD_W * 0.55, WORLD_H - 18 - pulse, -Math.PI / 2);
+    ctx.fillStyle = 'rgba(235,70,55,0.85)';
+    ctx.strokeStyle = 'rgba(40,10,5,0.8)';
+    ctx.lineWidth = 1.2;
+    const pulse = this.reduceMotion ? 0 : 4 * Math.sin(this.time * 4);
+    const m = 18 * s;
+    for (const e of edges) {
+      const mids = (wave?.groups ?? []).filter((gr) => gr.edge === e).map((gr) => Math.round((gr.span[0] + gr.span[1]) / 2));
+      const along = [...new Set(mids)].slice(0, 3);
+      const len = e === 'W' || e === 'E' ? GH : GW;
+      const pts = along.length ? along.map((v) => (Math.max(1, Math.min(len - 2, v)) + 0.5) * T) : [len * T * 0.35, len * T * 0.65];
+      for (const at of pts) {
+        if (e === 'W') arrow(m + pulse, at, 0);
+        else if (e === 'E') arrow(WORLD_W - m - pulse, at, Math.PI);
+        else if (e === 'N') arrow(at, m + pulse, Math.PI / 2);
+        else if (e === 'S') arrow(at, WORLD_H - m - pulse, -Math.PI / 2);
+      }
+    }
   }
 
   private drawFires(w: World) {
@@ -776,7 +834,7 @@ export class Renderer {
         add('#big', u);
         continue;
       }
-      add(u.side === 0 ? (u.squad ? u.squad.color : this.theme.dye) + '|' + u.def.trim : u.def.color + '|' + u.def.trim, u);
+      add((u.side === 0 ? (u.squad ? u.squad.color : this.theme.dye) : u.def.color) + '|' + u.def.trim + '|' + u.side, u);
     }
     const ix = (u: Unit) => u.px + (u.x - u.px) * alpha;
     const iy = (u: Unit) => u.py + (u.y - u.py) * alpha;
@@ -802,16 +860,22 @@ export class Renderer {
       }
       ctx.fill();
     }
-    const zoomed = this.cam.zoom > 1.6;
-    // keep soldiers at least ~2.3 screen px in radius when zoomed far out
-    const boost = Math.max(1, 2.3 / (3.2 * this.cam.zoom));
-    const R = (u: Unit): number => u.def.r * boost;
+    const zoom = this.cam.zoom;
+    const zoomed = zoom > 1.6;
+    // keep soldiers at least ~2.7 screen px in radius when zoomed far out (fit zoom on a phone is ~0.5)
+    const minR = 2.7 / zoom;
+    const R = (u: Unit): number => (u.def.r < minR ? minR : u.def.r);
+    const outline = Math.max(0.7, 1 / zoom);
+    let drawn = 0;
     for (const [key, arr] of b) {
-      if (!arr.length || key[0] === '#') continue;
-      const [body, trim] = key.split('|');
+      // the special buckets are exactly '#down' and '#big'; body colours are hex strings that also start with '#'
+      if (!arr.length || key === '#down' || key === '#big') continue;
+      drawn += arr.length;
+      const [body, trim, side] = key.split('|');
       ctx.fillStyle = body;
-      ctx.strokeStyle = 'rgba(10,10,12,0.75)';
-      ctx.lineWidth = 0.7;
+      // defenders get a pale rim, attackers a dark one, so the sides read apart even as dots
+      ctx.strokeStyle = side === '0' ? 'rgba(230,238,255,0.9)' : 'rgba(12,8,6,0.9)';
+      ctx.lineWidth = outline;
       ctx.beginPath();
       for (const u of arr) {
         const x = ix(u);
@@ -847,6 +911,8 @@ export class Renderer {
       }
       ctx.stroke();
     }
+    if (elevPass) this.drawnUnits += drawn;
+    else this.drawnUnits = drawn;
     // hit flashes
     ctx.fillStyle = 'rgba(255,255,255,0.7)';
     ctx.beginPath();
@@ -1150,14 +1216,15 @@ export class Renderer {
       ctx.strokeStyle = sel ? '#ffe08a' : 'rgba(0,0,0,0.6)';
       ctx.lineWidth = sel ? 1.6 * s : 0.8 * s;
       ctx.stroke();
-      ctx.font = `bold ${7 * s}px sans-serif`;
+      const label = this.labels.get(sq.id) ?? sq.type.short;
+      ctx.font = `bold ${(label.length > 1 ? 6.4 : 7) * s}px sans-serif`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.lineWidth = 2 * s;
       ctx.strokeStyle = 'rgba(0,0,0,0.65)';
-      ctx.strokeText(sq.type.short, fx0 + fw / 2, fy0 + fh / 2 + wave / 2 + 0.5 * s);
+      ctx.strokeText(label, fx0 + fw / 2, fy0 + fh / 2 + wave / 2 + 0.5 * s);
       ctx.fillStyle = '#fff';
-      ctx.fillText(sq.type.short, fx0 + fw / 2, fy0 + fh / 2 + wave / 2 + 0.5 * s);
+      ctx.fillText(label, fx0 + fw / 2, fy0 + fh / 2 + wave / 2 + 0.5 * s);
       // morale bar
       const mw = 14 * s;
       ctx.fillStyle = 'rgba(0,0,0,0.6)';
@@ -1292,23 +1359,32 @@ export class Renderer {
 
   // ------------------------------------------------------------------ picking
 
-  squadAt(sx: number, sy: number, radiusPx = 30): Squad | null {
+  /** banner flag centre on screen (the flag hangs right of the pole, above the squad) */
+  bannerScreen(sq: Squad) {
+    const s = Math.max(0.55, Math.min(1.6, 1.1 / this.cam.zoom));
+    return { x: this.cam.toScreenX(sq.cx + 7.5 * s), y: this.cam.toScreenY(sq.cy - 17 * s) };
+  }
+
+  /**
+   * Squad under a tap: nearest banner flag within `radiusPx` (or a per-squad radius from `radiusOf`),
+   * then, with `bodies`, one of its soldiers.
+   */
+  squadAt(sx: number, sy: number, radiusPx = 30, bodies = true, radiusOf?: (sq: Squad) => number): Squad | null {
     const w = this.world;
     if (!w) return null;
     let best: Squad | null = null;
-    let bd = radiusPx * radiusPx;
-    const s = Math.max(0.55, Math.min(1.6, 1.1 / this.cam.zoom));
+    let bd = Infinity;
     for (const sq of w.squads) {
       if (sq.alive === 0) continue;
-      const bx = this.cam.toScreenX(sq.cx);
-      const by = this.cam.toScreenY(sq.cy - 14 * s);
-      const d = (bx - sx) ** 2 + (by - sy) ** 2;
-      if (d < bd) {
+      const r = radiusOf ? radiusOf(sq) : radiusPx;
+      const p = this.bannerScreen(sq);
+      const d = (p.x - sx) ** 2 + (p.y - sy) ** 2;
+      if (d < r * r && d < bd) {
         bd = d;
         best = sq;
       }
     }
-    if (best) return best;
+    if (best || !bodies) return best;
     // otherwise: tap on soldiers of a squad
     const wx = this.cam.toWorldX(sx);
     const wy = this.cam.toWorldY(sy);
@@ -1325,7 +1401,8 @@ export class Renderer {
     return bu ? bu.squad : null;
   }
 
-  enemyAt(sx: number, sy: number): Unit | null {
+  /** Nearest attacker within ~16 screen px of a tap (on walls and ladders too). */
+  enemyAt(sx: number, sy: number, radiusPx = 16): Unit | null {
     const w = this.world;
     if (!w) return null;
     const wx = this.cam.toWorldX(sx);
@@ -1333,7 +1410,8 @@ export class Renderer {
     let best: Unit | null = null;
     let bd = Infinity;
     for (const e of w.activeEnemies) {
-      const R = e.def.r + 12 / this.cam.zoom;
+      if (e.fleeing) continue;
+      const R = e.def.r + radiusPx / this.cam.zoom;
       const d = (e.x - wx) ** 2 + (e.y - wy) ** 2;
       if (d < R * R && d < bd) {
         bd = d;

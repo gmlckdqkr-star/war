@@ -94,10 +94,56 @@ async function run() {
   await page.waitForTimeout(300);
   check('battle started', (await state()).state === 'battle');
 
+  // soldiers are drawn (debug counter) and show up as pixels next to their banner, at fit zoom too
+  const soldierPx = async () =>
+    page.evaluate(() => {
+      const b = window.__app.battle;
+      const r = b.renderer;
+      const c = b.canvas;
+      const dpr = r.dpr;
+      const ctx = c.getContext('2d');
+      let px = 0;
+      for (const sq of b.world.squads) {
+        if (sq.alive === 0) continue;
+        // a box just below the squad centre: soldiers stand there, the banner hangs above it
+        const x = Math.round((r.cam.toScreenX(sq.cx) - 14) * dpr);
+        const y = Math.round((r.cam.toScreenY(sq.cy) + 1) * dpr);
+        const w = Math.round(28 * dpr);
+        const hh = Math.round(14 * dpr);
+        const d = ctx.getImageData(Math.max(0, x), Math.max(0, y), w, hh).data;
+        // defenders: dye body (blue) or the pale rim
+        for (let i = 0; i < d.length; i += 4) if ((d[i + 2] > 150 && d[i + 2] - d[i] > 70) || (d[i] > 190 && d[i + 2] > 235)) px++;
+      }
+      return { drawn: r.drawnUnits, px, zoom: r.cam.zoom };
+    });
+  const sv = await soldierPx();
+  check('soldiers visible (counter + pixels)', sv.drawn > 20 && sv.px > 40, JSON.stringify(sv));
+  await page.evaluate(() => window.__app.battle.renderer.cam.fit());
+  await page.waitForTimeout(150);
+  const svFit = await soldierPx();
+  check('soldiers visible at fit zoom', svFit.drawn > 20 && svFit.px > 80, JSON.stringify(svFit));
+  await shot('04b_soldiers_fit');
+  // auto fast-forward while the enemy is still walking in
+  check('fast-forward indicator before contact', await page.evaluate(() => window.__app.battle.approaching && document.querySelector('.hud-banner').textContent.includes('적 접근 중')));
+
   // select squad via card, order by tapping ground
   await page.tap('.cards .card:nth-child(2)');
   await page.waitForTimeout(150);
   check('selection strip shown', await page.isVisible('.sel-strip'));
+  const chips = await page.evaluate(() =>
+    [...document.querySelectorAll('.sel-strip .chip')].map((c) => {
+      const r = document.createRange();
+      r.selectNodeContents(c);
+      return { t: c.textContent, h: Math.round(c.getBoundingClientRect().height), lines: r.getClientRects().length };
+    }),
+  );
+  check('selection strip chips on one line', chips.length >= 5 && chips.every((c) => c.lines === 1 && c.h <= 46), JSON.stringify(chips));
+  const stripBox = await page.evaluate(() => {
+    const s = document.querySelector('.sel-strip').getBoundingClientRect();
+    const cam = window.__app.battle.renderer.cam;
+    return { top: s.top, right: s.right, mapBottom: cam.h - cam.insetBottom, vw: innerWidth };
+  });
+  check('selection strip stays off the map', stripBox.top >= stripBox.mapBottom - 2 && stripBox.right <= stripBox.vw, JSON.stringify(stripBox));
   const tgt = await page.evaluate(() => {
     const w = window.__app.battle.world;
     const r = window.__app.battle.renderer;
@@ -137,9 +183,51 @@ async function run() {
     const used = await page.evaluate(() => Object.values(window.__app.battle.world.abilities).some((a) => a.cd > 0));
     check('ability targeting works', !!armed && used);
   }
+  // a burst of alerts: at most two toasts on screen, top-right
+  await page.evaluate(() => {
+    const w = window.__app.battle.world;
+    for (let i = 0; i < 6; i++) w.events.push({ type: 'test', text: `시험 알림 ${i + 1}`, level: 'warn', x: 200, y: 200 });
+  });
+  await page.waitForTimeout(150);
+  const toasts = await page.evaluate(() => [...document.querySelectorAll('.toasts .toast')].map((t) => t.getBoundingClientRect().left));
+  check('battle toasts: at most 2, right side', toasts.length >= 1 && toasts.length <= 2 && toasts.every((x) => x > 844 / 2), JSON.stringify(toasts));
+
   await page.click('.speed[data-speed="3"]');
   await page.waitForTimeout(800);
   await shot('05_battle');
+  check('battle speed saved', (await save()).settings.speed === 3);
+
+  // war council: during an intermission, options from the world become big buttons
+  await page.evaluate(() => {
+    const w = window.__app.battle.world;
+    let n = 0;
+    while (w.state === 'battle' && n++ < 30 * 600) w.step();
+    window.__picked = [];
+    w.councilOptions = () =>
+      w.councilPick
+        ? []
+        : [
+            { id: 'a', name: '성벽 보수', desc: '성벽 내구 회복' },
+            { id: 'b', name: '휴식', desc: '전 분대 사기 +20' },
+            { id: 'c', name: '보급 정비', desc: '화살 +150' },
+          ];
+    w.chooseCouncil = (id) => {
+      window.__picked.push(id);
+      w.councilPick = id;
+      return true;
+    };
+  });
+  await page.waitForTimeout(400);
+  if ((await state()).state === 'intermission') {
+    const opts = await page.$$('.council-opt');
+    check('council options shown', opts.length === 3);
+    check('next wave direction announced', ((await page.textContent('.inter-dir')) ?? '').startsWith('다음 공세:'));
+    await shot('05b_council');
+    await page.tap('.council-opt[data-id="b"]');
+    await page.waitForTimeout(200);
+    const picked = await page.evaluate(() => ({ p: window.__picked, label: document.querySelector('.inter-pick')?.textContent, n: document.querySelectorAll('.council-opt').length }));
+    check('council pick applied and shown', picked.p[0] === 'b' && (picked.label ?? '').includes('휴식') && picked.n === 0, JSON.stringify(picked));
+  } else check('council options shown', false, 'no intermission: ' + (await state()).state);
 
   // portrait screenshot of the running battle
   await page.setViewportSize({ width: 390, height: 844 });
@@ -245,6 +333,24 @@ async function run() {
   await shot('14_wardrobe');
   check('wardrobe equip', !!(await page.$('.item.equipped')));
 
+  // ---------------------------------------------------------------- 4b. supply packs are planned, not paid, until a result
+  await page.click('.topbar .back');
+  await page.evaluate(() => {
+    window.__app.save.gold = Math.max(window.__app.save.gold, 200);
+    window.__app.go('campaign');
+  });
+  await (await page.$$('.stage-card'))[0].click();
+  await page.waitForSelector('.prebattle');
+  const gPlan = (await save()).gold;
+  await page.click('.sup-row .btn');
+  await page.waitForTimeout(120);
+  const planText = (await page.textContent('.plan-line')) ?? '';
+  check('supply pack planned, gold untouched', (await save()).gold === gPlan && planText.includes('◉'), planText);
+  await shot('14b_supply_plan');
+  await page.click('.topbar .back');
+  await page.waitForTimeout(120);
+  check('leaving prebattle charges nothing', (await save()).gold === gPlan, `${gPlan} -> ${(await save()).gold}`);
+
   // ---------------------------------------------------------------- 5. settings: export/import strips purchases
   await page.click('.topbar .back');
   await page.click('text=설정');
@@ -282,6 +388,7 @@ async function run() {
   await page.click('.pre-actions .btn.primary');
   await page.waitForSelector('.battle');
   await closeModals();
+  check('battle speed remembered', await page.evaluate(() => window.__app.battle.speed === 3 && document.querySelector('.speed.on')?.dataset.speed === '3'));
   await page.click('.start-btn');
   await page.evaluate(() => {
     const w = window.__app.battle.world;

@@ -4,14 +4,17 @@
  * Mobile control model (designed for one thumb + occasional second finger):
  *  - Squads fight on their own (squad AI + war council). The player gives macro orders only.
  *  - Tap a banner or a squad card -> select. Tap ground -> move there. Tap an enemy -> focus it.
+ *    While a squad is selected only a direct hit on another banner selects it; every other tap is an order.
  *  - Drag a banner -> move along the drag. One-finger drag on empty ground -> pan. Pinch -> zoom.
  *  - Abilities: tap button, then tap the map. Presets: one tap for the whole army.
  *  - Pause is tactical: every order still works while paused.
+ *  - Until the first contact of a wave the battle runs fast-forward on its own (same sim steps, less waiting).
  */
-import { DT, SQUAD_TYPES } from '../sim/defs';
+import { DT, SQUAD_TYPES, TILE } from '../sim/defs';
 import { tileAt, tx, ty } from '../sim/grid';
+import { particle, type JosaPair } from '../sim/josa';
 import type { StageDef } from '../sim/stages';
-import { ABILITY_INFO, ST, World, type AbilityId, type BattleConfig, type BattleResult, type GameEvent, type Squad, type Stance } from '../sim/world';
+import { ABILITY_INFO, ST, World, type AbilityId, type BattleConfig, type BattleResult, type GameEvent, type Squad, type Stance, type Unit } from '../sim/world';
 import { cosmeticById } from '../meta/cosmetics';
 import { RANK_NAMES } from '../meta/progression';
 import { hasFlag } from '../meta/shop';
@@ -27,9 +30,16 @@ export interface BattleSetup {
   stage: StageDef;
   cfg: BattleConfig;
   modName?: string;
+  /** gold for the planned supply packs; charged only when the result is recorded */
+  supplyCost?: number;
 }
 
 const STANCE_NAMES: Record<Stance, string> = { hold: '고수', defend: '방어', aggressive: '추격' };
+const EDGE_NAMES: Record<string, string> = { W: '서쪽', N: '북쪽', S: '남쪽', E: '동쪽' };
+/** speed used while nothing has met the enemy yet */
+const APPROACH_SPEED = 3;
+/** seconds of sim time without contact before fast-forward resumes */
+const CONTACT_HOLD = 5;
 
 export function themeFromSave(app: App): Theme {
   const s = app.save;
@@ -37,6 +47,31 @@ export function themeFromSave(app: App): Theme {
   const ban = cosmeticById(s.equipped.banner)?.colors ?? ['#2f5fc4', '#f2e6c8'];
   const dye = cosmeticById(s.equipped.dye)?.colors[0] ?? '#3a6fd8';
   return { stone: castle[0], stoneDark: castle[1], dye, bannerField: ban[0], bannerCharge: ban[1], bannerPattern: cosmeticById(s.equipped.banner)?.pattern ?? 'plain' };
+}
+
+const ROMAN: Record<string, number> = { I: 1, II: 2, III: 3, IV: 4, V: 5, VI: 6, VII: 7, VIII: 8, IX: 9, X: 10 };
+
+/** Squad name + particle; a roman suffix is read as a Korean number (궁수대 I → 궁수대 일 → "이"). */
+export function nameJosa(name: string, pair: JosaPair): string {
+  const spoken = name.replace(/\s([IVX]+)$/, (m, r: string) => (ROMAN[r] ? ' ' + ROMAN[r] : m));
+  return name + particle(spoken, pair);
+}
+
+/**
+ * Number that tells same-type squads apart (궁1, 궁2 ...): the roman suffix of the squad name when the
+ * names are unique, otherwise the order. Squads whose type appears once get no number.
+ */
+export function squadNumbers<T extends { type: string; name: string }>(list: T[]): Map<T, number> {
+  const out = new Map<T, number>();
+  const byType = new Map<string, T[]>();
+  for (const q of list) byType.set(q.type, [...(byType.get(q.type) ?? []), q]);
+  for (const group of byType.values()) {
+    if (group.length < 2) continue;
+    const nums = group.map((q) => ROMAN[/\s([IVX]+)$/.exec(q.name.trim())?.[1] ?? ''] ?? 0);
+    const ok = nums.every((n) => n > 0) && new Set(nums).size === nums.length;
+    group.forEach((q, i) => out.set(q, ok ? nums[i] : i + 1));
+  }
+  return out;
 }
 
 export class BattleView {
@@ -58,6 +93,12 @@ export class BattleView {
   targeting: AbilityId | null = null;
   selected: Squad | null = null;
   crashed = false;
+  /** auto fast-forward is running (no contact yet in this wave) */
+  approaching = false;
+  /** sim time of the last contact */
+  private contactT = -99;
+  /** melee charges ordered by tapping an enemy: the stance to restore once the target is gone */
+  private charges = new Map<Squad, { target: Unit; prev: Stance }>();
   private els: Record<string, HTMLElement> = {};
   private cards: HTMLElement[] = [];
   private abilityBtns: Partial<Record<AbilityId, HTMLButtonElement>> = {};
@@ -67,17 +108,23 @@ export class BattleView {
   private lastTap = { t: 0, x: 0, y: 0 };
   private hintShown = new Set<string>();
   private playStart = performance.now();
+  private interKey = '';
+  private councilNames = new Map<string, string>();
+  private laidOut = false;
 
   constructor(app: App, setup: BattleSetup) {
     this.app = app;
     this.setup = setup;
     this.world = new World(setup.cfg);
-    this.root = h('div', { class: 'battle' + (app.save.settings.leftHanded ? ' lefty' : '') });
+    const s = app.save;
+    const allowed = this.speeds();
+    this.speed = allowed.includes(s.settings.speed) ? s.settings.speed : Math.min(Math.max(1, Math.round(s.settings.speed || 1)), allowed[allowed.length - 1]);
+    this.root = h('div', { class: 'battle' + (s.settings.leftHanded ? ' lefty' : '') });
     this.canvas = h('canvas', { class: 'battle-canvas', 'aria-label': '전장' });
     this.root.append(this.canvas);
     this.renderer = new Renderer(this.canvas, themeFromSave(app));
-    this.renderer.reduceMotion = app.save.settings.reduceMotion;
-    this.renderer.setQuality(app.save.settings.quality === 'low');
+    this.renderer.reduceMotion = s.settings.reduceMotion;
+    this.renderer.setQuality(s.settings.quality === 'low');
     this.renderer.onSound = (k, x) => audio.play(k, x);
     this.buildHud();
     app.screenRoot.append(this.root);
@@ -87,6 +134,7 @@ export class BattleView {
     this.renderer.deployMode = true;
     const g = this.world.grid;
     this.renderer.cam.focusCastle(g.keepX, g.keepY);
+    this.laidOut = true;
     this.bindInput();
     this.ro = new ResizeObserver(() => this.layout());
     this.ro.observe(this.root);
@@ -107,11 +155,30 @@ export class BattleView {
 
   // ================================================================== layout & HUD
 
+  private speeds() {
+    return [1, 2, 3, ...(hasFlag(this.app.save, 'speed4') ? [4] : [])];
+  }
+
+  /** Fit the canvas between the HUD bars. The map never jumps: the world point under the screen centre stays put. */
   private layout() {
     const r = this.root.getBoundingClientRect();
+    const bottomBar = this.els.bottom?.offsetHeight ?? 70;
     const top = (this.els.top?.offsetHeight ?? 44) + 4;
-    const bottom = (this.els.bottom?.offsetHeight ?? 70) + (this.els.strip?.offsetHeight ?? 0) + 4;
-    this.renderer.resize(Math.max(1, r.width), Math.max(1, r.height), top, bottom);
+    const bottom = bottomBar + 4;
+    this.root.style.setProperty('--hud-bottom', `${bottomBar}px`);
+    this.root.style.setProperty('--hud-top', `${top - 4}px`);
+    const cam = this.renderer.cam;
+    const w = Math.max(1, r.width);
+    const hh = Math.max(1, r.height);
+    if (this.laidOut && cam.w === w && cam.h === hh && cam.insetTop === top && cam.insetBottom === bottom) return;
+    const wx = cam.toWorldX(cam.w / 2);
+    const wy = cam.toWorldY(cam.h / 2);
+    this.renderer.resize(w, hh, top, bottom);
+    if (this.laidOut) {
+      cam.x = wx;
+      cam.y = wy + cam.centerOffsetY() / cam.zoom;
+      cam.clamp();
+    }
   }
 
   private buildHud() {
@@ -125,10 +192,9 @@ export class BattleView {
     E.keep = h('div', { class: 'keep-label' });
     E.keepBar = bar(1, 'keep');
     E.sup = h('div', { class: 'supplies' });
-    const speeds = [1, 2, 3, ...(hasFlag(s, 'speed4') ? [4] : [])];
     E.pause = h('button', { class: 'hud-btn', 'aria-label': '일시정지', onclick: () => this.togglePause() }, '⏸');
-    const speedBtns = speeds.map((sp) =>
-      h('button', { class: 'hud-btn speed' + (sp === 1 ? ' on' : ''), 'data-speed': sp, onclick: () => this.setSpeed(sp) }, `${sp}×`),
+    const speedBtns = this.speeds().map((sp) =>
+      h('button', { class: 'hud-btn speed' + (sp === this.speed ? ' on' : ''), 'data-speed': sp, 'aria-label': `${sp}배속`, onclick: () => this.setSpeed(sp) }, `${sp}×`),
     );
     E.top = h(
       'div',
@@ -138,7 +204,7 @@ export class BattleView {
       E.sup,
       h('div', { class: 'speeds' }, E.pause, ...speedBtns),
     );
-    // ---- banners (pause / targeting / intermission / deploy)
+    // ---- banners (pause / targeting / approach / deploy)
     E.banner = h('div', { class: 'hud-banner hidden' });
     // ---- left: presets
     const preset = (kind: 'allAuto' | 'manWalls' | 'fallback' | 'holdAll', icon: string, label: string) =>
@@ -148,9 +214,11 @@ export class BattleView {
           class: 'side-btn',
           onclick: () => {
             this.world.preset(kind);
+            if (kind !== 'holdAll') this.charges.clear();
             audio.play('order');
             haptic(s.settings.haptics);
             toast(label, 'info', undefined, 1400);
+            this.renderStrip();
             this.updateHud(true);
           },
         },
@@ -174,26 +242,32 @@ export class BattleView {
       abil.append(b);
     }
     E.right = abil;
-    // ---- selection strip
+    // ---- selection strip: docked in the bottom bar next to the cards, so it never covers the map
     E.strip = h('div', { class: 'sel-strip hidden' });
     // ---- bottom squad cards
     E.cards = h('div', { class: 'cards' });
     E.start = h('button', { class: 'btn primary start-btn', onclick: () => this.startBattle() }, '전투 시작');
-    // ---- intermission (lives in the bottom bar so it never collides with alerts)
+    // ---- intermission panel (countdown, next approach, war council) floats just above the bottom bar
     E.inter = h('div', { class: 'inter hidden' });
-    E.bottom = h('div', { class: 'hud-bottom' }, E.cards, E.inter, E.start);
-    this.root.append(E.top, E.banner, E.left, E.right, E.strip, E.bottom, h('div', { class: 'rotate-hint' }, '📱↻ 가로로 돌리면 더 넓게 보입니다'));
+    E.bottom = h('div', { class: 'hud-bottom' }, E.cards, E.strip, E.start);
+    this.root.append(E.top, E.banner, E.left, E.right, E.inter, E.bottom, h('div', { class: 'rotate-hint' }, '📱↻ 가로로 돌리면 더 넓게 보입니다'));
     this.rebuildCards();
   }
 
   private rebuildCards() {
     const E = this.els;
     clear(E.cards);
+    const nums = squadNumbers(this.world.squads.map((sq) => ({ sq, type: sq.type.id, name: sq.name })));
+    const label = new Map<Squad, number>();
+    for (const [k, n] of nums) label.set(k.sq, n);
+    this.renderer.labels.clear();
     this.cards = this.world.squads.map((sq) => {
+      const n = label.get(sq);
+      this.renderer.labels.set(sq.id, sq.type.short + (n ?? ''));
       const c = h(
         'button',
         { class: 'card', onclick: () => this.cardTap(sq) },
-        h('span', { class: 'glyph' }, sq.type.short),
+        h('span', { class: 'glyph' }, sq.type.short, n ? h('i', { class: 'num' }, String(n)) : null),
         h('span', { class: 'cnt' }),
         h('span', { class: 'mor' }, h('i')),
         h('span', { class: 'ammo' }, h('i')),
@@ -221,19 +295,26 @@ export class BattleView {
     this.selected = sq;
     this.renderer.selected = sq;
     if (sq) {
+      // choosing a squad always ends ability aiming, so the next tap is a move order, not a volley
+      this.targeting = null;
       audio.play('select');
       haptic(this.app.save.settings.haptics, 8);
-      this.firstHint('select', '선택됨: 땅을 탭하면 이동, 적을 탭하면 집중 공격. 깃발을 끌어서 옮길 수도 있습니다.');
+      this.firstHint('select', '땅을 탭하면 이동, 적을 탭하면 집중 공격.');
     }
     this.renderStrip();
     this.updateHud(true);
     this.layout();
+    if (sq) {
+      const i = this.world.squads.indexOf(sq);
+      this.cards[i]?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
+    }
   }
 
   private renderStrip() {
     const E = this.els;
     const sq = this.selected;
     clear(E.strip);
+    E.bottom.classList.toggle('has-sel', !!sq);
     if (!sq) {
       E.strip.classList.add('hidden');
       return;
@@ -245,8 +326,10 @@ export class BattleView {
         'button',
         {
           class: 'chip' + (sq.stance === st ? ' on' : ''),
+          'aria-pressed': sq.stance === st ? 'true' : 'false',
           onclick: () => {
             w.commandStance(sq, st);
+            this.charges.delete(sq);
             audio.play('click');
             this.renderStrip();
           },
@@ -254,18 +337,19 @@ export class BattleView {
         STANCE_NAMES[st],
       );
     E.strip.append(
-      h('span', { class: 'sel-name' }, `${sq.name} · ${RANK_NAMES[sq.rank] ?? ''}`),
+      h('span', { class: 'sel-name' }, sq.name, h('small', null, RANK_NAMES[sq.rank] ?? '')),
       h(
         'button',
         {
           class: 'chip auto' + (sq.auto ? ' on' : ''),
+          'aria-pressed': sq.auto ? 'true' : 'false',
           onclick: () => {
             w.commandAuto(sq, !sq.auto);
             audio.play('click');
             this.renderStrip();
           },
         },
-        sq.auto ? '자동 ON' : '자동 OFF',
+        sq.auto ? '자동' : '수동',
       ),
       stanceBtn('hold'),
       stanceBtn('defend'),
@@ -276,6 +360,7 @@ export class BattleView {
           class: 'chip',
           onclick: () => {
             w.commandRetreat(sq);
+            this.charges.delete(sq);
             audio.play('order');
             this.renderStrip();
           },
@@ -287,9 +372,16 @@ export class BattleView {
   }
 
   private setSpeed(sp: number) {
+    if (!this.speeds().includes(sp)) return;
     this.speed = sp;
     this.paused = false;
+    this.els.pause.textContent = '⏸';
     for (const b of this.root.querySelectorAll<HTMLElement>('.speed')) b.classList.toggle('on', Number(b.dataset.speed) === sp);
+    const st = this.app.save.settings;
+    if (st.speed !== sp) {
+      st.speed = sp;
+      this.app.persist();
+    }
     this.updateHud(true);
   }
 
@@ -298,6 +390,10 @@ export class BattleView {
     this.els.pause.textContent = this.paused ? '▶' : '⏸';
     this.els.pause.setAttribute('aria-label', this.paused ? '계속' : '일시정지');
     this.updateHud(true);
+  }
+
+  private edgeText(edges: string[]) {
+    return edges.map((e) => EDGE_NAMES[e] ?? e).join('·');
   }
 
   private updateHud(force = false) {
@@ -343,14 +439,15 @@ export class BattleView {
       if (sq.type.ranged) {
         let a = 0;
         let m = 0;
-        for (const u of sq.units) if (u.state === ST.ACTIVE) {
-          a += u.ammo;
-          m += u.maxAmmo;
-        }
+        for (const u of sq.units)
+          if (u.state === ST.ACTIVE) {
+            a += u.ammo;
+            m += u.maxAmmo;
+          }
         (ammoEl.firstChild as HTMLElement).style.width = `${m ? (a / m) * 100 : 0}%`;
         ammoEl.style.display = '';
       } else ammoEl.style.display = 'none';
-      (c.children[4] as HTMLElement).textContent = dead ? '✝' : sq.routing ? '도주' : sq.auto ? '' : '수동';
+      (c.children[4] as HTMLElement).textContent = dead ? '✝' : sq.routing ? '도주' : this.charges.has(sq) ? '돌격' : sq.auto ? '' : '수동';
       c.setAttribute('aria-label', `${sq.name} ${sq.alive}명 사기 ${Math.round(sq.morale)}`);
     });
     // abilities
@@ -370,7 +467,8 @@ export class BattleView {
     let text = '';
     let cls = '';
     if (w.state === 'deploy') {
-      text = '배치 단계 — 깃발을 끌어 분대를 옮기세요';
+      const first = this.edgeText(w.nextWaveEdges());
+      text = `배치 — 깃발을 끌어 파란 칸에 두세요${first ? ` · 첫 공세: ${first}` : ''}`;
       cls = 'deploy';
     } else if (this.targeting) {
       text = `${ABILITY_INFO[this.targeting].name}: 지도에서 지점을 탭하세요 (다시 누르면 취소)`;
@@ -378,22 +476,123 @@ export class BattleView {
     } else if (this.paused) {
       text = '일시정지 — 명령은 계속 내릴 수 있습니다';
       cls = 'paused';
+    } else if (this.approaching) {
+      text = '⏩ 적 접근 중';
+      cls = 'ff';
     }
-    E.banner.textContent = text;
-    E.banner.className = 'hud-banner ' + cls + (text && !this.selected ? '' : ' hidden');
-    // intermission
-    if (w.state === 'intermission') {
-      E.inter.classList.remove('hidden');
-      if (!E.inter.firstChild) {
-        E.inter.append(h('span', { class: 'inter-t' }), h('button', { class: 'btn small primary', onclick: () => this.world.skipIntermission() }, '바로 시작 +◉'));
-      }
-      (E.inter.firstChild as HTMLElement).textContent = `다음 물결 ${Math.ceil(w.interT)}초`;
-    } else E.inter.classList.add('hidden');
+    if (E.banner.textContent !== text) E.banner.textContent = text;
+    E.banner.className = 'hud-banner ' + cls + (text ? '' : ' hidden');
+    this.updateInter();
     E.start.style.display = w.state === 'deploy' ? '' : 'none';
     if (this.selected && this.selected.alive === 0) this.select(null);
   }
 
+  /** Intermission panel: countdown, where the next wave comes from, and the war council choice. */
+  private updateInter() {
+    const w = this.world;
+    const E = this.els;
+    if (w.state !== 'intermission') {
+      if (!E.inter.classList.contains('hidden')) {
+        E.inter.classList.add('hidden');
+        this.root.classList.remove('inter-on');
+        this.interKey = '';
+      }
+      return;
+    }
+    let opts: { id: string; name: string; desc: string }[] = [];
+    try {
+      opts = w.councilOptions() ?? [];
+    } catch (err) {
+      this.app.logError('council', err);
+    }
+    for (const o of opts) this.councilNames.set(o.id, o.name);
+    const pick = w.councilPick;
+    const showOpts = !pick && opts.length > 0;
+    const key = `${w.waveIdx}|${pick ?? ''}|${showOpts ? opts.map((o) => o.id).join(',') : ''}`;
+    if (key !== this.interKey) {
+      this.interKey = key;
+      clear(E.inter);
+      const head = h(
+        'div',
+        { class: 'inter-head' },
+        showOpts ? h('span', { class: 'council-title' }, '작전 회의') : null,
+        h('span', { class: 'inter-t' }),
+        h('span', { class: 'inter-dir' }),
+        pick ? h('span', { class: 'inter-pick' }, `✔ ${this.councilNames.get(pick) ?? pick}`) : null,
+        h('button', { class: 'btn small primary inter-go', onclick: () => this.world.skipIntermission() }, '바로 시작 +◉'),
+      );
+      E.inter.append(head);
+      if (showOpts) {
+        E.inter.append(
+          h(
+            'div',
+            { class: 'council' },
+            ...opts.slice(0, 3).map((o) =>
+              h(
+                'button',
+                { class: 'council-opt', 'data-id': o.id, onclick: () => this.pickCouncil(o.id, o.name) },
+                h('b', null, o.name),
+                h('small', null, o.desc),
+              ),
+            ),
+          ),
+        );
+      }
+      E.inter.classList.toggle('with-council', showOpts);
+      E.inter.classList.remove('hidden');
+      this.root.classList.add('inter-on');
+      this.root.style.setProperty('--inter-h', `${E.inter.offsetHeight}px`);
+    }
+    (E.inter.querySelector('.inter-t') as HTMLElement).textContent = `다음 물결 ${Math.max(0, Math.ceil(w.interT))}초`;
+    const dir = this.edgeText(w.nextWaveEdges());
+    (E.inter.querySelector('.inter-dir') as HTMLElement).textContent = dir ? `다음 공세: ${dir}` : '';
+  }
+
+  private pickCouncil(id: string, name: string) {
+    let ok = false;
+    try {
+      ok = this.world.chooseCouncil(id);
+    } catch (err) {
+      this.app.logError('council', err);
+    }
+    if (ok) {
+      audio.play('order');
+      haptic(this.app.save.settings.haptics, 15);
+      toast(`작전 회의: ${name}`, 'good', undefined, 1800);
+    } else {
+      audio.play('deny');
+      toast('지금은 고를 수 없습니다.', 'warn', undefined, 1500);
+    }
+    this.interKey = '';
+    this.updateHud(true);
+  }
+
   // ================================================================== loop
+
+  /**
+   * True while a wave is under way but nobody has met the enemy yet: no missiles in the air, no ladders,
+   * no attacker inside the walls or within a few tiles of a defender. Reads the world only.
+   */
+  private noContact(): boolean {
+    const w = this.world;
+    if (w.state !== 'battle') return false;
+    if (w.projectiles.length || w.ladders.length) return false;
+    const g = w.grid;
+    const near = 5 * TILE;
+    let hit = false;
+    for (const e of w.activeEnemies) {
+      if (e.fleeing) continue;
+      const t = tileAt(e.x, e.y);
+      if (t >= 0 && t < g.n && g.inside[t]) return false;
+      w.dHash.each(e.x, e.y, near, () => {
+        hit = true;
+        return true;
+      });
+      if (hit) return false;
+    }
+    for (const sq of w.squads) if (sq.engaged > 0) return false;
+    return true;
+  }
 
   private loop = (ts: number) => {
     if (this.destroyed) return;
@@ -403,19 +602,36 @@ export class BattleView {
     // any open dialog (menu, tips, purchase confirm) freezes the battle
     const blocked = !!document.querySelector('.modal-back');
     if (!this.crashed && !this.paused && !blocked && (w.state === 'battle' || w.state === 'intermission')) {
-      this.acc += dt * this.speed;
+      // fast-forward the walk-in: only how many fixed steps run per frame changes, never the steps themselves
+      if (!this.noContact()) this.contactT = w.t;
+      const ff = w.state === 'battle' && w.t - this.contactT >= CONTACT_HOLD && this.speed < APPROACH_SPEED;
+      if (ff !== this.approaching) {
+        this.approaching = ff;
+        this.updateHud(true);
+      }
+      this.acc += dt * (ff ? APPROACH_SPEED : this.speed);
       let n = 0;
       try {
         while (this.acc >= DT && n < 14) {
           w.step();
           this.acc -= DT;
           n++;
+          if (ff && !this.noContact()) {
+            // contact: drop back to the chosen speed right away
+            this.contactT = w.t;
+            this.acc = Math.min(this.acc, DT);
+            break;
+          }
         }
       } catch (err) {
         this.onCrash(err);
       }
       if (n >= 14) this.acc = 0; // device too slow for this speed: slow down instead of spiralling
+    } else if (this.approaching) {
+      this.approaching = false;
+      this.updateHud(true);
     }
+    this.checkCharges();
     const alpha = Math.max(0, Math.min(1, this.acc / DT));
     try {
       this.renderer.render(this.paused ? 1 : alpha, dt);
@@ -437,6 +653,19 @@ export class BattleView {
     }
     this.raf = requestAnimationFrame(this.loop);
   };
+
+  /** A charge (melee squad sent at a tapped enemy) ends when the target falls, flees or is no longer the focus. */
+  private checkCharges() {
+    if (!this.charges.size) return;
+    for (const [sq, c] of this.charges) {
+      const t = c.target;
+      const gone = sq.alive === 0 || sq.focus !== t || (t.state !== ST.ACTIVE && t.state !== ST.CLIMB) || t.fleeing || !!t.band?.broken;
+      if (!gone) continue;
+      this.charges.delete(sq);
+      if (sq.stance === 'aggressive' && c.prev !== 'aggressive') sq.stance = c.prev;
+      if (sq === this.selected) this.renderStrip();
+    }
+  }
 
   private onCrash(err: unknown) {
     this.crashed = true;
@@ -477,9 +706,10 @@ export class BattleView {
       haptic(s.haptics, 30);
     }
     if (e.type === 'cleared') audio.play('coin');
-    toast(e.text, e.level === 'good' ? 'good' : e.level, jump, e.level === 'danger' ? 3600 : 2600);
-    if (e.type === 'breach') this.firstHint('breach', '돌파구가 생겼습니다! 근접 분대를 선택해 돌파 지점에 배치하거나 "본성 후퇴"로 전열을 좁히세요.');
-    if (e.type === 'rout') this.firstHint('rout', '사기가 무너진 분대는 도주합니다. "함성"으로 붙잡거나 본성 근처에서 회복시키세요.');
+    // short-lived: the map matters more than the log
+    toast(e.text, e.level === 'good' ? 'good' : e.level, jump, e.level === 'danger' ? 3000 : 2000);
+    if (e.type === 'breach') this.firstHint('breach', '돌파구! 근접 분대를 보내거나 "본성 후퇴"를 누르세요.');
+    if (e.type === 'rout') this.firstHint('rout', '사기가 무너진 분대는 도주합니다. "함성"으로 붙잡으세요.');
   }
 
   private firstHint(key: string, text: string) {
@@ -487,7 +717,7 @@ export class BattleView {
     if (!s.settings.showTips || this.hintShown.has(key) || s.seenTips.includes('hint_' + key)) return;
     this.hintShown.add(key);
     s.seenTips.push('hint_' + key);
-    toast('💡 ' + text, 'info', undefined, 6000);
+    toast('💡 ' + text, 'info', undefined, 4500, 'hint');
   }
 
   // ================================================================== actions
@@ -524,8 +754,8 @@ export class BattleView {
       this.updateHud(true);
       return;
     }
-    this.targeting = id;
     this.select(null);
+    this.targeting = id;
     this.updateHud(true);
   }
 
@@ -551,7 +781,7 @@ export class BattleView {
     if (w.state === 'deploy') {
       const t = tileAt(wx, wy);
       if (!w.grid.deployable(t)) {
-        toast('성 안쪽(파란 칸)에만 배치할 수 있습니다.', 'warn', undefined, 1600);
+        toast('성 안쪽 파란 칸에만 배치할 수 있습니다.', 'warn', undefined, 1600);
         audio.play('deny');
         return;
       }
@@ -562,19 +792,25 @@ export class BattleView {
     const e = this.renderer.enemyAt(sx, sy);
     if (e && sq.type.ranged) {
       w.commandFocus(sq, e);
-      toast(`${sq.name}: 집중 공격`, 'info', undefined, 1200);
+      this.renderer.ping(e.x, e.y, '#ff7060');
+      toast(`${sq.name}: 집중 사격`, 'info', undefined, 1200);
     } else if (e) {
-      w.commandFocus(sq, e);
+      // charge: pursue this target, then fall back to the stance the squad had before
+      const prev = this.charges.get(sq)?.prev ?? sq.stance;
       w.commandMove(sq, e.x, e.y);
+      w.commandFocus(sq, e);
       sq.stance = 'aggressive';
-      toast(`${sq.name}: 돌격`, 'info', undefined, 1200);
+      this.charges.set(sq, { target: e, prev });
+      this.renderer.ping(e.x, e.y, '#ff7060');
+      toast(`${nameJosa(sq.name, '이/가')} 돌격합니다`, 'info', undefined, 1200);
     } else {
       w.commandMove(sq, wx, wy);
-      this.firstHint('manual', '직접 명령을 받은 분대는 "수동"이 됩니다. 자동으로 돌려놓으려면 "자동 ON"을 누르세요.');
+      this.renderer.ping(wx, wy, '#ffe08a');
+      this.firstHint('manual', '명령한 분대는 "수동"이 됩니다. 다시 누르면 자동.');
     }
-    this.renderer.ping(wx, wy, '#ffe08a');
     audio.play('order');
     haptic(this.app.save.settings.haptics, 10);
+    this.checkCharges();
     this.renderStrip();
     this.updateHud(true);
   }
@@ -591,11 +827,15 @@ export class BattleView {
     c.addEventListener('pointerleave', (e) => {
       if (e.pointerType === 'mouse') this.onCancel(e);
     });
-    c.addEventListener('wheel', (e) => {
-      e.preventDefault();
-      const r = c.getBoundingClientRect();
-      this.renderer.cam.zoomAt(e.clientX - r.left, e.clientY - r.top, Math.exp(-e.deltaY * 0.0015));
-    }, { passive: false });
+    c.addEventListener(
+      'wheel',
+      (e) => {
+        e.preventDefault();
+        const r = c.getBoundingClientRect();
+        this.renderer.cam.zoomAt(e.clientX - r.left, e.clientY - r.top, Math.exp(-e.deltaY * 0.0015));
+      },
+      { passive: false },
+    );
     c.addEventListener('contextmenu', (e) => e.preventDefault());
     this.root.addEventListener('keydown', this.onKey);
     this.root.tabIndex = -1;
@@ -608,14 +848,29 @@ export class BattleView {
       this.togglePause();
     } else if (e.key >= '1' && e.key <= '4') this.setSpeed(Number(e.key));
     else if (e.key === 'Escape') {
-      if (this.targeting) this.targeting = null;
-      else this.select(null);
+      if (this.targeting) {
+        this.targeting = null;
+        this.updateHud(true);
+      } else this.select(null);
     }
   };
 
   private local(e: PointerEvent) {
     const r = this.canvas.getBoundingClientRect();
     return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+
+  /**
+   * Squad a touch starts on. Nothing selected: generous (banner within 30 px or one of its soldiers).
+   * A squad selected: only a direct hit on a banner (14 px; 20 px for the selected one so it can be dragged),
+   * so taps next to a banner stay move or focus orders.
+   */
+  private pickSquad(x: number, y: number): Squad | null {
+    if (this.targeting) return null;
+    const r = this.renderer;
+    const sel = this.selected;
+    if (!sel) return r.squadAt(x, y, 30, true);
+    return r.squadAt(x, y, 14, false, (sq) => (sq === sel ? 20 : 14));
   }
 
   private onDown = (e: PointerEvent) => {
@@ -634,7 +889,7 @@ export class BattleView {
       return;
     }
     if (this.pointers.size > 2) return;
-    const sq = this.targeting ? null : this.renderer.squadAt(p.x, p.y, 30);
+    const sq = this.pickSquad(p.x, p.y);
     this.gesture = sq ? { kind: 'squad', squad: sq, moved: false } : { kind: 'pan', moved: false };
   };
 
@@ -680,10 +935,14 @@ export class BattleView {
     this.renderer.dragLine = null;
     const p = { x: pt.x, y: pt.y };
     if (g.kind === 'squad' && g.squad && g.moved) {
-      this.selected = g.squad;
-      this.renderer.selected = g.squad;
+      if (this.selected !== g.squad) {
+        this.selected = g.squad;
+        this.renderer.selected = g.squad;
+        this.targeting = null;
+      }
       this.orderTo(g.squad, p.x, p.y);
       this.renderStrip();
+      this.updateHud(true);
       this.gesture = { kind: 'none', moved: false };
       return;
     }
@@ -729,31 +988,23 @@ export class BattleView {
   private async introTips() {
     const s = this.app.save;
     const st = this.setup.stage;
+    // the scouting report (story + tips) is on the pre-battle screen, so no second copy here
+    if (st.tips?.length && !s.seenTips.includes('stage_' + st.id)) s.seenTips.push('stage_' + st.id);
     if (!s.tutorialDone && this.setup.mode === 'campaign' && st.index === 1) {
       const pages = [
-        ['분대는 스스로 싸웁니다', '모든 분대는 기본적으로 "자동"입니다. 성벽을 지키고, 돌파구로 달려가고, 화살을 보급받습니다. 당신은 큰 그림만 지휘하면 됩니다.'],
-        ['한 손가락 지휘', '깃발이나 아래 분대 카드를 탭해 선택 → 땅을 탭하면 이동, 적을 탭하면 집중 공격. 깃발을 끌어서 옮길 수도 있습니다. 빈 곳을 끌면 화면 이동, 두 손가락으로 확대·축소.'],
-        ['사기·부상·보급', '분대 카드의 색 막대는 사기입니다. 사기가 무너지면 도주합니다. 쓰러진 병사는 군의대가 살릴 수 있고, 화살과 식량은 한정되어 있습니다.'],
-        ['일시정지는 작전 시간', '⏸ 를 누르면 시간이 멈추지만 명령은 계속 내릴 수 있습니다. 준비되면 "전투 시작"!'],
+        ['분대는 스스로 싸웁니다', '분대는 알아서 성벽을 지킵니다. 당신은 큰 그림만 지휘하세요. ⏸ 일시정지 중에도 명령할 수 있습니다.'],
+        ['한 손가락 지휘', '깃발이나 아래 카드를 탭해 선택 → 땅을 탭하면 이동, 적을 탭하면 집중 공격. 빈 곳을 끌면 화면 이동, 두 손가락으로 확대.'],
       ];
       for (let i = 0; i < pages.length; i++) {
         const v = await modal(pages[i][0], h('p', null, pages[i][1]), [
           ...(i === 0 ? [{ label: '건너뛰기', value: 'skip', kind: 'ghost' as const }] : []),
-          { label: i === pages.length - 1 ? '시작하기' : '다음', value: 'next', kind: 'primary' },
+          { label: i === pages.length - 1 ? '배치하기' : '다음', value: 'next', kind: 'primary' },
         ]);
         if (v === 'skip' || this.destroyed) break;
       }
       s.tutorialDone = true;
-      this.app.persist();
-      return;
     }
-    if (this.world.state !== 'deploy' || this.destroyed) return;
-    const key = 'stage_' + st.id;
-    if (s.settings.showTips && (st.tips ?? []).length && !s.seenTips.includes(key) && this.setup.mode === 'campaign') {
-      s.seenTips.push(key);
-      this.app.persist();
-      await modal(`${st.name} — 정찰 보고`, [h('p', { class: 'story' }, st.story), h('ul', { class: 'tips' }, ...(st.tips ?? []).map((t) => h('li', null, t)))], [{ label: '배치하러 가기', value: 'ok', kind: 'primary' }]);
-    }
+    this.app.persist();
   }
 
   async openMenu() {
@@ -769,7 +1020,7 @@ export class BattleView {
       ],
     );
     if (v === 'restart') {
-      if (await confirmBox('다시 시작', '이번 전투를 기록 없이 처음부터 다시 시작합니다.', '다시 시작')) {
+      if (await confirmBox('다시 시작', '이번 전투를 기록 없이 처음부터 다시 시작합니다. 보급 비용도 나가지 않습니다.', '다시 시작')) {
         this.app.exitBattle(this, null, true);
         return;
       }
@@ -778,7 +1029,7 @@ export class BattleView {
         this.app.exitBattle(this, null, false);
         return;
       }
-      if (await confirmBox('후퇴', '지금까지 막아낸 물결만큼 위로금을 받고, 이번 전투의 사상자는 그대로 반영됩니다.', '후퇴', true)) {
+      if (await confirmBox('후퇴', '지금까지 막아낸 물결만큼 위로금을 받고, 이번 전투의 사상자와 보급 비용은 그대로 반영됩니다.', '후퇴', true)) {
         this.world.surrender();
         return;
       }
@@ -797,11 +1048,14 @@ export class BattleView {
       const sq = this.world.squads.find((x) => x.rosterId === q.rosterId);
       return h('tr', null, h('td', null, sq?.name ?? ''), h('td', null, String(q.kills)), h('td', null, String(q.dead.length)), h('td', null, String(q.wounded.length)));
     });
+    // on a defeat the advice comes first, so it is never hidden behind the buttons
+    const advice = !won && this.setup.mode === 'campaign' ? h('p', { class: 'hint' }, this.defeatAdvice(res)) : null;
     const panel = h(
       'div',
       { class: 'result ' + (won ? 'won' : 'lost') },
       h('h1', null, won ? '성을 지켜냈습니다' : this.setup.mode === 'endless' ? '마지막 물결' : '성이 함락되었습니다'),
       won && this.setup.mode === 'campaign' ? stars(res.stars) : null,
+      advice,
       h(
         'div',
         { class: 'stats' },
@@ -814,9 +1068,20 @@ export class BattleView {
         statRow('본성 내구', `${Math.round(res.keepPct * 100)}%`),
         statRow('시간', `${mins}:${String(secs).padStart(2, '0')}`),
       ),
-      h('div', { class: 'rewards' }, h('h3', null, `보상: 금화 ${fmt(rw.gold)}${rw.medals ? ` · 훈장 ${rw.medals}` : ''} · 연대기 ${rw.passXp}xp`), h('ul', null, ...rw.lines.map((l) => h('li', null, l)), ...rw.unlocked.map((l) => h('li', { class: 'good' }, '🔓 ' + l)), ...rw.promoted.map((l) => h('li', { class: 'good' }, '⬆ 진급 ' + l)), ...rw.achievements.map((l) => h('li', { class: 'good' }, '🏅 업적: ' + l)))),
+      h(
+        'div',
+        { class: 'rewards' },
+        h('h3', null, `보상: 금화 ${fmt(rw.gold)}${rw.medals ? ` · 훈장 ${rw.medals}` : ''} · 연대기 ${rw.passXp}xp`),
+        h(
+          'ul',
+          null,
+          ...rw.lines.map((l) => h('li', null, l)),
+          ...rw.unlocked.map((l) => h('li', { class: 'good' }, '🔓 ' + l)),
+          ...rw.promoted.map((l) => h('li', { class: 'good' }, '⬆ 진급 ' + l)),
+          ...rw.achievements.map((l) => h('li', { class: 'good' }, '🏅 업적: ' + l)),
+        ),
+      ),
       h('details', { class: 'squad-stats' }, h('summary', null, '분대별 전과'), h('table', null, h('tr', null, h('th', null, '분대'), h('th', null, '처치'), h('th', null, '전사'), h('th', null, '부상')), ...squadRows)),
-      !won && this.setup.mode === 'campaign' ? h('p', { class: 'hint' }, this.defeatAdvice(res)) : null,
       h(
         'div',
         { class: 'result-buttons' },
@@ -834,9 +1099,10 @@ export class BattleView {
     const w = this.world;
     const s = this.app.save;
     const wounded = s.roster.reduce((a, r) => a + r.soldiers.filter((x) => x.wounded > 0).length, 0);
-    if (w.supplies.arrows < 5 && w.squads.some((q) => q.type.ranged)) return '💡 화살이 바닥났습니다. 출정 전 보급에서 화살을 더 사거나 "병참" 연구를 올려 보세요.';
+    if (w.supplies.arrows < 5 && w.squads.some((q) => q.type.ranged)) return '💡 화살이 바닥났습니다. 출정 전 보급에서 화살을 더 챙기거나 "병참" 연구를 올려 보세요.';
+    if (w.starving) return '💡 식량이 떨어졌습니다. 출정 화면의 "식량 필요 / 보유"를 보고 식량을 더 챙기세요.';
     if (res.wavesCleared === 0) return '💡 첫 물결도 막기 어려웠다면 설정에서 난이도를 "쉬움"으로 바꿀 수 있습니다 (보상 85%).';
-    if (wounded > 6) return '💡 부상병이 많습니다. 병영에서 치료하거나 다음 전투 한 번을 쉬게 하면 회복됩니다.';
+    if (wounded > 6) return '💡 부상병이 많습니다. 출정 화면의 "모두 치료"를 누르거나 한 전투를 쉬게 하면 회복됩니다.';
     if (Object.values(s.upgrades).reduce((a, b) => a + b, 0) < 4) return '💡 연구소에서 "석공술"·"대장간"을 올리면 성벽과 병사가 훨씬 단단해집니다.';
     return '💡 이전 성을 다시 지켜 금화를 모으고, 석궁대·공병대로 편성을 보강해 보세요. 돌파구가 생기면 "본성 후퇴"로 전열을 좁히는 것도 방법입니다.';
   }
