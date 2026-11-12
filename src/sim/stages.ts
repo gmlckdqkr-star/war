@@ -62,7 +62,7 @@ export interface StageDef {
    */
   lanes?: Lane[];
   flank?: number;
-  /** stores a supply train brings after every cleared wave (endless: the siege has no fixed length) */
+  /** stores a supply train brings before every later wave, up to the starting stores (endless: no fixed length) */
   resupply?: Partial<Supplies>;
   tips?: string[];
   unlockSquad?: string; // squad type granted on first clear of the previous stage
@@ -186,14 +186,14 @@ export const STAGES: StageDef[] = [
     story: '용에게 쫓겨 남하한 오크 군단과 고블린 수행족. 수가 많다. 화살이 떨어지지 않도록 보급고를 지켜라.',
     factions: ['orc'],
     squadCap: 5,
-    level: 0.85,
+    level: 0.8,
     supplies: supplies(3),
     reward: 240,
     keepHp: 3600,
     abilities: ['rally', 'volley'],
     unlockSquad: 'engineer',
     tips: ['궁수는 보급고 근처에서 빨리 화살을 채웁니다. 화살 재고를 확인하세요.', '공병대는 자재를 써서 성벽과 성문을 수리합니다.', '"일제사격": 적이 몰린 곳을 눌러 모든 궁수가 집중 사격합니다.'],
-    lanes: [L('W', MIDW, 3), L('N', [32, 54]), L('S', [32, 54]), L('E', [8, 26], 1)],
+    lanes: [L('W', MIDW, 3), L('N', [32, 54]), L('S', [32, 54])],
     flank: 0.35,
     build(g, rng) {
       g.fill(Tile.GRASS);
@@ -223,7 +223,7 @@ export const STAGES: StageDef[] = [
     story: '산을 되찾겠다는 딥홀드 씨족. 그들의 방패벽은 화살을 튕겨내고, 갱도병은 성벽 밑을 판다. 외성이 무너지면 내성으로 물러나라.',
     factions: ['dwarf'],
     squadCap: 6,
-    level: 0.88,
+    level: 0.84,
     supplies: supplies(4),
     reward: 280,
     keepHp: 3800,
@@ -279,7 +279,7 @@ export const STAGES: StageDef[] = [
     abilities: ['rally', 'volley', 'oil'],
     unlockSquad: 'ballista',
     tips: ['노포대를 탑 위에 두면 거수와 공성 병기를 멀리서 잡습니다.', '엘프 척후궁수는 근접병이 다가오면 물러납니다. 기사나 일제사격으로 대응하세요.'],
-    lanes: [L('W', MIDW, 3), L('N', [20, 40]), L('S', [20, 40]), L('E', [9, 25], 1)],
+    lanes: [L('W', MIDW, 3), L('N', [20, 40]), L('S', [20, 40])],
     flank: 0.4,
     build(g, rng) {
       g.fill(Tile.GRASS);
@@ -310,7 +310,7 @@ export const STAGES: StageDef[] = [
     story: '협약군과 오크 군단이 손을 잡았다. 서쪽, 북쪽, 남쪽 성문이 동시에 공격받는다. 예비대를 남겨두어라.',
     factions: ['human', 'orc'],
     squadCap: 7,
-    level: 1.12,
+    level: 1.06,
     supplies: supplies(6),
     reward: 360,
     keepHp: 4200,
@@ -349,12 +349,12 @@ export const STAGES: StageDef[] = [
     story: '늪지에 세운 옛 수도원. 해자가 적의 발을 묶지만, 바위 트롤은 아랑곳하지 않는다. 군단장을 쓰러뜨리면 군단이 흔들린다.',
     factions: ['orc'],
     squadCap: 7,
-    level: 1.1,
+    level: 1.17,
     supplies: supplies(7),
     reward: 400,
     keepHp: 4400,
     abilities: ['rally', 'volley', 'oil', 'reserve'],
-    lanes: [L('W', MIDW, 3), L('N', [32, 58]), L('S', [32, 58]), L('E', [7, 26], 1)],
+    lanes: [L('W', MIDW, 3), L('N', [32, 58]), L('S', [32, 58])],
     flank: 0.4,
     build(g, rng) {
       g.fill(Tile.GRASS);
@@ -389,12 +389,12 @@ export const STAGES: StageDef[] = [
     story: '협약군과 딥홀드가 공성 병기를 끌고 왔다. 투석기가 성벽을 무너뜨리기 전에 출격하거나, 공병으로 버텨라.',
     factions: ['human', 'dwarf'],
     squadCap: 8,
-    level: 1.18,
+    level: 1.22,
     supplies: supplies(8),
     reward: 460,
     keepHp: 4600,
     abilities: ['rally', 'volley', 'oil', 'reserve'],
-    lanes: [L('W', MIDW, 3), L('N', [20, 40]), L('S', [20, 40]), L('E', [7, 27], 1)],
+    lanes: [L('W', MIDW, 3), L('N', [20, 40]), L('S', [20, 40])],
     flank: 0.4,
     build(g, rng) {
       g.fill(Tile.GRASS);
@@ -430,13 +430,13 @@ export const STAGES: StageDef[] = [
     story: '잿불 고룡이 깨어났다. 용의 포효는 병사의 심장을 얼리고, 숨결은 성벽 위를 태운다. 노포를 아끼지 마라.',
     factions: ['wyrm'],
     squadCap: 8,
-    level: 1.34,
+    level: 1.5,
     supplies: supplies(9),
     reward: 540,
     keepHp: 4800,
     abilities: ['rally', 'volley', 'oil', 'reserve'],
     tips: ['용은 공중에 있어 근접 공격이 닿지 않습니다. 노포·석궁·궁수로 쏘세요.', '용의 숨결이 닿기 전 분대를 흩어 피해를 줄이세요. 용이 물러나면 코볼트도 흩어집니다.'],
-    lanes: [L('W', MIDW, 3), L('N', [30, 50]), L('S', [30, 50]), L('E', [8, 26], 1)],
+    lanes: [L('W', MIDW, 3), L('N', [30, 50]), L('S', [30, 50])],
     flank: 0.4,
     build(g, rng) {
       g.fill(Tile.GRASS);
@@ -470,12 +470,12 @@ export const STAGES: StageDef[] = [
     story: '할드미어의 마지막 성. 다섯 세력이 한꺼번에 몰려온다. 외성이 무너져도 내성이 남아 있다. 깃발이 서 있는 한 끝나지 않았다.',
     factions: ['human', 'dwarf', 'elf', 'orc', 'wyrm'],
     squadCap: 9,
-    level: 1.24,
+    level: 1.3,
     supplies: supplies(10),
     reward: 700,
     keepHp: 5200,
     abilities: ['rally', 'volley', 'oil', 'reserve'],
-    lanes: [L('W', MIDW, 3), L('N', [26, 50]), L('S', [26, 50]), L('E', [6, 28], 1)],
+    lanes: [L('W', MIDW, 3), L('N', [26, 50]), L('S', [26, 50])],
     flank: 0.45,
     build(g, rng) {
       g.fill(Tile.GRASS);
@@ -625,7 +625,13 @@ export function endlessWave(w: number, seed: number, lanes: Lane[] = [L('W', MID
   return { groups, maxTime: 110, intermission: 12, mul: 1 + ENDLESS_MUL_GROWTH * w };
 }
 
-export const ENDLESS_RESUPPLY: Partial<Supplies> = { food: 45, arrows: 250, mats: 50, meds: 3 };
+/**
+ * What a supply train can carry to the endless castle before each later wave. It refills the stores
+ * at most to what they held when the siege began (World.startWave), and it carries less than a full
+ * army eats and shoots in a hard wave: the stores run down as the waves grow (the war council's
+ * forage / resupply picks, or fewer mouths, make up the rest).
+ */
+export const ENDLESS_RESUPPLY: Partial<Supplies> = { food: 25, arrows: 200, mats: 40, meds: 2 };
 
 export function endlessStage(seed: number): StageDef {
   const base = stageById(ENDLESS_CASTLES[(seed >>> 0) % ENDLESS_CASTLES.length]) ?? STAGES[5];
@@ -643,7 +649,7 @@ export function endlessStage(seed: number): StageDef {
     reward: 0,
     // the generator already spreads the bands over the castle's approaches
     flank: 0,
-    // a wave's rations for a full army and some arrows, timber and medicine reach the castle between waves
+    // some rations, arrows, timber and medicine reach the castle between waves (never above the starting stores)
     resupply: ENDLESS_RESUPPLY,
     abilities: ['rally', 'volley', 'oil', 'reserve'],
     waves: Array.from({ length: 60 }, (_, w) => endlessWave(w, seed, lanes)),

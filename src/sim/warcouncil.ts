@@ -87,7 +87,7 @@ export function councilDesc(w: World, id: string): string {
     case 'resupply':
       return `화살 +${a.resupply}`;
     case 'rest':
-      return `전 분대 사기 +${REST_MORALE}, 부상병 체력 회복`;
+      return `전 분대 사기 +${REST_MORALE}, 잃은 체력 ${Math.round(REST_HEAL * 100)}% 회복`;
     case 'scout':
       return `다음 물결 구성·방향 보고, 사기 +${SCOUT_MORALE}`;
     case 'relief':

@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { GH, GW, Tile } from '../src/sim/defs';
-import { Grid, idx } from '../src/sim/grid';
+import { Grid, SPAWN_GAP, idx } from '../src/sim/grid';
 import { RNG } from '../src/sim/rng';
 import { ENDLESS_CASTLES, ENDLESS_RESUPPLY, STAGES, dailyChallenge, endlessStage, planWaves, swarmWave, type Edge, type StageDef } from '../src/sim/stages';
 import { COUNCIL_IDS, COUNCIL_NAMES, GATE_BOOST, REPAIR_FRAC, councilDesc } from '../src/sim/warcouncil';
 import { josa } from '../src/sim/josa';
-import { ACT, BAND_STALL_T, BATTLE_HARD_CAP, DRAGON_MAX_STAY, DRAGON_PAIN_MAX, DRAGON_STAY_ALONE, GATE_SAFE_R, ST, TREB_SPLASH_DMG, World, isEngine, type Unit } from '../src/sim/world';
+import { ACT, BAND_STALL_T, BATTLE_HARD_CAP, CAP_HOLD_N, KEEP_PRESS_MAX, KEEP_PRESS_T, SAPPER_COVER, SAPPER_DIG_T, DRAGON_FLEE_HP, DRAGON_MAX_STAY, DRAGON_PAIN_DMG, DRAGON_PAIN_MAX, GATE_SAFE_R, ST, TOWER_EMPTY_T, TREB_SPLASH_DMG, World, isEngine, type Unit } from '../src/sim/world';
 import { newSave, newSquad } from '../src/meta/save';
 import { LEVY_BELOW, LEVY_MAX_SQUADS, UPGRADES, applyBattle, baseSupplies, battleConfig, defaultLineup, foodNeeded, lineupSoldiers, upgradeCost } from '../src/meta/progression';
 
@@ -182,6 +182,77 @@ describe('siege engines', () => {
     expect(w.ladders.some((l) => l.tower === tower)).toBe(true);
   });
 
+  it('a digging sapper works under a mantlet: missiles do less damage, a blow from the wall walk full', () => {
+    const { w, core } = lone('s4', 'w_sappers', 3);
+    const sap = core[0];
+    const bow = w.defs.find((u) => u.def.id === 'd_xbow')!;
+    w.step();
+    sap.act = ACT.DIG;
+    sap.screened = false;
+    let h = sap.hp;
+    w.damage(sap, 20, 0, bow, true);
+    const shot = h - sap.hp;
+    h = sap.hp;
+    w.damage(sap, 20, 0, bow, false);
+    const blow = h - sap.hp;
+    expect(shot).toBeCloseTo(blow * SAPPER_COVER, 5);
+    expect(SAPPER_COVER).toBeLessThan(1);
+    expect(SAPPER_DIG_T).toBeGreaterThanOrEqual(8);
+  });
+
+  it('a docked tower nobody climbs any more stops holding its band in the fight', () => {
+    const { w, b, core } = lone('s6', 'h_tower');
+    const tower = core[0];
+    for (let i = 0; i < 30 * 150 && tower.act !== ACT.DOCKED && tower.state === ST.ACTIVE; i++) w.step();
+    expect(tower.act).toBe(ACT.DOCKED);
+    w.waveIdx = w.totalWaves() - 1; // the last wave: only this tower is left
+    for (const u of b.units) if (u !== tower && u.state !== ST.DEAD) w.killEnemy(u, null);
+    // only archers are left on the walls: they find the tower too stout to shoot at
+    for (const u of w.defs) if (u.def.id !== 'd_archer' && u.state !== ST.DEAD) w.killDef(u);
+    tower.hp = tower.maxHp * 0.9;
+    b.contactT = w.t; // the last of its men went up the tower just now
+    const t0 = w.t;
+    let leftAfter = -1;
+    for (let i = 0; i < 30 * (BAND_STALL_T + 20) && w.state === 'battle'; i++) {
+      // nobody hurts it (a stray arrow at most)
+      tower.hp = Math.max(tower.hp, tower.maxHp * 0.9);
+      tower.crew = 100;
+      w.step();
+      if (leftAfter < 0 && tower.fleeing) leftAfter = w.t - t0;
+    }
+    expect(tower.fleeing || tower.state !== ST.ACTIVE).toBe(true);
+    // an empty tower is pulled back soon, not after a full stall
+    expect(leftAfter).toBeGreaterThan(0);
+    expect(leftAfter).toBeLessThan(TOWER_EMPTY_T + 5);
+    expect(w.state).toBe('won');
+    expect(w.t - t0).toBeLessThan(BAND_STALL_T + 20);
+  });
+
+  it('a fleeing ram inside the courtyard leaves the way it came in instead of pressing on the far wall', () => {
+    const { w, core } = lone('s4', 'w_ram');
+    const ram = core[0];
+    const g = w.grid;
+    // put it in the inner courtyard of the pass fort, behind the broken inner gate
+    const gate = idx(42, 17);
+    w.destroyStruct(gate, 'broken');
+    w.destroyStruct(idx(30, 17), 'broken');
+    w.step();
+    ram.x = 46.5 * 16;
+    ram.y = 17.5 * 16;
+    w.engineRetreat(ram);
+    let maxX = ram.x;
+    for (let i = 0; i < 30 * 150 && ram.state === ST.ACTIVE; i++) {
+      ram.hp = ram.maxHp; // let it go: we only follow its way out
+      w.step();
+      maxX = Math.max(maxX, ram.x);
+    }
+    expect(ram.state).toBe(ST.FLED);
+    // out by the west, through both broken gates, not out the back of the pass fort
+    expect(ram.x).toBeLessThan(3 * 16);
+    expect(maxX).toBeLessThan(48 * 16);
+    expect(g.inside[idx(0, Math.floor(ram.y / 16))]).toBe(0);
+  });
+
   it('screened sappers reach the wall and dig, but are exposed while digging', () => {
     const { w, core } = lone('s4', 'w_sappers', 3, ['w_wall']);
     let dug = false;
@@ -331,6 +402,58 @@ describe('stalemates', () => {
     expect(w.result!.won).toBe(true);
     expect(w.t).toBeLessThanOrEqual(BATTLE_HARD_CAP + 1 / 30 + 1e-9);
   });
+
+  it('at the hard cap, attackers holding the courtyard take the castle', () => {
+    const { w, b } = lastWaveWith('h_levies');
+    const g = w.grid;
+    const yard: number[] = [];
+    for (let i = 0; i < g.n; i++) if (g.inside[i] && !g.keepAdj[i]) yard.push(i);
+    b.units.slice(0, CAP_HOLD_N + 1).forEach((u, k) => {
+      u.x = ((yard[k * 7] % GW) + 0.5) * 16;
+      u.y = (Math.floor(yard[k * 7] / GW) + 0.5) * 16;
+    });
+    w.t = BATTLE_HARD_CAP - 1 / 30;
+    w.step();
+    expect(w.state).toBe('lost');
+    expect(w.result!.won).toBe(false);
+    expect(w.events.some((e) => e.type === 'siegeend' && e.level === 'danger')).toBe(true);
+  });
+
+  it('an assault on the keep grows stronger the longer it lasts, and is announced without spam', () => {
+    const { w, b } = lastWaveWith('h_levies');
+    // the band stays put at the map edge; its first man stands for 'someone hammering at the keep door'
+    const pin = b.units.map((u) => [u.x, u.y]);
+    const hammer = b.units[0];
+    w.keepMax = w.keepHp = 1e6; // never falls here
+    const lossOver = (secs: number, hitting = true) => {
+      const k0 = w.keepHp;
+      for (let i = 0; i < 30 * secs; i++) {
+        b.units.forEach((u, k) => {
+          u.x = pin[k][0];
+          u.y = pin[k][1];
+        });
+        if (hitting && i % 30 === 0) {
+          hammer.cd = 0;
+          w.attackKeep(hammer);
+        }
+        w.step();
+      }
+      return k0 - w.keepHp;
+    };
+    const first = lossOver(15);
+    lossOver(KEEP_PRESS_T * 2);
+    const later = lossOver(15);
+    expect(first).toBeGreaterThan(0);
+    expect(later / first).toBeGreaterThan(2);
+    expect(w.keepPressMul()).toBeLessThanOrEqual(1 + KEEP_PRESS_MAX);
+    // one alert opens the assault; no fresh alert every few seconds while it goes on
+    expect(w.events.filter((e) => e.type === 'keep').length).toBe(1);
+    // driven off, the pressure ebbs; a new assault after a lull is announced again
+    lossOver(60, false);
+    expect(w.keepPressMul()).toBeLessThan(1 + KEEP_PRESS_MAX);
+    lossOver(3);
+    expect(w.events.filter((e) => e.type === 'keep').length).toBe(2);
+  });
 });
 
 describe('dragon', () => {
@@ -349,17 +472,49 @@ describe('dragon', () => {
     for (let i = 0; i < 30 * maxS && !d.fleeing && d.state === ST.ACTIVE; i++) w.step();
   };
 
-  it('ignores the collapse of its retinue, but does not linger alone forever', () => {
+  it('ignores the collapse of its retinue: unhurt, it stays and keeps burning', () => {
     const { w, d } = dragonWorld();
     for (let i = 0; i < 30 * 20; i++) w.step();
     const band = d.band!;
     for (const u of band.units) if (u !== d && u.state === ST.ACTIVE) w.killEnemy(u, null);
     w.breakBand(band);
-    for (let i = 0; i < 30 * 10; i++) w.step();
-    expect(d.fleeing).toBe(false); // fearless: still fighting 10 s after its band broke
-    flee(w, d, DRAGON_STAY_ALONE + 5);
+    // keep it unhurt: only wounds or ballista bolts may send it away
+    let breath = 0;
+    for (let i = 0; i < 30 * 60 && w.state === 'battle'; i++) {
+      d.hp = d.maxHp;
+      d.pain = 0;
+      w.step();
+      if (d.fState === 1) breath += 1 / 30;
+    }
+    expect(d.fleeing).toBe(false);
+    expect(d.state).toBe(ST.ACTIVE);
+    expect(breath).toBeGreaterThan(10);
+  });
+
+  it('a storm of arrows harries it off long before it is badly hurt; stray shots never do', () => {
+    const { w, d } = dragonWorld();
+    const bow = w.defs.find((u) => u.def.id === 'd_archer' || u.def.id === 'd_xbow')!;
+    // only the test's own shots reach it: the garrison's missile troops stand down
+    for (const u of w.defs) if (u.def.range > 0 && u !== bow) u.state = ST.DEAD;
+    bow.x = bow.y = -999;
+    for (let i = 0; i < 30 * 15; i++) w.step();
+    // stray shots: 1% of its HP every 3 s wears off faster than it builds
+    for (let k = 0; k < 20 && !d.fleeing; k++) {
+      w.damage(d, d.maxHp * 0.01, 1, bow, true);
+      for (let i = 0; i < 90; i++) w.step();
+    }
+    expect(d.fleeing).toBe(false);
+    expect(d.pain).toBeLessThan(1);
+    // a storm: the same arrows all at once
+    const hp0 = d.hp;
+    for (let k = 0; k < 60 && d.pain < DRAGON_PAIN_MAX + 0.5; k++) w.damage(d, d.maxHp * 0.01, 1, bow, true);
+    const lost = (hp0 - d.hp) / d.maxHp;
+    expect(lost).toBeGreaterThanOrEqual(DRAGON_PAIN_MAX * DRAGON_PAIN_DMG - 0.001);
+    expect(lost).toBeLessThan((DRAGON_PAIN_MAX + 1) * DRAGON_PAIN_DMG);
+    flee(w, d, 1);
     expect(d.fleeing).toBe(true);
-    expect(w.t - band.brokenT).toBeLessThan(DRAGON_STAY_ALONE + 2);
+    expect(d.hp / d.maxHp).toBeGreaterThan(DRAGON_FLEE_HP);
+    expect(w.stats.dragons).toBe(1);
   });
 
   it('is driven off by sustained ballista hits and counts once in stats.dragons', () => {
@@ -709,12 +864,13 @@ function laneCheck(st: StageDef, seed: number) {
       const y = Math.floor(t / GW);
       const off = l.edge === 'W' ? x : l.edge === 'E' ? GW - 1 - x : l.edge === 'N' ? y : GH - 1 - y;
       expect(off, `${where}: spawns ${off} tiles in from its edge`).toBeLessThanOrEqual(6);
+      expect(g.wallDist[t], `${where}: spawns ${g.wallDist[t].toFixed(1)} tiles from the walls`).toBeGreaterThanOrEqual(SPAWN_GAP);
       expect(isFinite(breach.dist[t]) && isFinite(esc.dist[t]), `${where} reaches the keep`).toBe(true);
     }
 }
 
 describe('approaches', () => {
-  it.each(STAGES.map((s) => [s.id, s]))('%s: every lane spawns outside, near its edge, and reaches the keep', (_id, st) => {
+  it.each(STAGES.map((s) => [s.id, s]))('%s: every lane spawns outside, near its edge, clear of the walls, and reaches the keep', (_id, st) => {
     for (const seed of [1, 2, 3, 123]) laneCheck(st, seed);
   });
 
@@ -895,12 +1051,18 @@ describe('daily and endless', () => {
     expect(w.waveIdx).toBe(1);
     expect(w.events.some((e) => e.type === 'resupply')).toBe(true);
     const mouths = Math.ceil(w.defs.filter((u) => u.state === ST.ACTIVE).length / 2);
-    expect(w.supplies.food).toBe(food + ENDLESS_RESUPPLY.food! - mouths);
-    expect(w.supplies.mats).toBeGreaterThanOrEqual(mats + ENDLESS_RESUPPLY.mats! - 1);
-    // the forecast: one ration in store, then only what the train does not cover
+    // the train fills the stores up to what they held at the start, no further
+    const cap = (k: 'food' | 'mats', before: number) => Math.floor(Math.min(ENDLESS_RESUPPLY[k]!, w.startSupplies[k] - before));
+    expect(cap('food', food)).toBeGreaterThan(0);
+    expect(w.supplies.food).toBe(food + cap('food', food) - mouths);
+    expect(w.supplies.mats).toBeGreaterThanOrEqual(mats + Math.max(0, cap('mats', mats)) - 1);
+    for (const k of ['food', 'arrows', 'mats', 'meds'] as const) expect(w.supplies[k]).toBeLessThanOrEqual(w.startSupplies[k]);
+    // a full army eats more than a train carries: the granary runs down over the waves
     const n = lineupSoldiers(s, ids);
     const r = Math.ceil(n / 2);
-    expect(foodNeeded(st, n)).toBe(r + (st.waves.length - 1) * Math.max(0, r - ENDLESS_RESUPPLY.food!));
+    expect(r).toBeGreaterThan(ENDLESS_RESUPPLY.food!);
+    // the forecast: one ration in store, then what the train does not cover, over the first 10 waves
+    expect(foodNeeded(st, n)).toBe(r + 9 * Math.max(0, r - ENDLESS_RESUPPLY.food!));
     expect(foodNeeded(st, 2 * ENDLESS_RESUPPLY.food!)).toBe(ENDLESS_RESUPPLY.food!);
     // campaign castles get no train
     expect(STAGES.every((x) => !x.resupply)).toBe(true);

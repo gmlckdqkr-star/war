@@ -10,7 +10,7 @@
 import { SQUAD_TYPES, type SquadTypeId } from '../src/sim/defs';
 import { RNG } from '../src/sim/rng';
 import { STAGES, endlessStage, type StageDef, type Supplies } from '../src/sim/stages';
-import { BATTLE_HARD_CAP, World } from '../src/sim/world';
+import { BATTLE_HARD_CAP, ST, World, type Unit } from '../src/sim/world';
 import { newSave, type SaveData } from '../src/meta/save';
 import {
   SQUAD_PRICE,
@@ -115,8 +115,20 @@ function play(st: StageDef, battleSeed: number, attempt: number | 'farm') {
   const council: string[] = [];
   const edges: string[] = [];
   let lastWave = -1;
+  // the dragon's visit: how long it stayed, how it left (driven = wounded or harried), its HP then
+  const dragon: { stay: number; hp: number; how: string }[] = [];
+  const seen = new Map<Unit, { born: number; done: boolean }>();
   while ((w.state === 'battle' || w.state === 'intermission') && w.t < BATTLE_HARD_CAP + 60) {
     w.step();
+    for (const e of w.activeEnemies) if (e.def.role === 'dragon' && !seen.has(e)) seen.set(e, { born: w.t, done: false });
+    for (const [e, r] of seen) {
+      if (r.done) continue;
+      const gone = e.state === ST.DEAD || e.fleeing || e.state === ST.FLED;
+      if (!gone && !w.result) continue;
+      r.done = true;
+      const how = e.state === ST.DEAD ? 'slain' : gone ? (w.dragonsCounted.has(e.id) ? 'driven' : 'sated') : 'stayed';
+      dragon.push({ stay: Math.round(w.t - r.born), hp: +(Math.max(0, e.hp) / e.maxHp).toFixed(2), how });
+    }
     if (w.waveIdx !== lastWave && w.state === 'battle') {
       lastWave = w.waveIdx;
       edges.push(w.nextWaveEdges().join(''));
@@ -165,6 +177,7 @@ function play(st: StageDef, battleSeed: number, attempt: number | 'farm') {
       noMeds: evc.nomeds ?? 0,
       council,
       edges,
+      ...(dragon.length ? { dragon } : {}),
       ms: Date.now() - t0,
     }),
   );
