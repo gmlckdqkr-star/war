@@ -4,7 +4,7 @@
  * (with hysteresis so they don't thrash), archers drift to the walls with the best field of fire,
  * engineers pick safe repairs, and idle squads return to their posts.
  */
-import { GH, GW, TILE, Tile } from './defs';
+import { GH, GW, TILE, Tile, UNITS } from './defs';
 import { cx, cy, idx, inb, tileAt, tx, ty } from './grid';
 import type { Squad, World } from './world';
 import { ST } from './world';
@@ -37,10 +37,14 @@ export class CouncilState {
   tn = new Int32Array(CW * CH);
   dens = new Float32Array(DW * DH);
   danger = new Float32Array(DW * DH);
+  /** enemies on the ground inside the walls / at the keep (extra weight for the shooters) */
+  idens = new Float32Array(DW * DH);
   rangedTick = 0;
 }
 
 const MELEE = new Set(['spear', 'sword', 'knight', 'militia']);
+/** extra weight of an enemy inside the walls for the shooters' choice of position (doubled at the keep) */
+const INTRUDER_W = 2;
 
 export function findThreats(w: World): Threat[] {
   const g = w.grid;
@@ -145,11 +149,19 @@ export function runCouncil(w: World) {
 
   // ---------------- ranged squads (every 2 s) ----------------
   const cs = w.council;
-  const { dens, danger } = cs;
+  const { dens, danger, idens } = cs;
   cs.rangedTick++;
   if (cs.rangedTick % 4 === 0) {
     dens.fill(0);
     danger.fill(0);
+    idens.fill(0);
+    // intruders: enemies on the ground inside the walls or at the keep. Shooting them comes first,
+    // so they weigh extra and shooters may leave their stretch of wall (or come down) to reach them.
+    let inN = 0;
+    let x0 = GW;
+    let x1 = -1;
+    let y0 = GH;
+    let y1 = -1;
     for (const e of w.activeEnemies) {
       if (e.fleeing) continue;
       const c = Math.min(DH - 1, Math.floor(e.y / (DCS * T))) * DW + Math.min(DW - 1, Math.floor(e.x / (DCS * T)));
@@ -157,6 +169,14 @@ export function runCouncil(w: World) {
       const tiE = tileAt(e.x, e.y);
       dens[c] += e.def.role === 'ladder' || e.def.role === 'sapper' || e.def.big ? 2 : 1;
       if (e.elev || g.inside[tiE]) danger[c] += 1;
+      if (!e.elev && !e.def.flying && (g.inside[tiE] === 1 || g.keepAdj[tiE] === 1)) {
+        idens[c] += (g.keepAdj[tiE] ? INTRUDER_W * 2 : INTRUDER_W) * (e.def.big ? 2 : 1);
+        inN++;
+        x0 = Math.min(x0, tx(tiE));
+        x1 = Math.max(x1, tx(tiE));
+        y0 = Math.min(y0, ty(tiE));
+        y1 = Math.max(y1, ty(tiE));
+      }
     }
     const claimed: number[] = [];
     for (const s of w.squads) if (s.type.ranged && s.destTile >= 0 && (!s.auto || s.type.id === 'ballista')) claimed.push(s.destTile);
@@ -168,18 +188,26 @@ export function runCouncil(w: World) {
         return p;
       };
       if (s.homeTile < 0) continue;
-      const R = 9 * 1.25; // tiles
+      const range = UNITS[s.type.unit].range;
+      /** what this squad could shoot from `tile` (range in tiles; +25% from a wall top), minus the danger there */
       const score = (tile: number) => {
+        const elev = g.isElev(tile);
         const x = tx(tile) / DCS;
         const y = ty(tile) / DCS;
-        const r = R / DCS;
+        const r = (range * (elev ? 1.25 : 1)) / DCS;
+        // reach of the squad as a whole is a bit less than a soldier's (they spread around the tile)
+        const ri = r - 1 / DCS;
+        // on the ground any intruder can close in: keep further from them
+        const rz = elev ? 1.2 : 2.2;
         let sc = 0;
         let dz = 0;
         for (let yy = Math.max(0, Math.floor(y - r)); yy <= Math.min(DH - 1, Math.ceil(y + r)); yy++)
           for (let xx = Math.max(0, Math.floor(x - r)); xx <= Math.min(DW - 1, Math.ceil(x + r)); xx++) {
             const d = Math.hypot(xx + 0.5 - x, yy + 0.5 - y);
-            if (d <= r) sc += dens[yy * DW + xx];
-            if (d <= 1.2) dz += danger[yy * DW + xx];
+            const c = yy * DW + xx;
+            if (d <= r) sc += dens[c];
+            if (d <= ri) sc += idens[c];
+            if (d <= rz) dz += danger[c];
           }
         return sc - dz * 5;
       };
@@ -187,19 +215,32 @@ export function runCouncil(w: World) {
       const curScore = score(cur) - crowd(cur);
       let best = cur;
       let bs = curScore;
+      const consider = (i: number) => {
+        const sc = score(i) - crowd(i) - Math.hypot(tx(i) - tx(cur), ty(i) - ty(cur)) * 0.12;
+        if (sc > bs) {
+          bs = sc;
+          best = i;
+        }
+      };
       const hx = tx(s.homeTile);
       const hy = ty(s.homeTile);
       for (let y = Math.max(0, hy - 12); y <= Math.min(GH - 1, hy + 12); y++)
         for (let x = Math.max(0, hx - 12); x <= Math.min(GW - 1, hx + 12); x++) {
           if ((x + y) % 2) continue;
           const i = idx(x, y);
-          if (!g.isElev(i) || !g.deployable(i)) continue;
-          const sc = score(i) - crowd(i) - Math.hypot(x - tx(cur), y - ty(cur)) * 0.12;
-          if (sc > bs) {
-            bs = sc;
-            best = i;
-          }
+          if (g.isElev(i) && g.deployable(i)) consider(i);
         }
+      if (inN > 0) {
+        // wall walks, towers and courtyard ground within reach of the intruders, wherever they are
+        const m = Math.ceil(range * 1.25);
+        for (let y = Math.max(0, y0 - m); y <= Math.min(GH - 1, y1 + m); y++)
+          for (let x = Math.max(0, x0 - m); x <= Math.min(GW - 1, x1 + m); x++) {
+            if ((x + y) % 2) continue;
+            if (Math.abs(x - hx) <= 12 && Math.abs(y - hy) <= 12 && g.isElev(idx(x, y))) continue; // seen above
+            const i = idx(x, y);
+            if (g.deployable(i) && (g.isElev(i) || g.inside[i] === 1) && !g.keepAdj[i]) consider(i);
+          }
+      }
       if (curScore <= 0 && bs <= 0 && cur !== s.homeTile) {
         w.orderMove(s, s.homeTile, false);
         claimed.push(s.homeTile);

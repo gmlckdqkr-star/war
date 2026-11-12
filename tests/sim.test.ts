@@ -372,6 +372,43 @@ describe('dragon', () => {
   });
 });
 
+describe('keep defence', () => {
+  it('shooters leave a quiet wall to bring enemies at the keep within range', () => {
+    const st = STAGES.find((x) => x.id === 's8')!;
+    const s = armyFor(8);
+    s.settings.autoCommand = true;
+    const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, 31));
+    w.start();
+    w.pending = [];
+    w.spawnBand({ band: 'h_company', edge: 'W', span: [16, 18], delay: 0 }, 0);
+    const g = w.grid;
+    const ring: number[] = [];
+    for (let i = 0; i < g.n; i++) if (g.keepAdj[i] && g.inside[i]) ring.push(i);
+    w.enemies.forEach((e, k) => {
+      const t = ring[(k * 7) % ring.length];
+      e.x = e.px = ((t % GW) + 0.5) * 16;
+      e.y = e.py = (Math.floor(t / GW) + 0.5) * 16;
+    });
+    // only the shooters act
+    for (const q of w.squads) if (!q.type.ranged) for (const u of q.units) if (u.state === ST.ACTIVE) u.state = ST.EVAC;
+    const shooters = w.squads.filter((q) => q.auto && q.type.ranged && q.type.id !== 'ballista');
+    expect(shooters.length).toBeGreaterThan(0);
+    // the s8 walls are far from the keep: nobody can reach it from his post
+    const reach = (q: (typeof shooters)[number]) =>
+      q.units.some((u) => u.state === ST.ACTIVE && w.activeEnemies.some((e) => !e.fleeing && Math.hypot(e.x - u.x, e.y - u.y) <= u.def.range * (u.elev ? 1.25 : 1) * 16));
+    expect(shooters.filter(reach).length).toBe(0);
+    let hits = 0;
+    const dmg = w.damage.bind(w);
+    w.damage = (t, d, ap, src, ranged) => {
+      if (src && src.side === 0 && ranged) hits++;
+      return dmg(t, d, ap, src, ranged);
+    };
+    for (let i = 0; i < 30 * 20; i++) w.step();
+    expect(shooters.filter(reach).length).toBe(shooters.length);
+    expect(hits).toBeGreaterThan(50);
+  });
+});
+
 describe('battle simulation', () => {
   it('is deterministic for the same seed', () => {
     const a = runBattle('s1', 77, 200);
