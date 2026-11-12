@@ -9,7 +9,7 @@ const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
 const OUT = process.env.E2E_OUT || 'artifacts/e2e';
 mkdirSync(OUT, { recursive: true });
-const PORT = 4179;
+const PORT = Number(process.env.E2E_PORT ?? 4179);
 const URL = `http://localhost:${PORT}/`;
 
 const server = spawn('npx', ['vite', 'preview', '--port', String(PORT), '--strictPort'], { stdio: 'ignore' });

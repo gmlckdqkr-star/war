@@ -156,6 +156,25 @@ export function baseSupplies(s: SaveData, st: StageDef): Supplies {
   };
 }
 
+/**
+ * Food the whole battle will need for a lineup of `soldiers` fighters (shared by the sim rule and the
+ * pre-battle forecast). The sim deducts ceil(alive / 2) at the start of every wave, so this is the
+ * worst case where nobody falls. Keep this in sync with World.startWave.
+ */
+export function foodNeeded(st: StageDef, soldiers: number): number {
+  return st.waves.length * Math.ceil(Math.max(0, soldiers) / 2);
+}
+
+/** Soldiers that would deploy for a lineup (ready = not wounded). */
+export function lineupSoldiers(s: SaveData, squadIds: string[]): number {
+  let n = 0;
+  for (const id of squadIds) {
+    const r = s.roster.find((x) => x.id === id);
+    if (r) n += readyCount(r);
+  }
+  return n;
+}
+
 // ---------------------------------------------------------------- battle setup
 
 export function battleConfig(

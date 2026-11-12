@@ -38,6 +38,8 @@ export interface Settings {
   quality: 'low' | 'high';
   reduceMotion: boolean;
   showTips: boolean;
+  /** battle speed the player used last time (1-4); restored at the next battle */
+  speed: number;
 }
 
 export interface SaveData {
@@ -82,6 +84,7 @@ export const DEFAULT_SETTINGS: Settings = {
   quality: 'high',
   reduceMotion: false,
   showTips: true,
+  speed: 1,
 };
 
 export function newSquad(save: SaveData, type: SquadTypeId, name?: string): RosterSquad {
@@ -232,6 +235,7 @@ export function sanitize(raw: any): SaveData {
   }
   if (!['easy', 'normal', 'hard'].includes(s.settings.difficulty)) s.settings.difficulty = 'normal';
   if (!['low', 'high'].includes(s.settings.quality)) s.settings.quality = 'high';
+  s.settings.speed = Math.round(num(s.settings.speed, 1, 1, 4));
   s.tutorialDone = !!raw.tutorialDone;
   s.seenTips = strArr(raw.seenTips).slice(0, 200);
   s.firstWinKey = typeof raw.firstWinKey === 'string' ? raw.firstWinKey : '';

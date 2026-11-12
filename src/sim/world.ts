@@ -778,6 +778,32 @@ export class World {
     }
   }
 
+  // ---------------------------------------------------------------- war council (between waves)
+  // Shared interface for the UI. Stub for now: the balance pass fills in the options and effects.
+
+  /** id of the option picked during the current intermission, or null */
+  councilPick: string | null = null;
+
+  /** Options the player can pick right now (empty when not in an intermission or already picked). */
+  councilOptions(): { id: string; name: string; desc: string }[] {
+    return [];
+  }
+
+  /** Apply one council option. Returns false if not allowed now. */
+  chooseCouncil(_id: string): boolean {
+    return false;
+  }
+
+  /** Edges ('W' | 'N' | 'S' | 'E') the upcoming wave will come from: the first wave while deploying,
+   *  the next wave during an intermission, the current wave during battle. Used for approach arrows. */
+  nextWaveEdges(): string[] {
+    const waves = this.stage.waves;
+    if (!waves.length) return [];
+    const idx = this.state === 'deploy' ? 0 : this.state === 'intermission' ? this.waveIdx + 1 : Math.max(0, this.waveIdx);
+    const wv = waves[Math.min(idx, waves.length - 1)];
+    return [...new Set(wv.groups.map((g) => g.edge as string))];
+  }
+
   /** Player may call the next wave early during intermission (small gold bonus). */
   skipIntermission() {
     if (this.state !== 'intermission') return;
