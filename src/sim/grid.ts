@@ -491,6 +491,17 @@ export class Grid {
     return -1;
   }
 
+  /**
+   * Where a band coming from `edge` at `along` tiles down that edge appears: the nearest open ground
+   * outside the walls (-1 if there is none within 30 tiles).
+   */
+  spawnTile(edge: 'W' | 'N' | 'S' | 'E', along: number): number {
+    const a = Math.round(along);
+    const x = edge === 'W' ? 0 : edge === 'E' ? GW - 1 : Math.min(GW - 1, Math.max(0, a));
+    const y = edge === 'N' ? 0 : edge === 'S' ? GH - 1 : Math.min(GH - 1, Math.max(0, a));
+    return this.nearestTile(idx(x, y), (i) => this.openGround(i) && !this.inside[i], 30);
+  }
+
   /** Is a defender allowed to be deployed / ordered to this tile? */
   deployable(i: number) {
     const inf = TILE_INFO[this.tiles[i]];

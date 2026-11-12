@@ -20,7 +20,8 @@ import { Grid, cx, cy, idx, inb, newField, tileAt, tx, ty, type Field, N8 } from
 import { SpatialHash } from './hash';
 import { josa } from './josa';
 import { RNG } from './rng';
-import type { Edge, StageDef, Supplies, WaveGroup } from './stages';
+import { planWaves, type Edge, type StageDef, type Supplies, type WaveGroup } from './stages';
+import { applyCouncil, closeCouncil, councilOptionList, openCouncil } from './warcouncil';
 import { CouncilState, runCouncil, autoCommander } from './council';
 
 export const ST = { ACTIVE: 0, DOWN: 1, DEAD: 2, CARRIED: 3, EVAC: 4, FLED: 5, CLIMB: 6 } as const;
@@ -285,6 +286,7 @@ export const TREB_SPLASH_DMG = 14;
 export const TREB_SPLASH_R = 14;
 /** no battle runs longer than this (game seconds): the attackers lift the siege (endless mode excepted) */
 export const BATTLE_HARD_CAP = 900;
+const SUPPLY_NAMES: Record<keyof Supplies, string> = { food: '식량', arrows: '화살', mats: '자재', meds: '의약품' };
 
 /** extra reach (px) and damage multiplier for enemies inside the walls striking defenders on the wall top */
 export const WALLTOP_REACH = 6;
@@ -364,10 +366,21 @@ export class World {
   result: BattleResult | null = null;
   /** per-world id counter keeps battles reproducible for a given seed */
   uid = 1;
+  /** wall HP multiplier of this battle (masonry research, daily mods) */
+  structHpMul = 1;
+  /** war council: ids offered this intermission, their amounts, and every pick applied so far */
+  councilOffer: string[] = [];
+  councilAmt: Record<string, number> = {};
+  councilLog: string[] = [];
+  /** gates the council has already strengthened (once each) */
+  gateBoosted = new Set<number>();
+  /** arrows that came into the stores this battle (start, recovered, council) */
+  arrowsIn = 0;
 
   constructor(cfg: BattleConfig) {
     this.cfg = cfg;
-    this.stage = cfg.stage;
+    // the approaches of this battle's waves are fixed now, from the seed (see planWaves)
+    this.stage = { ...cfg.stage, waves: planWaves(cfg.stage, cfg.seed) };
     this.rng = new RNG(cfg.seed);
     this.up = cfg.upgrades;
     this.mods = new Set(cfg.mods ?? []);
@@ -381,11 +394,13 @@ export class World {
     cfg.stage.build(this.grid, stageRng);
     let hpMul = 1 + 0.12 * (this.up.masonry ?? 0);
     if (this.mods.has('brittle')) hpMul *= 0.65;
+    this.structHpMul = hpMul;
     this.grid.finalize(hpMul);
     this.keepMax = cfg.stage.keepHp * (1 + 0.06 * (this.up.masonry ?? 0));
     this.keepHp = this.keepMax;
     this.supplies = { ...cfg.supplies };
     this.startSupplies = { ...cfg.supplies };
+    this.arrowsIn = cfg.supplies.arrows;
     const cdMul = 1 - 0.08 * (this.up.command ?? 0);
     const mk = (id: AbilityId) => ({ cd: 0, max: ABILITY_INFO[id].cd * cdMul, unlocked: cfg.stage.abilities.includes(id), used: 0 });
     this.abilities = { rally: mk('rally'), volley: mk('volley'), oil: mk('oil'), reserve: mk('reserve') };
@@ -532,6 +547,7 @@ export class World {
       if (edges.has('W')) s += (GW - tx(i)) * 2;
       if (edges.has('N')) s += (GH - ty(i)) * 0.8;
       if (edges.has('S')) s += ty(i) * 0.8;
+      if (edges.has('E')) s += tx(i) * 0.5;
       return s;
     };
     gates.sort((a, b) => expo(b) - expo(a));
@@ -864,6 +880,8 @@ export class World {
   // ======================================================================
 
   startWave(w: number) {
+    // an open war council is decided (auto-commander) or lapses before the rations are handed out
+    if (this.state === 'intermission') closeCouncil(this);
     this.waveIdx = w;
     this.waveT = 0;
     this.pending = [...this.stage.waves[w].groups].sort((a, b) => a.delay - b.delay);
@@ -913,10 +931,24 @@ export class World {
           this.shotsWave = 0;
           if (rec > 0) {
             this.supplies.arrows += rec;
+            this.arrowsIn += rec;
             this.event('arrows', `전장에서 화살 ${rec}개를 회수했습니다.`, 'info');
+          }
+          const sup = this.stage.resupply;
+          if (sup) {
+            const got: string[] = [];
+            for (const k of ['food', 'arrows', 'mats', 'meds'] as const) {
+              const n = sup[k] ?? 0;
+              if (n <= 0) continue;
+              this.supplies[k] += n;
+              if (k === 'arrows') this.arrowsIn += n;
+              got.push(`${SUPPLY_NAMES[k]} +${n}`);
+            }
+            if (got.length) this.event('resupply', `보급 마차가 도착했습니다: ${got.join(', ')}`, 'info');
           }
           this.event('cleared', `물결을 막아냈습니다! 다음 공세까지 ${Math.round(this.interT)}초`, 'good');
           for (const sq of this.squads) sq.morale = Math.min(100, sq.morale + 10);
+          openCouncil(this);
         }
       } else if (!last && this.waveT > (wave.maxTime ?? 105)) {
         this.startWave(this.waveIdx + 1);
@@ -925,19 +957,27 @@ export class World {
   }
 
   // ---------------------------------------------------------------- war council (between waves)
-  // Shared interface for the UI. Stub for now: the balance pass fills in the options and effects.
+  // Each intermission offers three options (src/sim/warcouncil.ts); one may be taken.
 
   /** id of the option picked during the current intermission, or null */
   councilPick: string | null = null;
 
   /** Options the player can pick right now (empty when not in an intermission or already picked). */
   councilOptions(): { id: string; name: string; desc: string }[] {
-    return [];
+    if (this.state !== 'intermission' || this.councilPick) return [];
+    return councilOptionList(this);
   }
 
   /** Apply one council option. Returns false if not allowed now. */
-  chooseCouncil(_id: string): boolean {
-    return false;
+  chooseCouncil(id: string): boolean {
+    if (this.state !== 'intermission' || this.councilPick || !this.councilOffer.includes(id)) return false;
+    applyCouncil(this, id, false);
+    return true;
+  }
+
+  /** a gate's full strength at the start of this battle (research and daily mods included) */
+  gateBaseHp() {
+    return TILE_INFO[Tile.GATE].maxHp * this.structHpMul;
   }
 
   /** Edges ('W' | 'N' | 'S' | 'E') the upcoming wave will come from: the first wave while deploying,
@@ -962,24 +1002,9 @@ export class World {
     if (!tpl) return;
     const grid = this.grid;
     const r = this.rng;
-    let ex = 0;
-    let ey = 0;
     const along = r.range(g.span[0], g.span[1]);
-    if (g.edge === 'W') {
-      ex = 0;
-      ey = along;
-    } else if (g.edge === 'N') {
-      ex = along;
-      ey = 0;
-    } else if (g.edge === 'S') {
-      ex = along;
-      ey = GH - 1;
-    } else {
-      ex = GW - 1;
-      ey = along;
-    }
     const ok = (i: number) => grid.openGround(i) && !grid.inside[i];
-    let st = grid.nearestTile(idx(Math.round(Math.min(GW - 1, ex)), Math.round(Math.min(GH - 1, ey))), ok, 30);
+    const st = grid.spawnTile(g.edge, along);
     if (st < 0) return;
     const bx = cx(st);
     const by = cy(st);
@@ -1009,6 +1034,8 @@ export class World {
     if (tpl.leader) list.push(tpl.leader);
     for (const [id, n] of tpl.members) for (let i = 0; i < n; i++) list.push(id);
     const spread = 1.2 + Math.sqrt(list.length) * 0.55;
+    // endless waves grow stronger one by one
+    const waveMul = this.stage.waves[this.waveIdx]?.mul ?? 1;
     for (let i = 0; i < list.length; i++) {
       const def = UNITS[list[i]];
       let px = bx;
@@ -1017,7 +1044,7 @@ export class World {
         for (let tries = 0; tries < 8; tries++) {
           const ang = r.range(0, Math.PI * 2);
           const rad = i === 0 ? 0 : r.range(0.3, spread) * T;
-          const qx = Math.max(2, Math.min(WORLD_W - 2, bx + Math.cos(ang) * rad - (g.edge === 'W' ? rad * 0.5 : 0)));
+          const qx = Math.max(2, Math.min(WORLD_W - 2, bx + Math.cos(ang) * rad - (g.edge === 'W' ? rad * 0.5 : g.edge === 'E' ? -rad * 0.5 : 0)));
           const qy = Math.max(2, Math.min(WORLD_H - 2, by + Math.sin(ang) * rad));
           if (ok(tileAt(qx, qy))) {
             px = qx;
@@ -1026,17 +1053,17 @@ export class World {
           }
         }
       } else {
-        px = g.edge === 'W' ? 4 : bx;
+        px = g.edge === 'W' ? 4 : g.edge === 'E' ? WORLD_W - 4 : bx;
         py = g.edge === 'N' ? 4 : g.edge === 'S' ? WORLD_H - 4 : by;
         if (def.role === 'dragon') this.hasDragonEver = true;
       }
       const u = this.makeUnit(def, 1, px, py);
-      u.maxHp = u.hp = def.hp * this.hpScale;
-      u.atkMul = this.atkScale;
+      u.maxHp = u.hp = def.hp * this.hpScale * waveMul;
+      u.atkMul = this.atkScale * waveMul;
       u.band = band;
       if (def.role === 'ranged') u.ammo = u.maxAmmo = ENEMY_QUIVER;
       else if (def.role === 'treb') u.ammo = u.maxAmmo = TREB_STONES;
-      u.spawnX = g.edge === 'W' ? -20 : px;
+      u.spawnX = g.edge === 'W' ? -20 : g.edge === 'E' ? WORLD_W + 20 : px;
       u.spawnY = g.edge === 'N' ? -20 : g.edge === 'S' ? WORLD_H + 20 : py;
       if (def.leader && !band.leader) band.leader = u;
       band.units.push(u);
