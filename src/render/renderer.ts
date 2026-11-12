@@ -90,7 +90,7 @@ export class Renderer {
   /** screen rects (CSS px) covered by HUD panels: screen-space markers are kept out from under them */
   occluders: { x0: number; y0: number; x1: number; y1: number }[] = [];
   /** approach arrows drawn in the last frame (screen CSS px), for HUD placement and tests */
-  approachPts: { x: number; y: number; edge: string }[] = [];
+  approachPts: { x: number; y: number; edge: string; moved: boolean }[] = [];
   /** off-screen alert arrows drawn in the last frame (screen CSS px) */
   edgePts: { x: number; y: number }[] = [];
   private buckets = new Map<string, Unit[]>();
@@ -710,10 +710,10 @@ export class Renderer {
       const len = e === 'W' || e === 'E' ? GH : GW;
       const pts = along.length ? along.map((v) => (Math.max(1, Math.min(len - 2, v)) + 0.5) * T) : [len * T * 0.35, len * T * 0.65];
       for (const at of pts) {
-        let x = e === 'W' ? cam.toScreenX(0) + 18 : e === 'E' ? cam.toScreenX(WORLD_W) - 18 : cam.toScreenX(at);
-        let y = e === 'N' ? cam.toScreenY(0) + 18 : e === 'S' ? cam.toScreenY(WORLD_H) - 18 : cam.toScreenY(at);
-        x = Math.min(x1, Math.max(x0, x));
-        y = Math.min(y1, Math.max(y0, y));
+        const ex = e === 'W' ? cam.toScreenX(0) + 18 : e === 'E' ? cam.toScreenX(WORLD_W) - 18 : cam.toScreenX(at);
+        const ey = e === 'N' ? cam.toScreenY(0) + 18 : e === 'S' ? cam.toScreenY(WORLD_H) - 18 : cam.toScreenY(at);
+        let x = Math.min(x1, Math.max(x0, ex));
+        let y = Math.min(y1, Math.max(y0, ey));
         // out from under HUD panels, along the way the wave walks in
         for (let k = 0; k < 3; k++) {
           const o = this.occluders.find((r) => x + R > r.x0 && x - R < r.x1 && y + R > r.y0 && y - R < r.y1);
@@ -723,7 +723,7 @@ export class Renderer {
           else if (e === 'N') y = o.y1 + R + 2;
           else y = o.y0 - R - 2;
         }
-        this.approachPts.push({ x, y, edge: e });
+        this.approachPts.push({ x, y, edge: e, moved: Math.abs(x - ex) + Math.abs(y - ey) > 2 });
       }
     }
     const pulse = this.reduceMotion ? 0 : 4 * Math.sin(this.time * 4);
@@ -734,6 +734,8 @@ export class Renderer {
     ctx.lineWidth = 1.5;
     for (const p of this.approachPts) {
       ctx.save();
+      // brought in from an edge that is off screen or under the HUD: it lies over the map, so let units show through
+      ctx.globalAlpha = p.moved ? 0.75 : 1;
       ctx.translate(p.x, p.y);
       ctx.rotate(ang[p.edge] ?? 0);
       ctx.translate(pulse - 3, 0);
