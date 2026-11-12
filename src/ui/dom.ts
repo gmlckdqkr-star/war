@@ -40,6 +40,8 @@ export function toast(text: string, level: 'info' | 'good' | 'warn' | 'danger' =
     toastRoot = h('div', { class: 'toasts', 'aria-live': 'polite' });
     document.body.append(toastRoot);
   }
+  // the same alert again replaces the old copy instead of stacking up
+  for (const old of [...toastRoot.children]) if (old.textContent === text) old.remove();
   const t = h('div', { class: `toast ${level}${cls ? ' ' + cls : ''}`, role: 'status' }, text);
   if (onTap) {
     t.classList.add('tappable');

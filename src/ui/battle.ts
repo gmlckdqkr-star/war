@@ -149,6 +149,7 @@ export class BattleView {
     cancelAnimationFrame(this.raf);
     this.ro?.disconnect();
     document.body.classList.remove('in-battle');
+    document.body.style.removeProperty('--battle-top');
     this.app.save.stats.playSeconds += (performance.now() - this.playStart) / 1000;
     this.root.remove();
   }
@@ -167,6 +168,8 @@ export class BattleView {
     const bottom = bottomBar + 4;
     this.root.style.setProperty('--hud-bottom', `${bottomBar}px`);
     this.root.style.setProperty('--hud-top', `${top - 4}px`);
+    // alerts (outside this root) sit just under the top bar, whatever its height
+    document.body.style.setProperty('--battle-top', `${top - 4}px`);
     const cam = this.renderer.cam;
     const w = Math.max(1, r.width);
     const hh = Math.max(1, r.height);
@@ -304,9 +307,14 @@ export class BattleView {
     this.renderStrip();
     this.updateHud(true);
     this.layout();
-    if (sq) {
-      const i = this.world.squads.indexOf(sq);
-      this.cards[i]?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
+    // keep the selected card in view when the strip narrows the card row (scroll the row only, never the page)
+    const card = sq ? this.cards[this.world.squads.indexOf(sq)] : null;
+    const row = this.els.cards;
+    if (card) {
+      const cr = card.getBoundingClientRect();
+      const rr = row.getBoundingClientRect();
+      if (cr.left < rr.left) row.scrollLeft -= rr.left - cr.left + 4;
+      else if (cr.right > rr.right) row.scrollLeft += cr.right - rr.right + 4;
     }
   }
 
@@ -570,13 +578,15 @@ export class BattleView {
   // ================================================================== loop
 
   /**
-   * True while a wave is under way but nobody has met the enemy yet: no missiles in the air, no ladders,
-   * no attacker inside the walls or within a few tiles of a defender. Reads the world only.
+   * True while nobody has met the enemy yet: no missiles in the air, no squad engaged, no attacker inside
+   * the walls or within a few tiles of a defender. Reads the world only.
    */
   private noContact(): boolean {
     const w = this.world;
+    // an intermission is not contact: the next wave's walk-in can be fast-forwarded from its first step
+    if (w.state === 'intermission') return true;
     if (w.state !== 'battle') return false;
-    if (w.projectiles.length || w.ladders.length) return false;
+    if (w.projectiles.length) return false;
     const g = w.grid;
     const near = 5 * TILE;
     let hit = false;

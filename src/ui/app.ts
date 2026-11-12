@@ -482,8 +482,12 @@ export class App {
           'button',
           {
             class: 'btn small',
-            disabled: packs >= MAX_PACKS || !affordable,
+            disabled: packs >= MAX_PACKS,
             onclick: () => {
+              if (!affordable) {
+                toast(`금화가 부족합니다 (보급 계획 ◉${fmt(cost + pr.pack)} / 보유 ◉${fmt(s.gold)}).`, 'warn');
+                return;
+              }
               p.extra[k] = extra + pr.per;
               audio.play('click');
               refresh();

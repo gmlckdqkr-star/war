@@ -1594,6 +1594,13 @@ html.reduce-motion * {
   .modes {
     grid-template-columns: 1fr;
   }
+  .inter {
+    max-width: calc(100vw - 16px);
+  }
+  .inter.with-council {
+    width: calc(100vw - 16px);
+    max-width: none;
+  }
   /* portrait: the order strip takes its own row above the cards */
   .hud-bottom.has-sel {
     flex-wrap: wrap;
@@ -1611,6 +1618,7 @@ html.reduce-motion * {
 /* alerts during battle sit top-right, clear of the enemy approach (west), the ability column and the controls;
    at most two at a time (see toast()) */
 .in-battle .toasts {
+  top: calc(var(--battle-top, 48px) + 4px);
   left: auto;
   right: calc(72px + var(--sar));
   transform: none;
