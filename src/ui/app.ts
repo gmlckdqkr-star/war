@@ -58,8 +58,9 @@ import { audio } from './audio';
 import { BattleView, squadNumbers, type BattleMode, type BattleSetup } from './battle';
 import { MAX_PACKS, careAll, careCosts, fitPlan, foodForecast, lineupStrength, packsOf, planCost, readyLineup, setWantedSize, wantedSize } from './prebattle';
 import { bar, clear, confirmBox, fmt, h, modal, stars, toast } from './dom';
+import { VERSION } from './version';
 
-export const VERSION = '1.0.0';
+export { VERSION };
 
 type Screen = 'home' | 'campaign' | 'barracks' | 'research' | 'chronicle' | 'shop' | 'settings' | 'help' | 'prebattle';
 
