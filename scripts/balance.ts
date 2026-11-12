@@ -81,7 +81,7 @@ function shop(s: SaveData, st: StageDef) {
 
 /**
  * Supply packs a sensible player buys: enough food for the forecast shown on the pre-battle screen,
- * and, when retrying a stage, an extra pack of arrows and of medicine.
+ * and, when retrying a stage with gold to spare, an extra pack of arrows and of medicine.
  */
 function buySupplies(s: SaveData, st: StageDef, lineup: string[], attempt: number): Partial<Supplies> {
   const extra: Partial<Supplies> = {};
@@ -96,7 +96,7 @@ function buySupplies(s: SaveData, st: StageDef, lineup: string[], attempt: numbe
   const base = baseSupplies(s, st);
   const short = foodNeeded(st, lineupSoldiers(s, lineup)) - base.food;
   if (short > 0) buy('food', Math.min(3, Math.ceil(short / SUPPLY_PRICE.food.per)));
-  if (attempt >= 2) {
+  if (attempt >= 2 && s.gold >= 300) {
     buy('arrows', 1);
     buy('meds', 1);
   }
@@ -171,6 +171,17 @@ function play(st: StageDef, battleSeed: number, attempt: number | 'farm') {
   return res.won;
 }
 
+/** ready soldiers over full squad sizes, across the roster */
+function armyStrength(s: SaveData) {
+  let ready = 0;
+  let full = 0;
+  for (const r of s.roster) {
+    ready += readyCount(r);
+    full += SQUAD_TYPES[r.type].size;
+  }
+  return full ? ready / full : 0;
+}
+
 let battles = 0;
 const attempts: Record<string, number> = {};
 for (const st of STAGES) {
@@ -180,8 +191,10 @@ for (const st of STAGES) {
     won = play(st, rng.int(1, 1e9), attempts[st.id]);
     battles++;
     if (!won && attempts[st.id] % 2 === 0 && st.index > 1) {
-      // farm the previous stage once (as a stuck player would)
-      play(STAGES[st.index - 2], rng.int(1, 1e9), 'farm');
+      // farm the previous stage once (as a stuck player would); a battered army under half strength
+      // goes further back to an easier castle to earn the recruits it needs
+      const back = armyStrength(save) < 0.5 ? Math.min(st.index - 1, 4) : 1;
+      play(STAGES[st.index - 1 - back], rng.int(1, 1e9), 'farm');
       battles++;
     }
   }
