@@ -31,12 +31,12 @@ export const COUNCIL_NAMES: Record<string, string> = {
 export const COUNCIL_IDS = Object.keys(COUNCIL_NAMES);
 
 /** share of a structure's full strength the masons put back ('repair') */
-export const REPAIR_FRAC = 0.4;
+export const REPAIR_FRAC = 0.3;
 /** intact gates are strengthened by this factor once ('gate') */
-export const GATE_BOOST = 1.5;
-export const REST_MORALE = 25;
+export const GATE_BOOST = 1.3;
+export const REST_MORALE = 20;
 /** share of their missing HP the soldiers recover while resting */
-export const REST_HEAL = 0.5;
+export const REST_HEAL = 0.4;
 export const SCOUT_MORALE = 10;
 
 const EDGE_KO: Record<Edge, string> = { W: '서쪽', N: '북쪽', S: '남쪽', E: '동쪽' };

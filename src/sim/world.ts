@@ -256,7 +256,7 @@ export interface BattleResult {
 export const ABILITY_INFO: Record<AbilityId, { name: string; cd: number; desc: string; needsTarget: boolean }> = {
   rally: { name: '함성', cd: 40, desc: '지점 주변 분대의 사기 +35, 도주 중인 분대를 붙잡음', needsTarget: true },
   volley: { name: '일제사격', cd: 28, desc: '사거리 안의 모든 궁수·석궁이 지정 지점에 화살비', needsTarget: true },
-  oil: { name: '끓는 기름', cd: 38, desc: '성벽·성문 앞 적에게 큰 화염 피해, 사다리 파괴', needsTarget: true },
+  oil: { name: '끓는 기름', cd: 46, desc: '성벽·성문 앞 적에게 큰 화염 피해, 사다리 파괴', needsTarget: true },
   reserve: { name: '증원', cd: 999, desc: '본성 앞에 민병대 10명 소집 (전투당 1회, 식량 10)', needsTarget: false },
 };
 
@@ -286,6 +286,10 @@ export const TREB_SPLASH_DMG = 14;
 export const TREB_SPLASH_R = 14;
 /** no battle runs longer than this (game seconds): the attackers lift the siege (endless mode excepted) */
 export const BATTLE_HARD_CAP = 900;
+/** boiling oil: fire damage to every climber and wall-foot attacker in the splash (x fire weakness, x2.5 vs giants) */
+export const OIL_DMG = 50;
+/** morale the scalded bands lose */
+export const OIL_MORALE = 6;
 const SUPPLY_NAMES: Record<keyof Supplies, string> = { food: '식량', arrows: '화살', mats: '자재', meds: '의약품' };
 
 /** extra reach (px) and damage multiplier for enemies inside the walls striking defenders on the wall top */
@@ -886,6 +890,19 @@ export class World {
     this.waveT = 0;
     this.pending = [...this.stage.waves[w].groups].sort((a, b) => a.delay - b.delay);
     this.state = 'battle';
+    // a supply train (endless) reaches the castle before every later wave, cleared or not
+    const sup = this.stage.resupply;
+    if (sup && w > 0) {
+      const got: string[] = [];
+      for (const k of ['food', 'arrows', 'mats', 'meds'] as const) {
+        const n = sup[k] ?? 0;
+        if (n <= 0) continue;
+        this.supplies[k] += n;
+        if (k === 'arrows') this.arrowsIn += n;
+        got.push(`${SUPPLY_NAMES[k]} +${n}`);
+      }
+      if (got.length) this.event('resupply', `보급 마차가 도착했습니다: ${got.join(', ')}`, 'info');
+    }
     // food ration per wave
     const mouths = Math.ceil(this.defs.filter((u) => u.state === ST.ACTIVE).length / 2);
     if (this.supplies.food >= mouths) {
@@ -933,18 +950,6 @@ export class World {
             this.supplies.arrows += rec;
             this.arrowsIn += rec;
             this.event('arrows', `전장에서 화살 ${rec}개를 회수했습니다.`, 'info');
-          }
-          const sup = this.stage.resupply;
-          if (sup) {
-            const got: string[] = [];
-            for (const k of ['food', 'arrows', 'mats', 'meds'] as const) {
-              const n = sup[k] ?? 0;
-              if (n <= 0) continue;
-              this.supplies[k] += n;
-              if (k === 'arrows') this.arrowsIn += n;
-              got.push(`${SUPPLY_NAMES[k]} +${n}`);
-            }
-            if (got.length) this.event('resupply', `보급 마차가 도착했습니다: ${got.join(', ')}`, 'info');
           }
           this.event('cleared', `물결을 막아냈습니다! 다음 공세까지 ${Math.round(this.interT)}초`, 'good');
           for (const sq of this.squads) sq.morale = Math.min(100, sq.morale + 10);
@@ -2915,11 +2920,11 @@ export class World {
         if (e.elev && e.state !== ST.CLIMB) continue;
         if (Math.hypot(e.x - ox, e.y - oy) > R) continue;
         e.fireDeath = true;
-        this.damage(e, 75 * (e.def.fireWeak ?? 1) * (e.def.big ? 2.5 : 1), 0.8, null, false);
+        this.damage(e, OIL_DMG * (e.def.fireWeak ?? 1) * (e.def.big ? 2.5 : 1), 0.8, null, false);
         e.fireDeath = false;
         if (e.band) hitBands.add(e.band);
       }
-      for (const b of hitBands) b.morale -= 12;
+      for (const b of hitBands) b.morale -= OIL_MORALE;
       for (const l of [...this.ladders]) if (Math.hypot(cx(l.tile) - ox, cy(l.tile) - oy) < R && !l.tower) this.removeLadder(l, true);
       for (let dy = -2; dy <= 2; dy++)
         for (let dx = -2; dx <= 2; dx++) {
@@ -3012,9 +3017,10 @@ export class World {
     const deployed = Math.max(1, this.stats.deployed);
     let stars = 0;
     if (won) {
+      // 3 stars ask for a well-held keep and few graves: a clean defence, often on a replay
       stars = 1;
-      if (keepPct >= 0.5 && dead / deployed <= 0.4) stars = 2;
-      if (keepPct >= 0.8 && dead / deployed <= 0.2) stars = 3;
+      if (keepPct >= 0.5 && dead / deployed <= 0.35) stars = 2;
+      if (keepPct >= 0.8 && dead / deployed <= 0.15) stars = 3;
     }
     return {
       won,

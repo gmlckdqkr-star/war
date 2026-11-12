@@ -186,7 +186,7 @@ export const STAGES: StageDef[] = [
     story: '용에게 쫓겨 남하한 오크 군단과 고블린 수행족. 수가 많다. 화살이 떨어지지 않도록 보급고를 지켜라.',
     factions: ['orc'],
     squadCap: 5,
-    level: 0.92,
+    level: 0.87,
     supplies: supplies(3),
     reward: 240,
     keepHp: 3600,
@@ -223,7 +223,7 @@ export const STAGES: StageDef[] = [
     story: '산을 되찾겠다는 딥홀드 씨족. 그들의 방패벽은 화살을 튕겨내고, 갱도병은 성벽 밑을 판다. 외성이 무너지면 내성으로 물러나라.',
     factions: ['dwarf'],
     squadCap: 6,
-    level: 0.96,
+    level: 0.89,
     supplies: supplies(4),
     reward: 280,
     keepHp: 3800,
@@ -272,7 +272,7 @@ export const STAGES: StageDef[] = [
     story: '불탄 숲의 복수를 외치는 실반 무리. 숲에서 쏘는 척후궁수는 성벽 궁수보다 멀리 쏜다. 노포와 탑을 활용하라.',
     factions: ['elf'],
     squadCap: 6,
-    level: 1.06,
+    level: 1.04,
     supplies: supplies(5),
     reward: 320,
     keepHp: 4000,
@@ -299,7 +299,7 @@ export const STAGES: StageDef[] = [
       { groups: [W('e_skirmish', 'W', NW, 0), W('e_skirmish', 'W', SW, 2), W('e_dancers', 'W', MIDW, 8, 2)] },
       { groups: [W('e_grove', 'W', MIDW, 0), W('e_skirmish', 'W', MIDW, 3), W('e_dancers', 'N', [20, 40], 10), W('e_skirmish', 'W', MIDW, 12)] },
       { groups: [W('e_grove', 'W', MIDW, 0), W('e_skirmish', 'W', MIDW, 4, 2), W('e_dancers', 'S', [20, 40], 8, 2)] },
-      { groups: [W('e_grove', 'W', NW, 0), W('e_grove', 'W', SW, 6), W('e_skirmish', 'W', MIDW, 3, 2), W('e_dancers', 'S', [20, 40], 12, 2)] },
+      { groups: [W('e_grove', 'W', NW, 0), W('e_grove', 'W', SW, 6), W('e_skirmish', 'W', MIDW, 3), W('e_dancers', 'S', [20, 40], 12, 2)] },
     ],
   },
   {
@@ -310,7 +310,7 @@ export const STAGES: StageDef[] = [
     story: '협약군과 오크 군단이 손을 잡았다. 서쪽, 북쪽, 남쪽 성문이 동시에 공격받는다. 예비대를 남겨두어라.',
     factions: ['human', 'orc'],
     squadCap: 7,
-    level: 1.08,
+    level: 1.0,
     supplies: supplies(6),
     reward: 360,
     keepHp: 4200,
@@ -349,7 +349,7 @@ export const STAGES: StageDef[] = [
     story: '늪지에 세운 옛 수도원. 해자가 적의 발을 묶지만, 바위 트롤은 아랑곳하지 않는다. 군단장을 쓰러뜨리면 군단이 흔들린다.',
     factions: ['orc'],
     squadCap: 7,
-    level: 1.12,
+    level: 1.0,
     supplies: supplies(7),
     reward: 400,
     keepHp: 4400,
@@ -389,7 +389,7 @@ export const STAGES: StageDef[] = [
     story: '협약군과 딥홀드가 공성 병기를 끌고 왔다. 투석기가 성벽을 무너뜨리기 전에 출격하거나, 공병으로 버텨라.',
     factions: ['human', 'dwarf'],
     squadCap: 8,
-    level: 1.22,
+    level: 1.14,
     supplies: supplies(8),
     reward: 460,
     keepHp: 4600,
@@ -430,7 +430,7 @@ export const STAGES: StageDef[] = [
     story: '잿불 고룡이 깨어났다. 용의 포효는 병사의 심장을 얼리고, 숨결은 성벽 위를 태운다. 노포를 아끼지 마라.',
     factions: ['wyrm'],
     squadCap: 8,
-    level: 1.5,
+    level: 1.34,
     supplies: supplies(9),
     reward: 540,
     keepHp: 4800,
@@ -458,8 +458,8 @@ export const STAGES: StageDef[] = [
       { groups: [W('c_kobolds', 'W', MIDW, 0, 2), W('c_cult', 'W', MIDW, 5), W('c_drakes', 'N', [30, 50], 10)] },
       { groups: [W('c_drakes', 'W', MIDW, 0), W('c_cult', 'N', [30, 50], 3), W('c_kobolds', 'S', [30, 50], 6), W('c_drakes', 'S', [30, 50], 8), W('c_cult', 'W', MIDW, 10)] },
       { groups: [W('c_cult', 'W', MIDW, 0, 2), W('c_kobolds', 'W', MIDW, 4), W('c_drakes', 'W', MIDW, 6), W('c_drakes', 'N', [30, 50], 10), W('c_cult', 'S', [30, 50], 12)] },
-      { groups: [W('c_dragon', 'W', MIDW, 0), W('c_kobolds', 'W', MIDW, 3, 2), W('c_cult', 'S', [30, 50], 6), W('c_drakes', 'N', [30, 50], 10)] },
-      { groups: [W('c_drakes', 'W', MIDW, 0, 2), W('c_cult', 'W', MIDW, 4), W('c_cult', 'N', [30, 50], 8, 2), W('c_kobolds', 'S', [30, 50], 10), W('c_kobolds', 'W', MIDW, 14)] },
+      { groups: [W('c_dragon', 'W', MIDW, 0), W('c_kobolds', 'W', MIDW, 3), W('c_cult', 'S', [30, 50], 6), W('c_drakes', 'N', [30, 50], 10)] },
+      { groups: [W('c_drakes', 'W', MIDW, 0, 2), W('c_cult', 'W', MIDW, 4), W('c_cult', 'N', [30, 50], 8), W('c_kobolds', 'S', [30, 50], 10), W('c_kobolds', 'W', MIDW, 14)] },
     ],
   },
   {
@@ -470,7 +470,7 @@ export const STAGES: StageDef[] = [
     story: '할드미어의 마지막 성. 다섯 세력이 한꺼번에 몰려온다. 외성이 무너져도 내성이 남아 있다. 깃발이 서 있는 한 끝나지 않았다.',
     factions: ['human', 'dwarf', 'elf', 'orc', 'wyrm'],
     squadCap: 9,
-    level: 1.45,
+    level: 1.33,
     supplies: supplies(10),
     reward: 700,
     keepHp: 5200,
@@ -499,7 +499,7 @@ export const STAGES: StageDef[] = [
       { groups: [W('o_warband', 'W', MIDW, 0, 2), W('o_swarm', 'S', [26, 50], 4), W('h_treb', 'W', MIDW, 6), W('o_javelins', 'N', [26, 50], 10)] },
       { groups: [W('w_ram', 'W', MIDW, 0), W('e_grove', 'N', [26, 50], 3), W('h_tower', 'W', MIDW, 6), W('w_sappers', 'S', [26, 50], 9), W('w_bolts', 'W', MIDW, 12)] },
       { groups: [W('c_drakes', 'W', MIDW, 0), W('o_troll', 'W', MIDW, 3), W('e_dancers', 'S', [26, 50], 5, 2), W('h_knights', 'W', MIDW, 10), W('h_escalade', 'N', [26, 50], 12)] },
-      { groups: [W('c_dragon', 'W', MIDW, 0), W('o_warband', 'W', MIDW, 4, 2), W('w_wall', 'N', [26, 50], 8), W('c_cult', 'S', [26, 50], 8), W('o_berserkers', 'W', MIDW, 14), W('h_company', 'W', MIDW, 16)] },
+      { groups: [W('c_dragon', 'W', MIDW, 0), W('o_warband', 'W', MIDW, 4, 2), W('w_wall', 'N', [26, 50], 8), W('c_cult', 'S', [26, 50], 8), W('o_berserkers', 'W', MIDW, 14)] },
     ],
   },
 ];
@@ -595,8 +595,8 @@ const ENDLESS_POOL: { band: string; from: number; weight: number }[] = [
 export const ENDLESS_CASTLES = ['s3', 's4', 's5', 's6', 's7', 's8', 's9', 's10'];
 /** bands per endless wave, and the extra enemy strength each wave adds */
 export const ENDLESS_BANDS = (w: number) => 2 + Math.floor(w * ENDLESS_BAND_GROWTH);
-export const ENDLESS_BAND_GROWTH = 0.45;
-export const ENDLESS_MUL_GROWTH = 0.035;
+export const ENDLESS_BAND_GROWTH = 0.27;
+export const ENDLESS_MUL_GROWTH = 0.022;
 
 /** Generate wave `w` (0-based) of the endless siege deterministically from a seed. */
 export function endlessWave(w: number, seed: number, lanes: Lane[] = [L('W', MIDW, 3), L('N', [20, 36]), L('S', [20, 36])]): Wave {
@@ -625,7 +625,7 @@ export function endlessWave(w: number, seed: number, lanes: Lane[] = [L('W', MID
   return { groups, maxTime: 110, intermission: 12, mul: 1 + ENDLESS_MUL_GROWTH * w };
 }
 
-export const ENDLESS_RESUPPLY: Partial<Supplies> = { food: 40, arrows: 450, mats: 70, meds: 3 };
+export const ENDLESS_RESUPPLY: Partial<Supplies> = { food: 45, arrows: 450, mats: 70, meds: 3 };
 
 export function endlessStage(seed: number): StageDef {
   const base = stageById(ENDLESS_CASTLES[(seed >>> 0) % ENDLESS_CASTLES.length]) ?? STAGES[5];

@@ -167,10 +167,15 @@ export function baseSupplies(s: SaveData, st: StageDef): Supplies {
 /**
  * Food the whole battle will need for a lineup of `soldiers` fighters (shared by the sim rule and the
  * pre-battle forecast). The sim deducts ceil(alive / 2) at the start of every wave, so this is the
- * worst case where nobody falls. Keep this in sync with World.startWave.
+ * worst case where nobody falls. A stage with a supply train (endless) brings `resupply.food` before
+ * every later wave, so only the part of each ration the train does not cover has to be in store.
+ * Keep this in sync with World.startWave.
  */
 export function foodNeeded(st: StageDef, soldiers: number): number {
-  return st.waves.length * Math.ceil(Math.max(0, soldiers) / 2);
+  const ration = Math.ceil(Math.max(0, soldiers) / 2);
+  const train = st.resupply?.food ?? 0;
+  if (!st.waves.length) return 0;
+  return ration + (st.waves.length - 1) * Math.max(0, ration - train);
 }
 
 /** Soldiers that would deploy for a lineup (ready = not wounded). */

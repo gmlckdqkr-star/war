@@ -3,7 +3,7 @@ import { GH, GW, Tile } from '../src/sim/defs';
 import { Grid, idx } from '../src/sim/grid';
 import { RNG } from '../src/sim/rng';
 import { ENDLESS_CASTLES, ENDLESS_RESUPPLY, STAGES, dailyChallenge, endlessStage, planWaves, swarmWave, type Edge, type StageDef } from '../src/sim/stages';
-import { COUNCIL_IDS, COUNCIL_NAMES, councilDesc } from '../src/sim/warcouncil';
+import { COUNCIL_IDS, COUNCIL_NAMES, GATE_BOOST, REPAIR_FRAC, councilDesc } from '../src/sim/warcouncil';
 import { josa } from '../src/sim/josa';
 import { ACT, BAND_STALL_T, BATTLE_HARD_CAP, DRAGON_MAX_STAY, DRAGON_PAIN_MAX, DRAGON_STAY_ALONE, GATE_SAFE_R, ST, TREB_SPLASH_DMG, World, isEngine, type Unit } from '../src/sim/world';
 import { newSave, newSquad } from '../src/meta/save';
@@ -629,7 +629,7 @@ describe('war council', () => {
     expect(w.chooseCouncil('repair')).toBe(false);
     expect(w.events.filter((e) => e.type === 'council').length).toBe(1);
 
-    // repair: damaged walls and gates get 40% of their strength back
+    // repair: damaged walls and gates get REPAIR_FRAC of their strength back
     const r = atCouncil('s6', 11, false);
     const g = r.grid;
     const wall = g.structTiles.find((i) => g.tiles[i] === Tile.WALL)!;
@@ -638,8 +638,8 @@ describe('war council', () => {
     g.hp[gate] = g.maxHp[gate] * 0.5;
     r.councilOffer = ['repair', 'rest', 'scout'];
     expect(r.chooseCouncil('repair')).toBe(true);
-    expect(g.hp[wall] / g.maxHp[wall]).toBeCloseTo(0.5, 5);
-    expect(g.hp[gate] / g.maxHp[gate]).toBeCloseTo(0.9, 5);
+    expect(g.hp[wall] / g.maxHp[wall]).toBeCloseTo(0.1 + REPAIR_FRAC, 5);
+    expect(g.hp[gate] / g.maxHp[gate]).toBeCloseTo(Math.min(1, 0.5 + REPAIR_FRAC), 5);
 
     // gate: a broken gate stands again, an intact one is stronger than before
     const q = atCouncil('s6', 11, false);
@@ -651,7 +651,8 @@ describe('war council', () => {
     q.councilOffer = ['gate', 'rest', 'scout'];
     expect(q.chooseCouncil('gate')).toBe(true);
     expect(gq.tiles[gates[0]]).toBe(Tile.GATE);
-    expect(gq.maxHp[gates[1]]).toBeCloseTo(full * 1.5, 3);
+    expect(gq.maxHp[gates[1]]).toBeCloseTo(full * GATE_BOOST, 3);
+    expect(gq.maxHp[gates[0]]).toBeCloseTo(q.gateBaseHp() * GATE_BOOST, 3);
     expect(gq.hp[gates[1]]).toBeCloseTo(gq.maxHp[gates[1]], 3);
 
     // scout: a report of the next wave, by side
@@ -851,24 +852,32 @@ describe('daily and endless', () => {
     expect(late.atkMul / first.atkMul).toBeCloseTo(st.waves[20].mul! / st.waves[0].mul!, 5);
   });
 
-  it('a supply train reaches the endless castle after every cleared wave', () => {
+  it('a supply train reaches the endless castle before every later wave, and the food forecast counts it', () => {
     const st = endlessStage(3);
     const s = armyFor(8);
-    s.settings.autoCommand = true;
-    const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, 11));
+    s.settings.autoCommand = false; // no council pick in between (forage would add food too)
+    const ids = defaultLineup(s, st);
+    const w = new World(battleConfig(s, st, ids, {}, 11));
     w.start();
+    expect(w.events.some((e) => e.type === 'resupply')).toBe(false);
     let food = w.supplies.food;
     let mats = w.supplies.mats;
-    while (w.state === 'battle' && w.t < 300) {
+    while (w.waveIdx === 0 && w.t < 400) {
       food = w.supplies.food;
       mats = w.supplies.mats;
       w.events.length = 0;
       w.step();
     }
-    expect(w.state).toBe('intermission');
+    expect(w.waveIdx).toBe(1);
     expect(w.events.some((e) => e.type === 'resupply')).toBe(true);
-    expect(w.supplies.food).toBe(food + ENDLESS_RESUPPLY.food!);
-    expect(w.supplies.mats).toBeCloseTo(mats + ENDLESS_RESUPPLY.mats!, 5);
+    const mouths = Math.ceil(w.defs.filter((u) => u.state === ST.ACTIVE).length / 2);
+    expect(w.supplies.food).toBe(food + ENDLESS_RESUPPLY.food! - mouths);
+    expect(w.supplies.mats).toBeGreaterThanOrEqual(mats + ENDLESS_RESUPPLY.mats! - 1);
+    // the forecast: one ration in store, then only what the train does not cover
+    const n = lineupSoldiers(s, ids);
+    const r = Math.ceil(n / 2);
+    expect(foodNeeded(st, n)).toBe(r + (st.waves.length - 1) * Math.max(0, r - ENDLESS_RESUPPLY.food!));
+    expect(foodNeeded(st, 2 * ENDLESS_RESUPPLY.food!)).toBe(ENDLESS_RESUPPLY.food!);
     // campaign castles get no train
     expect(STAGES.every((x) => !x.resupply)).toBe(true);
   });
