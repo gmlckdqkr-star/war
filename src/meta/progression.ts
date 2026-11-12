@@ -320,7 +320,8 @@ export function applyBattle(
         }
       }
       const tk = todayKey(now);
-      if (s.firstWinKey !== tk) {
+      // '>' (not '!=') so moving the device clock back never pays a daily bonus twice
+      if (tk > s.firstWinKey) {
         s.firstWinKey = tk;
         rw.bonusFirstWin = true;
         const b = 60 + st.index * 10;
@@ -335,7 +336,7 @@ export function applyBattle(
     rw.passXp = 80 + 40 * res.wavesCleared + (res.won ? 60 * res.stars : 0) + (rw.firstClear ? 200 : 0);
   } else if (mode === 'daily') {
     const tk = todayKey(now);
-    if (res.won && s.daily.lastKey !== tk) {
+    if (res.won && tk > s.daily.lastKey) {
       rw.medals += 20;
       rw.gold += 150;
       rw.lines.push('오늘의 공성 완료: 금화 150, 훈장 20');
@@ -433,19 +434,26 @@ export function checkAchievements(s: SaveData, res: BattleResult, st: StageDef, 
 export const SWEEPS_PER_DAY = 3;
 
 export function sweepsLeft(s: SaveData, now = new Date()) {
-  return s.sweep.key === todayKey(now) ? Math.max(0, SWEEPS_PER_DAY - s.sweep.n) : SWEEPS_PER_DAY;
+  // a date earlier than the last sweep (clock moved back) counts as the same day
+  return todayKey(now) > s.sweep.key ? SWEEPS_PER_DAY : Math.max(0, SWEEPS_PER_DAY - s.sweep.n);
 }
 
-/** Collect a replay reward for a 3-star stage without fighting. Requires the 'sweep' entitlement (checked by caller). */
-export function sweepStage(s: SaveData, st: StageDef, now = new Date()): { gold: number; passXp: number } | string {
+export const SWEEP_PASS_XP = 150;
+export const SWEEP_MEDALS = 2;
+
+/**
+ * Collect a replay of a 3-star stage without fighting (commander kit convenience; the caller checks the
+ * entitlement). Deliberately gives NO gold: gold only comes from battles, so nothing bought with money
+ * turns into battle power. Rewards: chronicle xp + a couple of medals.
+ */
+export function sweepStage(s: SaveData, st: StageDef, now = new Date()): { medals: number; passXp: number } | string {
   if ((s.stars[st.id] ?? 0) < 3) return '별 3개를 받은 성만 소탕할 수 있습니다.';
   if (sweepsLeft(s, now) <= 0) return '오늘의 소탕 횟수를 모두 썼습니다.';
   const tk = todayKey(now);
-  if (s.sweep.key !== tk) s.sweep = { key: tk, n: 0 };
+  if (tk > s.sweep.key) s.sweep = { key: tk, n: 0 };
   s.sweep.n++;
-  const gold = Math.round(st.reward * 0.6);
-  s.gold += gold;
+  s.medals += SWEEP_MEDALS;
   s.cleared[st.id] = (s.cleared[st.id] ?? 0) + 1;
-  addPassXp(s, 150, now);
-  return { gold, passXp: 150 };
+  addPassXp(s, SWEEP_PASS_XP, now);
+  return { medals: SWEEP_MEDALS, passXp: SWEEP_PASS_XP };
 }
