@@ -4,7 +4,7 @@ import { Grid, idx } from '../src/sim/grid';
 import { RNG } from '../src/sim/rng';
 import { STAGES, dailyChallenge, endlessStage } from '../src/sim/stages';
 import { josa } from '../src/sim/josa';
-import { ACT, DRAGON_MAX_STAY, DRAGON_PAIN_MAX, DRAGON_STAY_ALONE, ST, World, isEngine, type Unit } from '../src/sim/world';
+import { ACT, BAND_STALL_T, BATTLE_HARD_CAP, DRAGON_MAX_STAY, DRAGON_PAIN_MAX, DRAGON_STAY_ALONE, ST, World, isEngine, type Unit } from '../src/sim/world';
 import { newSave, newSquad } from '../src/meta/save';
 import { battleConfig, defaultLineup } from '../src/meta/progression';
 
@@ -16,7 +16,7 @@ function armyFor(stageIdx: number) {
   return s;
 }
 
-function runBattle(stageId: string, seed: number, maxT = 900) {
+function runBattle(stageId: string, seed: number, maxT = BATTLE_HARD_CAP + 60) {
   const st = STAGES.find((x) => x.id === stageId)!;
   const s = armyFor(st.index);
   s.settings.autoCommand = true;
@@ -176,6 +176,57 @@ describe('siege engines', () => {
   });
 });
 
+describe('stalemates', () => {
+  function lastWaveWith(band: string) {
+    const st = STAGES.find((x) => x.id === 's5')!;
+    const s = armyFor(5);
+    const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, 21));
+    w.start();
+    w.waveIdx = st.waves.length - 1; // pretend this is the final wave
+    w.pending = [];
+    w.spawnBand({ band, edge: 'W', span: [16, 18], delay: 0 }, 0);
+    return { w, b: w.bands[w.bands.length - 1] };
+  }
+
+  it('a band without progress first assaults, then withdraws — and a withdrawal ends the last wave as won', () => {
+    const { w, b } = lastWaveWith('h_levies');
+    w.step();
+    b.contactT = w.t - BAND_STALL_T - 1;
+    w.step();
+    expect(b.assault).toBe(true);
+    expect(b.units.some((u) => u.fleeing)).toBe(false);
+    b.contactT = w.t - BAND_STALL_T - 1;
+    w.step();
+    expect(b.units.every((u) => u.state !== ST.ACTIVE || u.fleeing)).toBe(true);
+    for (let i = 0; i < 5 && w.state === 'battle'; i++) w.step();
+    expect(w.state).toBe('won');
+  });
+
+  it('enemy archers carry a finite quiver and come forward once it is empty', () => {
+    const { w, b } = lastWaveWith('h_archers');
+    const bows = b.units.filter((u) => u.def.role === 'ranged');
+    expect(bows[0].ammo).toBeGreaterThan(0);
+    for (const u of bows) u.ammo = 0;
+    const g = w.grid;
+    const d0 = bows.reduce((a, u) => a + Math.hypot(u.x - g.keepX, u.y - g.keepY), 0);
+    for (let i = 0; i < 30 * 20; i++) w.step();
+    const live = bows.filter((u) => u.state === ST.ACTIVE);
+    expect(live.length).toBeGreaterThan(0);
+    const d1 = live.reduce((a, u) => a + Math.hypot(u.x - g.keepX, u.y - g.keepY), 0);
+    expect(d1 / live.length).toBeLessThan(d0 / bows.length - 5 * 16);
+    expect(w.projectiles.some((p) => p.side === 1 && p.kind === 'arrow')).toBe(false);
+  });
+
+  it('no battle runs past the hard cap', () => {
+    const { w } = lastWaveWith('e_skirmish');
+    w.t = BATTLE_HARD_CAP - 2;
+    for (let i = 0; i < 30 * 3 && w.state === 'battle'; i++) w.step();
+    expect(w.state).toBe('won');
+    expect(w.result!.won).toBe(true);
+    expect(w.t).toBeLessThanOrEqual(BATTLE_HARD_CAP + 1 / 30 + 1e-9);
+  });
+});
+
 describe('dragon', () => {
   /** s9 with the dragon band spawned straight away (other bands skipped) */
   function dragonWorld() {
@@ -278,6 +329,7 @@ describe('battle simulation', () => {
   it.each(STAGES.map((s) => [s.id]))('%s runs to completion with sane state', (id) => {
     const w = runBattle(id, 1000 + Number(id.slice(1)));
     expect(['won', 'lost']).toContain(w.state);
+    expect(w.t).toBeLessThanOrEqual(BATTLE_HARD_CAP + 1e-6); // ended by itself, never by the test's surrender
     for (const u of w.units) {
       expect(Number.isFinite(u.x) && Number.isFinite(u.y)).toBe(true);
       expect(Number.isFinite(u.hp)).toBe(true);

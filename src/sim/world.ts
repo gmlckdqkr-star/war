@@ -147,6 +147,10 @@ export interface Band {
   formed: boolean;
   /** battle time the band broke (-1 while it holds) */
   brokenT: number;
+  /** last time a member dealt damage, fought in melee, climbed, dug or rammed */
+  contactT: number;
+  /** stalled once: everyone advances, archers stop hanging back */
+  assault: boolean;
 }
 
 export interface Ladder {
@@ -265,6 +269,14 @@ export const DRAGON_PAIN_DECAY = 6;
 /** longest a dragon stays over the battlefield, and how long it lingers once its retinue has broken (s) */
 export const DRAGON_MAX_STAY = 150;
 export const DRAGON_STAY_ALONE = 45;
+
+/** a band that has neither dealt damage nor been in melee for this long assaults (or, if weak, withdraws) */
+export const BAND_STALL_T = 75;
+/** missiles an enemy archer / crossbowman / javelin thrower carries; stones a trebuchet brings */
+export const ENEMY_QUIVER = 40;
+export const TREB_STONES = 24;
+/** no battle runs longer than this (game seconds): the attackers lift the siege (endless mode excepted) */
+export const BATTLE_HARD_CAP = 900;
 
 /** rams, siege towers and trebuchets: crewed machines with their own morale */
 export function isEngine(u: Unit) {
@@ -751,6 +763,7 @@ export class World {
     for (const k in this.alertCd) this.alertCd[k] -= dt;
     this.cleanup();
     this.checkEnd();
+    if (this.t >= BATTLE_HARD_CAP && this.stage.id !== 'endless' && (this.state === 'battle' || this.state === 'intermission')) this.liftSiege();
     if (this.fx.length > 3000) this.fx.splice(0, this.fx.length - 1500);
     if (this.events.length > 200) this.events.splice(0, this.events.length - 100);
   }
@@ -907,6 +920,8 @@ export class World {
       pace: 0,
       formed: false,
       brokenT: -1,
+      contactT: this.t,
+      assault: false,
     };
     const list: string[] = [];
     if (tpl.leader) list.push(tpl.leader);
@@ -937,6 +952,8 @@ export class World {
       u.maxHp = u.hp = def.hp * this.hpScale;
       u.atkMul = this.atkScale;
       u.band = band;
+      if (def.role === 'ranged') u.ammo = u.maxAmmo = ENEMY_QUIVER;
+      else if (def.role === 'treb') u.ammo = u.maxAmmo = TREB_STONES;
       u.spawnX = g.edge === 'W' ? -20 : px;
       u.spawnY = g.edge === 'N' ? -20 : g.edge === 'S' ? WORLD_H + 20 : py;
       if (def.leader && !band.leader) band.leader = u;
@@ -1032,12 +1049,54 @@ export class World {
 
   updateBandMorale(b: Band, dt: number) {
     if (b.convoy) this.updateConvoy(b);
-    if (b.broken) return;
     let alive = 0;
-    for (const u of b.units) if (u.state === ST.ACTIVE || u.state === ST.CLIMB) alive++;
+    let fighting = 0;
+    for (const u of b.units)
+      if (u.state === ST.ACTIVE || u.state === ST.CLIMB) {
+        alive++;
+        if (!u.fleeing) fighting++;
+      }
     if (alive === 0) return;
+    if (fighting > 0 && this.t - b.contactT > BAND_STALL_T) this.bandStalled(b, fighting);
+    if (b.broken) return;
     if (b.leader && b.leader.state === ST.ACTIVE && b.morale < b.tpl.morale) b.morale = Math.min(b.tpl.morale, b.morale + (b.leader.def.aura ?? 0) * 0.6 * dt);
     if (b.morale < 15) this.breakBand(b);
+  }
+
+  /** No progress for a long while: a strong band storms the walls, a weak (or already stalled) one withdraws. */
+  bandStalled(b: Band, fighting: number) {
+    b.contactT = this.t;
+    let x = 0;
+    let y = 0;
+    let n = 0;
+    for (const u of b.units)
+      if ((u.state === ST.ACTIVE || u.state === ST.CLIMB) && !u.fleeing) {
+        x += u.x;
+        y += u.y;
+        n++;
+      }
+    if (n) {
+      x /= n;
+      y /= n;
+    }
+    if (!b.broken && !b.assault && fighting >= Math.max(3, b.startCount * 0.35)) {
+      b.assault = true;
+      this.endConvoy(b);
+      this.event('assault', `${josa(b.tpl.name, '이/가')} 총공격에 나섭니다!`, 'warn', x, y);
+      return;
+    }
+    // withdraw: everyone still standing leaves the field (the dragon keeps its own counsel)
+    for (const u of b.units) {
+      if (u.state !== ST.ACTIVE || u.fleeing || u.def.role === 'dragon') continue;
+      if (isEngine(u)) this.engineRetreat(u);
+      else u.fleeing = true;
+    }
+    if (!b.broken) {
+      b.broken = true;
+      b.brokenT = this.t;
+    }
+    this.endConvoy(b);
+    this.event('withdraw', `${josa(b.tpl.name, '이/가')} 싸움을 포기하고 물러납니다.`, 'good', x, y);
   }
 
   /** Convoy bookkeeping: anchor on the core, forward direction along its path, pace of the slowest member. */
@@ -1850,8 +1909,9 @@ export class World {
         if (this.rng.chance(0.03)) this.fx.push({ k: 'eheal', x: w.x, y: w.y });
       }
     }
-    const ranged = e.def.range > 0;
+    const ranged = e.def.range > 0 && e.ammo >= 1;
     const noFight = role === 'ram' || role === 'tower';
+    const assault = !!e.band && e.band.assault;
     const convoy = e.escortIdx >= 0 && e.band && e.band.convoy ? e.band : null;
     if (!noFight && (e.retarget <= 0 || (e.target && e.target.state !== ST.ACTIVE))) {
       e.retarget = 0.35 + this.rng.next() * 0.25;
@@ -1861,7 +1921,7 @@ export class World {
     if (t && t.state === ST.ACTIVE && !noFight) {
       const d = Math.hypot(t.x - e.x, t.y - e.y);
       if (ranged) {
-        if (e.def.kite) {
+        if (e.def.kite && !assault) {
           const threat = this.dHash.best(e.x, e.y, 2.6 * T, (o) => (o.def.range === 0 && o.elev === e.elev ? 0 : Infinity));
           if (threat) {
             const ax = e.x - threat.x;
@@ -1875,7 +1935,7 @@ export class World {
           e.fx = (t.x - e.x) / (d || 1);
           e.fy = (t.y - e.y) / (d || 1);
           if (e.cd <= 0) this.enemyShoot(e, t);
-          return;
+          if (!assault) return; // storming: shoot on the move
         }
       } else {
         const reach = e.def.r + t.def.r + e.def.reach + 1;
@@ -1983,6 +2043,7 @@ export class World {
 
   enemyShoot(e: Unit, t: Unit) {
     e.cd = e.def.cd * this.rng.range(0.9, 1.2);
+    e.ammo -= 1;
     const d = Math.hypot(t.x - e.x, t.y - e.y);
     let acc = e.def.proj === 'bolt' ? 0.78 : 0.7;
     acc *= 1 - 0.3 * (d / (e.def.range * T));
@@ -2039,6 +2100,7 @@ export class World {
       return;
     }
     if (role === 'ram' && e.band) this.endConvoy(e.band); // at the gate: escorts join the assault
+    if (e.band) e.band.contactT = this.t;
     if (e.cd <= 0) {
       e.cd = e.def.cd * this.rng.range(0.9, 1.1);
       let dmg = this.structDamageOf(e);
@@ -2052,6 +2114,7 @@ export class World {
   enemyAction(e: Unit, dt: number) {
     const g = this.grid;
     const n = e.actTile;
+    if (e.band) e.band.contactT = this.t;
     if (e.act === ACT.PLANT) {
       if (g.tiles[n] !== Tile.WALL || this.ladderAt(n)) {
         e.act = ACT.DONE_LADDER;
@@ -2095,6 +2158,7 @@ export class World {
   }
 
   updateClimb(e: Unit, dt: number) {
+    if (e.band) e.band.contactT = this.t;
     const lad = this.ladderAt(e.actTile);
     if (!lad) {
       // ladder pushed or tower destroyed: fall
@@ -2118,6 +2182,7 @@ export class World {
   }
 
   attackKeep(e: Unit) {
+    if (e.band) e.band.contactT = this.t;
     if (e.cd > 0) return;
     e.cd = e.def.cd * this.rng.range(0.9, 1.1);
     const dmg = e.def.role === 'ram' ? (e.def.sdmg ?? 60) * 0.6 * e.atkMul : e.def.atk * e.atkMul * Math.max(0.5, e.def.sdmg ?? 0.5) * 0.6;
@@ -2160,6 +2225,10 @@ export class World {
       return;
     }
     if (e.cd > 0) return;
+    if (e.ammo < 1) {
+      this.engineRetreat(e); // out of stones: nothing left to do here
+      return;
+    }
     e.cd = e.def.cd * this.rng.range(0.9, 1.1);
     // choose a structure in range, prefer gates and damaged walls near the current aim
     let best = -1;
@@ -2186,6 +2255,8 @@ export class World {
     }
     const txp = keep ? g.keepX : cx(best) + this.rng.range(-5, 5);
     const typ = keep ? g.keepY : cy(best) + this.rng.range(-5, 5);
+    e.ammo -= 1;
+    if (e.band) e.band.contactT = this.t; // a working battery is pressing the siege
     this.projectiles.push({
       x: e.x,
       y: e.y,
@@ -2249,6 +2320,7 @@ export class World {
             if (this.moveToward(e, g.keepX, g.keepY) || Math.hypot(g.keepX - e.x, g.keepY - e.y) < 2 * T) {
               if (e.cd <= 0) {
                 e.cd = e.def.cd;
+                if (e.band) e.band.contactT = this.t;
                 this.keepHp -= e.def.atk * e.atkMul * 0.6;
                 if (this.keepHp <= 0) {
                   this.keepHp = 0;
@@ -2330,6 +2402,7 @@ export class World {
         }
         this.fx.push({ k: 'breath', x: e.x, y: e.y, a: ang });
         if (Math.hypot(g.keepX - e.x, g.keepY - e.y) < 5 * T) {
+          if (e.band) e.band.contactT = this.t;
           this.keepHp -= dmgTick * 1.5;
           if (this.keepHp <= 0) {
             this.keepHp = 0;
@@ -2366,6 +2439,8 @@ export class World {
     let eff = dmg * (1 - armor * (1 - ap));
     if (ranged && t.def.rangedResist) eff *= t.def.rangedResist;
     if (ranged && t.screened) eff *= 0.5; // the escort's shields catch half of it
+    if (src && src.side === 1 && src.band) src.band.contactT = this.t; // the attackers are making headway
+    else if (src && src.side === 0 && !ranged && t.band) t.band.contactT = this.t; // locked in melee
     if (t.side === 0 && t.squad && t.squad.routing) eff *= 1.25;
     if (t.fleeing) eff *= 1.2;
     t.hp -= eff;
@@ -2741,6 +2816,13 @@ export class World {
   checkEnd() {
     if (this.state === 'won' || this.state === 'lost') return;
     if (this.keepHp <= 0) this.finish(false);
+  }
+
+  /** Hard time cap reached with the keep still standing: the attackers give up and march away. */
+  liftSiege() {
+    for (const e of this.enemies) if (e.state === ST.ACTIVE || e.state === ST.CLIMB) e.fleeing = true;
+    this.event('siegeend', '긴 공방 끝에 적이 공성을 포기하고 물러갑니다!', 'good');
+    this.finish(true);
   }
 
   finish(won: boolean) {
