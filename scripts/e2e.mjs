@@ -177,7 +177,7 @@ async function run() {
   check('result recorded', s1.stats.battles === 1, `won=${won} gold=${s1.gold} stars=${JSON.stringify(s1.stars)}`);
   await page.click('.result-buttons .btn.primary');
   await page.waitForTimeout(200);
-  check('back to campaign after result', (await state()).screen === 'campaign' && !(await state()).battle);
+  check('result continues to next castle or map', ['campaign', 'prebattle'].includes((await state()).screen) && !(await state()).battle, (await state()).screen);
   await shot('08_campaign');
 
   // ---------------------------------------------------------------- 3. persistence

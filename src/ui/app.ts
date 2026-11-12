@@ -513,7 +513,7 @@ export class App {
     return rw;
   }
 
-  exitBattle(view: BattleView, res: BattleResult | null, retry: boolean, to: Screen = 'campaign') {
+  exitBattle(view: BattleView, res: BattleResult | null, retry: boolean, to: Screen | 'next' = 'campaign') {
     view.destroy();
     this.battle = null;
     if (retry && this.pre) {
@@ -523,14 +523,15 @@ export class App {
       this.go('prebattle');
       return;
     }
-    if (res && res.won && this.pre?.mode === 'campaign') {
+    if (to === 'next' && this.pre) {
       const nextSt = STAGES.find((x) => x.index === this.pre!.stage.index + 1);
-      if (nextSt && to === 'campaign') {
-        this.go('campaign');
+      if (nextSt) {
+        this.openStage(nextSt);
         return;
       }
+      to = 'campaign';
     }
-    this.go(to);
+    this.go(to === 'next' ? 'campaign' : to);
   }
 
   // ================================================================== barracks

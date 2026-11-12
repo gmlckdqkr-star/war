@@ -1,0 +1,53 @@
+# 출시 체크리스트
+
+## 상태 구분
+
+| 항목 | 상태 | 근거 |
+|---|---|---|
+| 전투 시뮬레이션·AI·10개 성·일일·무한 모드 | **테스트됨** | `npm test` (단위 41개), 밸런스 봇 캠페인 전 구간 완주 |
+| 휴대폰 화면 UI·터치 조작 | **테스트됨 (헤드리스 Chromium, 844×390 터치)** | `npm run e2e` 25개 항목 |
+| 저장·백업·손상 복구·저장 코드 | **테스트됨** | 단위 테스트 + E2E(손상 → 백업 복구) |
+| 웹 체험판 결제(테스트용 MockIAP) | **테스트됨** | E2E: 연대기·후원 구매 → 권한 부여 |
+| 실제 스토어 결제 (`NativeIAP`, cordova-plugin-purchase v13) | **구현됨 · 미검증** | 스토어 계정·테스트 트랙이 있어야 검증 가능 |
+| Android/iOS 앱 포장 (Capacitor) | **설계됨** | `capacitor.config.json`만 준비. 클라우드 환경에 Android SDK 없음 |
+| 실제 휴대폰 성능 | **미검증** | 데스크톱 Chromium: 시뮬 평균 0.14–0.26 ms/스텝, 렌더 ~0.5 ms/프레임 (휴대폰은 수 배 느림 추정) |
+
+## 사용자가 직접 해야 하는 일 (대신 할 수 없음)
+
+1. **개발자 계정**: Google Play Console(1회 등록비), Apple Developer Program(연회비).
+2. **앱 ID 결정**: `capacitor.config.json`의 `appId`(현재 `com.example.ashenramparts`)를 본인 도메인 기반으로 변경.
+3. **서명 키 생성·보관**: Android 업로드 키(keystore). 분실하면 업데이트 불가 → 안전한 곳에 백업.
+4. **인앱 상품 등록** (모두 *비소모성*):
+   - `supporter_small`, `supporter_large`, `bundle_castles`, `commander_kit`
+   - `chronicle_s01` … `chronicle_s24` (시즌 프리미엄, 시즌 1 = 2026-12-01 시작, 6주 간격)
+5. **개인정보처리방침 URL**: 수집 항목 없음 문구로 충분 (아래 초안). 스토어 등록 시 필수.
+6. **콘텐츠 등급 설문**: 판타지 전투 폭력(피 표현 있음, 도형 수준), 확률형 아이템 없음, 광고 없음.
+7. **실기기 테스트**: 저가형 Android 1대 + iPhone 1대에서 10분 플레이, 결제 테스트 트랙에서 구매→삭제→재설치→구매 복원.
+
+## 앱으로 포장하기 (Android 기준, 개발 PC에서)
+
+```bash
+npm ci
+npm run build
+npm i -D @capacitor/cli @capacitor/core @capacitor/android
+npx cap add android
+npm i cordova-plugin-purchase && npx cap sync android
+# android/app/src/main/AndroidManifest.xml 의 MainActivity 에 가로 고정:
+#   android:screenOrientation="sensorLandscape"
+# android:allowBackup="true" 유지 (기기 백업으로 진행 상황 자동 이전)
+npx cap open android   # Android Studio 에서 서명된 AAB 생성
+```
+
+iOS도 동일하게 `@capacitor/ios` → `npx cap add ios` → Xcode에서 가로 방향만 체크.
+
+## 개인정보처리방침 초안
+
+> 「잿빛 성벽」은 이용자의 개인정보를 수집·저장·전송하지 않습니다. 게임 진행 데이터는 이용자의 기기에만 저장되며,
+> 광고·분석 도구를 사용하지 않습니다. 인앱 결제는 Google Play / App Store가 처리하며 개발자는 결제 정보를 받지 않습니다.
+> 문의: (이메일 주소)
+
+## 출시 후 운영
+
+- 정기 작업 없음. 시즌·주간 진열·오늘의 공성은 날짜로 자동 회전.
+- 2029년 하반기(시즌 24 종료) 이후 프리미엄 시즌을 계속하려면: 상품 ID 추가 등록 + `MAX_REGISTERED_SEASONS` 상향 업데이트 1회.
+- 문의 대응 표준 답변: ① 상점/설정의 "구매 복원" ② 설정 → "저장 코드 복사/불러오기" ③ 설정 → "오류 기록 복사".

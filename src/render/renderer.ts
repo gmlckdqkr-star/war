@@ -1121,8 +1121,8 @@ export class Renderer {
       ctx.lineTo(x, y - 12 * s);
       ctx.stroke();
       // flag with cosmetic pattern
-      const fw = 13 * s;
-      const fh = 9 * s;
+      const fw = 15 * s;
+      const fh = 10 * s;
       const fx0 = x;
       const fy0 = y - 12 * s;
       const wave = Math.sin(this.time * 3 + sq.id) * 1.2 * s;
@@ -1134,13 +1134,29 @@ export class Renderer {
       ctx.lineTo(fx0, fy0 + fh);
       ctx.closePath();
       ctx.fill();
+      if (!sq.routing) {
+        // heraldic pattern from the equipped banner cosmetic
+        ctx.save();
+        ctx.clip();
+        this.drawPattern(fx0, fy0 + wave / 2, fw, fh, s);
+        ctx.restore();
+      }
+      ctx.beginPath();
+      ctx.moveTo(fx0, fy0);
+      ctx.lineTo(fx0 + fw, fy0 + wave);
+      ctx.lineTo(fx0 + fw, fy0 + fh + wave);
+      ctx.lineTo(fx0, fy0 + fh);
+      ctx.closePath();
       ctx.strokeStyle = sel ? '#ffe08a' : 'rgba(0,0,0,0.6)';
       ctx.lineWidth = sel ? 1.6 * s : 0.8 * s;
       ctx.stroke();
-      ctx.fillStyle = this.theme.bannerCharge;
       ctx.font = `bold ${7 * s}px sans-serif`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
+      ctx.lineWidth = 2 * s;
+      ctx.strokeStyle = 'rgba(0,0,0,0.65)';
+      ctx.strokeText(sq.type.short, fx0 + fw / 2, fy0 + fh / 2 + wave / 2 + 0.5 * s);
+      ctx.fillStyle = '#fff';
       ctx.fillText(sq.type.short, fx0 + fw / 2, fy0 + fh / 2 + wave / 2 + 0.5 * s);
       // morale bar
       const mw = 14 * s;
@@ -1160,6 +1176,65 @@ export class Renderer {
         ctx.fillText('!', x - 4 * s, fy0 + fh / 2);
       }
     }
+  }
+
+  private drawPattern(x: number, y: number, w: number, h: number, s: number) {
+    const ctx = this.ctx;
+    ctx.fillStyle = this.theme.bannerCharge;
+    ctx.strokeStyle = this.theme.bannerCharge;
+    ctx.globalAlpha = 0.75;
+    const cx0 = x + w / 2;
+    const cy0 = y + h / 2;
+    switch (this.theme.bannerPattern) {
+      case 'cross':
+        ctx.fillRect(cx0 - 1.2 * s, y, 2.4 * s, h);
+        ctx.fillRect(x, cy0 - 1.2 * s, w, 2.4 * s);
+        break;
+      case 'saltire':
+        ctx.lineWidth = 2.2 * s;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x + w, y + h);
+        ctx.moveTo(x + w, y);
+        ctx.lineTo(x, y + h);
+        ctx.stroke();
+        break;
+      case 'chevron':
+        ctx.lineWidth = 2.4 * s;
+        ctx.beginPath();
+        ctx.moveTo(x, y + h);
+        ctx.lineTo(cx0, y + h * 0.3);
+        ctx.lineTo(x + w, y + h);
+        ctx.stroke();
+        break;
+      case 'quarter':
+        ctx.fillRect(x, y, w / 2, h / 2);
+        ctx.fillRect(cx0, cy0, w / 2, h / 2);
+        break;
+      case 'pale':
+        ctx.fillRect(x + w / 3, y, w / 3, h);
+        break;
+      case 'star': {
+        ctx.beginPath();
+        for (let k = 0; k < 10; k++) {
+          const r = (k % 2 ? 1.6 : 3.8) * s;
+          const a = -Math.PI / 2 + (k * Math.PI) / 5;
+          ctx.lineTo(cx0 + Math.cos(a) * r, cy0 + Math.sin(a) * r);
+        }
+        ctx.closePath();
+        ctx.fill();
+        break;
+      }
+      case 'tower':
+        ctx.fillRect(cx0 - 2.5 * s, cy0 - 1.5 * s, 5 * s, 5 * s);
+        ctx.fillRect(cx0 - 2.5 * s, cy0 - 3 * s, 1.4 * s, 1.6 * s);
+        ctx.fillRect(cx0 - 0.7 * s, cy0 - 3 * s, 1.4 * s, 1.6 * s);
+        ctx.fillRect(cx0 + 1.1 * s, cy0 - 3 * s, 1.4 * s, 1.6 * s);
+        break;
+      default:
+        ctx.fillRect(x, y + h - 2 * s, w, 2 * s);
+    }
+    ctx.globalAlpha = 1;
   }
 
   private drawPings(dt: number) {

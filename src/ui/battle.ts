@@ -822,7 +822,9 @@ export class BattleView {
         { class: 'result-buttons' },
         h('button', { class: 'btn ghost', onclick: () => this.app.exitBattle(this, res, true) }, '다시 도전'),
         h('button', { class: 'btn ghost', onclick: () => this.app.exitBattle(this, res, false, 'barracks') }, '병영'),
-        h('button', { class: 'btn primary', onclick: () => this.app.exitBattle(this, res, false) }, '계속'),
+        won && this.setup.mode === 'campaign' && this.setup.stage.index < 10
+          ? h('button', { class: 'btn primary', onclick: () => this.app.exitBattle(this, res, false, 'next') }, '다음 성 ›')
+          : h('button', { class: 'btn primary', onclick: () => this.app.exitBattle(this, res, false) }, '계속'),
       ),
     );
     this.root.append(h('div', { class: 'result-back' }, panel));
