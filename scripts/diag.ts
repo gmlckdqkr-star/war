@@ -5,7 +5,7 @@
 declare const process: { argv: string[] };
 import { GW, TILE } from '../src/sim/defs';
 import { STAGES } from '../src/sim/stages';
-import { World } from '../src/sim/world';
+import { BATTLE_HARD_CAP, World } from '../src/sim/world';
 import { newSave, newSquad } from '../src/meta/save';
 import { battleConfig, defaultLineup } from '../src/meta/progression';
 
@@ -21,7 +21,7 @@ s.roster.push(newSquad(s, 'engineer'), newSquad(s, 'archer'), newSquad(s, 'spear
 const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, seed));
 w.start();
 let next = 0;
-while ((w.state === 'battle' || w.state === 'intermission') && w.t < 900) {
+while ((w.state === 'battle' || w.state === 'intermission') && w.t < BATTLE_HARD_CAP + 60) {
   w.step();
   if (w.t >= next) {
     next += 10;

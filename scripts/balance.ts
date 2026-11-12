@@ -7,7 +7,7 @@
 import { SQUAD_TYPES, type SquadTypeId } from '../src/sim/defs';
 import { RNG } from '../src/sim/rng';
 import { STAGES, type StageDef } from '../src/sim/stages';
-import { World } from '../src/sim/world';
+import { BATTLE_HARD_CAP, World } from '../src/sim/world';
 import { newSave, type SaveData } from '../src/meta/save';
 import {
   UPGRADES,
@@ -67,7 +67,7 @@ function play(st: StageDef, battleSeed: number) {
   const w = new World(cfg);
   w.start();
   const t0 = Date.now();
-  while ((w.state === 'battle' || w.state === 'intermission') && w.t < 900) w.step();
+  while ((w.state === 'battle' || w.state === 'intermission') && w.t < BATTLE_HARD_CAP + 60) w.step();
   if (!w.result) w.surrender();
   const res = w.result!;
   const rw = applyBattle(save, st, res, 'campaign', new Date(2027, 0, 1 + save.stats.battles));

@@ -82,8 +82,6 @@ class Heap {
   }
 }
 
-const heap = new Heap(GW * GH * 4);
-
 export interface Field {
   dist: Float64Array;
   next: Int32Array;
@@ -104,6 +102,14 @@ export class Grid {
   keepAdj = new Uint8Array(GW * GH);
   /** number of ladders/siege towers docked against this wall tile */
   ladders = new Uint8Array(GW * GH);
+  /**
+   * 1 = tile belongs to the castle's original wall line (wall, tower or gate when the stage was built).
+   * Only these may count as boundary when broken, be rebuilt, or take wall deployments; decorative
+   * rubble scattered in the field is plain outside ground.
+   */
+  wallLine = new Uint8Array(GW * GH);
+  /** 1 = this intact gate is barred: enemies are at it, so defenders cannot pass either */
+  gateShut = new Uint8Array(GW * GH);
   keepTiles: number[] = [];
   depots: number[] = [];
   infirmaries: number[] = [];
@@ -111,6 +117,8 @@ export class Grid {
   keepX = 0;
   keepY = 0;
   version = 0;
+  /** path-search scratch heap, owned by this grid (no shared module state) */
+  private heap = new Heap(GW * GH * 4);
 
   get(x: number, y: number): TileId {
     return this.tiles[idx(x, y)] as TileId;
@@ -131,7 +139,8 @@ export class Grid {
   /** wall line tiles that count as castle boundary (not plain outside ground) */
   isBoundary(i: number) {
     const t = this.tiles[i];
-    return t === Tile.WALL || t === Tile.TOWER || t === Tile.GATE || t === Tile.GATE_BROKEN || t === Tile.RUBBLE;
+    if (t === Tile.RUBBLE) return this.wallLine[i] === 1;
+    return t === Tile.WALL || t === Tile.TOWER || t === Tile.GATE || t === Tile.GATE_BROKEN;
   }
   outsideGround(i: number) {
     return !this.inside[i] && !this.isBoundary(i);
@@ -245,6 +254,11 @@ export class Grid {
         if (inb(nx, ny)) seed(idx(nx, ny));
       }
     }
+    this.wallLine.fill(0);
+    for (let i = 0; i < this.n; i++) {
+      const t = this.tiles[i];
+      if (t === Tile.WALL || t === Tile.TOWER || t === Tile.GATE || t === Tile.GATE_BROKEN) this.wallLine[i] = 1;
+    }
     this.inside.fill(0);
     for (let i = 0; i < this.n; i++) {
       const inf = TILE_INFO[this.tiles[i]];
@@ -282,6 +296,7 @@ export class Grid {
     const ib = TILE_INFO[tb];
     if (!ib.dpass) return false;
     if (a === b) return true;
+    if (tb === Tile.GATE && this.gateShut[b]) return false; // barred: step off it, never onto it
     const elevA = this.isElev(a);
     const elevB = ib.elev;
     // cannot climb a wall from outside ground, cannot jump off a wall to outside ground
@@ -325,6 +340,7 @@ export class Grid {
   /** Reverse Dijkstra from keep-adjacent tiles. dist = cost-to-keep for enemies walking there. */
   enemyField(kind: FieldKind, f: Field) {
     const { dist, next } = f;
+    const heap = this.heap;
     dist.fill(Infinity);
     next.fill(-1);
     heap.clear();
@@ -375,6 +391,7 @@ export class Grid {
   /** Multi-source Dijkstra for defenders toward a set of goal tiles. */
   defenderField(goals: number[], f: Field) {
     const { dist, next } = f;
+    const heap = this.heap;
     dist.fill(Infinity);
     next.fill(-1);
     heap.clear();
@@ -424,7 +441,11 @@ export class Grid {
     let qi = 0;
     while (qi < q.length && out.length < count) {
       const i = q[qi++];
-      const ok = TILE_INFO[this.tiles[i]].dpass && this.isElev(i) === elev && (insideDest ? this.inside[i] || this.isBoundary(i) : true);
+      const ok =
+        TILE_INFO[this.tiles[i]].dpass &&
+        this.isElev(i) === elev &&
+        (insideDest ? this.inside[i] || this.isBoundary(i) : true) &&
+        !(this.tiles[i] === Tile.GATE && this.gateShut[i]);
       if (ok) out.push(i);
       else if (i !== dest) continue;
       const x = tx(i);

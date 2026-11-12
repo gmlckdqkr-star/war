@@ -38,6 +38,8 @@ export interface StageDef {
   factions: FactionId[];
   squadCap: number;
   level: number; // enemy stat scaling
+  /** extra multiplier on enemy HP and attack alike (daily '정예군'); level alone scales attack by √level */
+  enemyMul?: number;
   supplies: Supplies;
   reward: number; // gold for first clear (3 stars), scaled by stars
   keepHp: number;
@@ -373,7 +375,7 @@ export const STAGES: StageDef[] = [
       { groups: [W('h_tower', 'W', MIDW, 0), W('w_sappers', 'N', [20, 40], 4), W('h_company', 'W', MIDW, 6)] },
       { groups: [W('w_ram', 'W', MIDW, 0), W('h_treb', 'W', NW, 3), W('h_treb', 'W', SW, 3), W('w_bolts', 'W', MIDW, 6, 2)] },
       { groups: [W('h_knights', 'W', MIDW, 0), W('w_wall', 'S', [20, 40], 3, 2), W('h_escalade', 'N', [20, 40], 6, 2)] },
-      { groups: [W('h_tower', 'W', NW, 0), W('h_tower', 'W', SW, 2), W('w_ram', 'W', MIDW, 6), W('w_sappers', 'S', [20, 40], 8, 2), W('h_company', 'W', MIDW, 10, 2)] },
+      { groups: [W('h_tower', 'W', NW, 0), W('h_tower', 'W', SW, 2), W('w_ram', 'W', MIDW, 6), W('w_sappers', 'S', [20, 40], 8), W('h_company', 'W', MIDW, 10)] },
     ],
   },
   {
@@ -567,7 +569,8 @@ export function dailyChallenge(dateKey: string, maxClearedIndex: number): { stag
     name: `오늘의 공성: ${base.name}`,
     subtitle: mod.name,
     story: `${mod.name} — ${mod.desc}. 하루 한 번 보상을 받을 수 있습니다.`,
-    level: base.level * (mod.id === 'elite' ? 1.3 : 1),
+    level: base.level,
+    enemyMul: mod.id === 'elite' ? 1.3 : undefined,
     supplies: sup,
     waves,
     abilities: ['rally', 'volley', 'oil', 'reserve'],
