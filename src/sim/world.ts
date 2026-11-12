@@ -267,14 +267,22 @@ export const DRAGON_FLEE_HP = 0.35;
 export const DRAGON_PAIN_MAX = 8;
 export const DRAGON_PAIN_DECAY = 6;
 /** longest a dragon stays over the battlefield, and how long it lingers once its retinue has broken (s) */
-export const DRAGON_MAX_STAY = 150;
-export const DRAGON_STAY_ALONE = 45;
+export const DRAGON_MAX_STAY = 120;
+export const DRAGON_STAY_ALONE = 30;
+/**
+ * breath damage per 0.2 s tick, as a fraction of the dragon's attack. The dragon now stays until it is
+ * hurt, harried or tired (several passes, not one or two), so each pass burns less than it used to.
+ */
+export const DRAGON_BREATH = 0.13;
 
 /** a band that has neither dealt damage nor been in melee for this long assaults (or, if weak, withdraws) */
 export const BAND_STALL_T = 75;
 /** missiles an enemy archer / crossbowman / javelin thrower carries; stones a trebuchet brings */
 export const ENEMY_QUIVER = 40;
-export const TREB_STONES = 24;
+export const TREB_STONES = 16;
+/** a trebuchet stone is a wall-breaker: men within TREB_SPLASH_R px of the impact take TREB_SPLASH_DMG (x attack scale) */
+export const TREB_SPLASH_DMG = 14;
+export const TREB_SPLASH_R = 14;
 /** no battle runs longer than this (game seconds): the attackers lift the siege (endless mode excepted) */
 export const BATTLE_HARD_CAP = 900;
 
@@ -1233,7 +1241,8 @@ export class World {
       if (c.state === ST.ACTIVE && !c.fleeing)
         for (const u of b.units)
           if (u.escortIdx >= 0 && u.state === ST.ACTIVE && !u.fleeing && (u.x - c.x) ** 2 + (u.y - c.y) ** 2 < R2 + c.def.r * c.def.r * 4) near++;
-      c.screened = near >= 2;
+      // a miner at work sits at the wall foot, right under the archers: the shields cannot cover him there
+      c.screened = near >= 2 && c.act !== ACT.DIG;
     }
   }
 
@@ -2374,7 +2383,7 @@ export class World {
       dur: 2.3,
       target: null,
       side: 1,
-      dmg: 30 * e.atkMul,
+      dmg: TREB_SPLASH_DMG * e.atkMul,
       ap: 0.5,
       kind: 'stone',
       structTile: keep ? -1 : best,
@@ -2488,7 +2497,7 @@ export class World {
       if (e.timer <= 0) {
         e.timer = 0.2;
         const L = 5.5 * T;
-        const dmgTick = e.def.atk * e.atkMul * 0.2;
+        const dmgTick = e.def.atk * e.atkMul * DRAGON_BREATH;
         this.dHash.each(e.x, e.y, L, (d) => {
           const a = Math.atan2(d.y - e.y, d.x - e.x);
           let da = Math.abs(a - ang);
@@ -2694,9 +2703,9 @@ export class World {
       } else if (p.structTile >= 0) this.damageStruct(p.structTile, (p.src?.def.sdmg ?? 120) * (p.src?.atkMul ?? 1));
       this.fx.push({ k: 'boom', x: p.tx, y: p.ty });
       const hit = (u: Unit) => {
-        if (Math.hypot(u.x - p.tx, u.y - p.ty) < 22) this.damage(u, p.dmg, 0.5, p.src, false);
+        if (Math.hypot(u.x - p.tx, u.y - p.ty) < TREB_SPLASH_R) this.damage(u, p.dmg, 0.5, p.src, false);
       };
-      this.dHash.each(p.tx, p.ty, 22, hit);
+      this.dHash.each(p.tx, p.ty, TREB_SPLASH_R, hit);
       return;
     }
     if (p.area) {

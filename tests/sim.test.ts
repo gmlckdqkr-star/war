@@ -4,7 +4,7 @@ import { Grid, idx } from '../src/sim/grid';
 import { RNG } from '../src/sim/rng';
 import { STAGES, dailyChallenge, endlessStage } from '../src/sim/stages';
 import { josa } from '../src/sim/josa';
-import { ACT, BAND_STALL_T, BATTLE_HARD_CAP, DRAGON_MAX_STAY, DRAGON_PAIN_MAX, DRAGON_STAY_ALONE, GATE_SAFE_R, ST, World, isEngine, type Unit } from '../src/sim/world';
+import { ACT, BAND_STALL_T, BATTLE_HARD_CAP, DRAGON_MAX_STAY, DRAGON_PAIN_MAX, DRAGON_STAY_ALONE, GATE_SAFE_R, ST, TREB_SPLASH_DMG, World, isEngine, type Unit } from '../src/sim/world';
 import { newSave, newSquad } from '../src/meta/save';
 import { battleConfig, defaultLineup } from '../src/meta/progression';
 
@@ -157,6 +157,22 @@ describe('siege engines', () => {
     expect(stones).toBeGreaterThan(2);
   });
 
+  it('a stone bruises the men beside its impact but cannot cut down a whole squad', () => {
+    const { w, core } = lone('s8', 'h_treb');
+    const treb = core[0];
+    w.step(); // spatial hashes are built in the step
+    const sq = w.squads.find((q) => q.units.filter((u) => u.state === ST.ACTIVE && u.elev).length >= 6)!;
+    const men = sq.units.filter((u) => u.state === ST.ACTIVE);
+    const x = men.reduce((a, u) => a + u.x, 0) / men.length;
+    const y = men.reduce((a, u) => a + u.y, 0) / men.length;
+    const hp0 = men.map((u) => u.hp);
+    w.land({ x, y, sx: x, sy: y, tx: x, ty: y, t: 0, dur: 1, target: null, side: 1, dmg: TREB_SPLASH_DMG * treb.atkMul, ap: 0.5, kind: 'stone', structTile: -1, area: true, src: treb, keep: false });
+    const hurt = men.filter((u, k) => u.hp < hp0[k]).length;
+    expect(hurt).toBeGreaterThan(0);
+    expect(hurt).toBeLessThan(men.length / 2);
+    expect(men.every((u) => u.state === ST.ACTIVE)).toBe(true);
+  });
+
   it('a siege tower docks against the wall', () => {
     const { w, core } = lone('s8', 'h_tower');
     const tower = core[0];
@@ -165,14 +181,19 @@ describe('siege engines', () => {
     expect(w.ladders.some((l) => l.tower === tower)).toBe(true);
   });
 
-  it('screened sappers reach the wall and dig', () => {
+  it('screened sappers reach the wall and dig, but are exposed while digging', () => {
     const { w, core } = lone('s4', 'w_sappers', 3, ['w_wall']);
     let dug = false;
+    let screenedOnTheWay = false;
     for (let i = 0; i < 30 * 120 && !dug; i++) {
       w.step();
+      if (core.some((u) => u.screened)) screenedOnTheWay = true;
       dug = core.some((u) => u.act === ACT.DIG);
     }
+    expect(screenedOnTheWay).toBe(true);
     expect(dug).toBe(true);
+    for (let i = 0; i < 15; i++) w.step();
+    for (const u of core) if (u.act === ACT.DIG) expect(u.screened).toBe(false);
   });
 });
 
