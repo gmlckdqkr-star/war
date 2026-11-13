@@ -395,6 +395,45 @@ describe('siege engines', () => {
     expect(w.mineProg[wall]).toBe(0);
   });
 
+  it('two miners at one wall tile dig one tunnel: no faster than one miner', () => {
+    const { w, core } = lone('s4', 'w_sappers', 3);
+    const g = w.grid;
+    w.step();
+    const wall = idx(30, 14);
+    const [a, b] = core;
+    w.handleObstacle(a, wall);
+    w.handleObstacle(b, wall);
+    expect(a.act).toBe(ACT.DIG);
+    expect(b.act).toBe(ACT.DIG);
+    let took = 0;
+    for (let i = 0; i < 30 * (SAPPER_DIG_T + 2) && g.tiles[wall] === Tile.WALL; i++) {
+      a.hp = a.maxHp;
+      b.hp = b.maxHp;
+      w.step();
+      took += 1 / 30;
+    }
+    expect(g.tiles[wall]).toBe(Tile.RUBBLE);
+    expect(took).toBeGreaterThan(SAPPER_DIG_T - 0.5);
+  });
+
+  it('a gallery left half dug when the assault ends is filled in before the next wave', () => {
+    const { w, core } = lone('s4', 'w_sappers', 3);
+    w.step();
+    const wall = idx(30, 14);
+    const [a] = core;
+    w.handleObstacle(a, wall);
+    for (let i = 0; i < 30 * 5; i++) {
+      a.hp = a.maxHp;
+      w.step();
+    }
+    expect(w.mineProg[wall]).toBeGreaterThan(4);
+    for (const e of w.enemies) if (e.state === ST.ACTIVE) w.killEnemy(e, null);
+    for (let i = 0; i < 30 * 120 && w.waveIdx === 0; i++) w.step();
+    expect(w.waveIdx).toBe(1);
+    expect(w.mineProg[wall]).toBe(0);
+    expect(w.events.some((e) => e.type === 'minefilled')).toBe(true);
+  });
+
   it('crossbowmen who have shot their quivers empty go home instead of hacking at the gate', () => {
     const { w, b } = lone('s4', 'w_bolts', 1);
     const g = w.grid;

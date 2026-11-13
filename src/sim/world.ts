@@ -299,7 +299,9 @@ export const BREATH_HALF = 0.5;
  * mark of every archer in range, and the squads' council sends spearmen to the wall walk above him,
  * where stones dropped on the mantlet hit him hard (a blow from the wall walk x SAPPER_STONES instead of
  * the usual x0.6 against men below). Boiling oil does the rest. The gallery stays dug when he falls
- * (World.mineProg): the next miner at that stretch of wall carries on.
+ * (World.mineProg): the next miner at that stretch of wall carries on. One gallery is one tunnel: more
+ * miners at the same wall tile do not dig it any faster. Between waves the garrison fills in what was
+ * left half dug, so a mine has to be finished within one assault.
  */
 export const SAPPER_DIG_T = 16;
 export const SAPPER_COVER = 0.8;
@@ -368,6 +370,8 @@ export class World {
   fire: Float32Array = new Float32Array(GW * GH);
   /** seconds of mining already dug under each wall tile: a gallery stays dug when its miner falls */
   mineProg: Float32Array = new Float32Array(GW * GH);
+  /** sim time a gallery was last dug (one miner's work per tile per tick) */
+  mineT: Float64Array = new Float64Array(GW * GH).fill(-1);
   fx: Fx[] = [];
   events: GameEvent[] = [];
   dirtyTiles: number[] = [];
@@ -951,6 +955,17 @@ export class World {
   startWave(w: number) {
     // an open war council is decided (auto-commander) or lapses before the rations are handed out
     if (this.state === 'intermission') closeCouncil(this);
+    // galleries nobody is digging any more are filled in between the assaults
+    if (w > 0) {
+      let filled = 0;
+      for (let i = 0; i < this.mineProg.length; i++) {
+        if (this.mineProg[i] <= 0) continue;
+        if (this.activeEnemies.some((e) => e.act === ACT.DIG && e.actTile === i && e.state === ST.ACTIVE)) continue;
+        this.mineProg[i] = 0;
+        filled++;
+      }
+      if (filled) this.event('minefilled', '수비대가 반쯤 파인 갱도를 메웠습니다.', 'good');
+    }
     this.waveIdx = w;
     this.waveT = 0;
     this.pending = [...this.stage.waves[w].groups].sort((a, b) => a.delay - b.delay);
@@ -2534,8 +2549,12 @@ export class World {
         e.act = ACT.NONE;
         return;
       }
-      e.timer -= dt;
-      this.mineProg[n] += dt;
+      // one tunnel per wall tile: a second miner at the same spot is a relief, not twice the speed
+      if (this.mineT[n] !== this.t) {
+        this.mineT[n] = this.t;
+        this.mineProg[n] += dt;
+      }
+      e.timer = Math.max(0, SAPPER_DIG_T - this.mineProg[n]);
       if (this.rng.chance(0.08)) this.fx.push({ k: 'dust', x: e.x, y: e.y });
       if (e.timer <= 0) {
         e.act = ACT.NONE;
