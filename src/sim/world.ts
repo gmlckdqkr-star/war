@@ -310,7 +310,7 @@ export const BREATH_REACT = 0.6;
  * miners at the same wall tile do not dig it any faster. Between waves the garrison fills in what was
  * left half dug, so a mine has to be finished within one assault.
  */
-export const SAPPER_DIG_T = 16;
+export const SAPPER_DIG_T = 12;
 export const SAPPER_COVER = 0.8;
 export const SAPPER_STONES = 2.4;
 
