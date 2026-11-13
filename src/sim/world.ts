@@ -283,15 +283,27 @@ export const DRAGON_MAX_STAY = 240;
  * hurt, harried or tired (several passes, not one or two), so each pass burns less than it used to.
  */
 export const DRAGON_BREATH = 0.13;
+/**
+ * A fire pot that bursts on the stone of a wall walk or tower burns out after this long (s); on the
+ * ground (grass, timber, a courtyard) it burns 2.5-3 s. Wall-top cover then means something against
+ * cultists: a miss no longer leaves a fire burning under the merlons for as long as a hit does.
+ */
+export const POT_FIRE_STONE = 1.2;
+/** the breath's cone: how far it reaches (px) and its half-angle (rad) */
+export const BREATH_LEN = 5.5 * TILE;
+export const BREATH_HALF = 0.5;
 
 /**
  * A sapper's mine takes this long to dig (s). He works at the wall foot under a timber mantlet that
- * catches a good part of the missiles (ranged damage x SAPPER_COVER), so archers must keep at him or
- * catch him on the way in; boiling oil and men striking down from the wall walk do the rest. The gallery
- * stays dug when he falls (World.mineProg): the next miner at that stretch of wall carries on.
+ * catches some of the missiles (ranged damage x SAPPER_COVER), but a miner at work is still the first
+ * mark of every archer in range, and the squads' council sends spearmen to the wall walk above him,
+ * where stones dropped on the mantlet hit him hard (a blow from the wall walk x SAPPER_STONES instead of
+ * the usual x0.6 against men below). Boiling oil does the rest. The gallery stays dug when he falls
+ * (World.mineProg): the next miner at that stretch of wall carries on.
  */
-export const SAPPER_DIG_T = 12;
-export const SAPPER_COVER = 0.6;
+export const SAPPER_DIG_T = 16;
+export const SAPPER_COVER = 0.8;
+export const SAPPER_STONES = 2.4;
 
 /** a band that has neither dealt damage nor been in melee for this long assaults (or, if weak, withdraws) */
 export const BAND_STALL_T = 75;
@@ -393,6 +405,8 @@ export class World {
   activeEnemies: Unit[] = [];
   downed: Unit[] = [];
   terrorUnits: Unit[] = [];
+  /** dragons breathing fire this tick (defenders step out of the cone) */
+  breathing: Unit[] = [];
   hpScale: number;
   atkScale: number;
   up: Record<string, number>;
@@ -818,6 +832,8 @@ export class World {
       else if (u.state === ST.DOWN) this.downed.push(u);
     }
     for (const u of this.enemies) if (u.state === ST.ACTIVE || u.state === ST.CLIMB) this.activeEnemies.push(u);
+    this.breathing.length = 0;
+    for (const e of this.activeEnemies) if (e.def.role === 'dragon' && e.fState === 1 && !e.fleeing) this.breathing.push(e);
     this.dHash.build(this.activeDefs);
     this.eHash.build(this.activeEnemies);
     if (this.fieldsDirty && this.t - this.lastFieldT > 0.35) this.recomputeFields();
@@ -1558,7 +1574,72 @@ export class World {
       u.moveT = 0;
       return true;
     }
+    // the post is burning (or in a dragon's breath): wait beside it instead of walking back into the flames
+    if (d < 3 * T && this.tileDanger(tileAt(u.slotX, u.slotY)) > 0) {
+      u.moveT = 0;
+      return true;
+    }
     return this.walkField(u, sq.field, u.slotX, u.slotY);
+  }
+
+  /**
+   * How dangerous a tile is to stand on: 1 if it burns, plus 1 (more toward the axis) for every dragon
+   * breathing a cone over it. 0 = safe.
+   */
+  tileDanger(i: number): number {
+    let d = this.fire[i] > 0 ? 1 : 0;
+    if (this.breathing.length) {
+      const x = cx(i);
+      const y = cy(i);
+      for (const e of this.breathing) {
+        const dx = x - e.x;
+        const dy = y - e.y;
+        // the dragon drifts forward as it breathes: a little margin on the reach and the angle
+        if (dx * dx + dy * dy > (BREATH_LEN + T) ** 2) continue;
+        let da = Math.abs(Math.atan2(dy, dx) - Math.atan2(e.fy, e.fx));
+        if (da > Math.PI) da = Math.PI * 2 - da;
+        const half = BREATH_HALF + 0.2;
+        if (da < half) d += 1 + (half - da);
+      }
+    }
+    return d;
+  }
+
+  /**
+   * Fire and breath are the soldiers' own business (GAME_DESIGN §5: micro is the AI's): a defender on a
+   * burning tile or in a dragon's breath steps to the safest neighbouring tile. He keeps to his level
+   * (a single step stays inside even a holding squad's 1.3-tile leash); off the wall walk he goes only
+   * down into the courtyard, and only when nothing on the wall is safer. No RNG. Returns true if he moves.
+   */
+  avoidDanger(u: Unit): boolean {
+    const g = this.grid;
+    const ti = tileAt(u.x, u.y);
+    const here = this.tileDanger(ti);
+    if (here <= 0) return false;
+    const x = tx(ti);
+    const y = ty(ti);
+    const el = g.isElev(ti);
+    let best = -1;
+    let bs = Infinity;
+    for (const [dx, dy] of N8) {
+      const xx = x + dx;
+      const yy = y + dy;
+      if (!inb(xx, yy)) continue;
+      const j = idx(xx, yy);
+      if (!g.defCanMove(ti, j)) continue;
+      const down = g.isElev(j) !== el;
+      if (down && !(el && g.inside[j] === 1)) continue;
+      const dj = this.tileDanger(j);
+      if (dj >= here) continue;
+      const s = dj * 600 + (down ? 300 : 0) + Math.hypot(cx(j) - u.slotX, cy(j) - u.slotY) + Math.hypot(dx, dy) * 4;
+      if (s < bs) {
+        bs = s;
+        best = j;
+      }
+    }
+    if (best < 0) return false;
+    this.moveToward(u, cx(best), cy(best));
+    return true;
   }
 
   /** Is there an intact structure (or keep/cliff) between two ground points? */
@@ -1651,6 +1732,8 @@ export class World {
       return;
     }
     const role = u.def.role;
+    // an engineer at work stays at it (putting out a burning wall is his job); everyone else steps clear
+    if (!(role === 'engineer' && sq.taskTile >= 0) && this.avoidDanger(u)) return;
     if (role === 'engineer' && this.engineerAI(u, sq)) return;
     if (role === 'surgeon' && this.surgeonAI(u)) return;
     this.combatAI(u, sq);
@@ -1719,8 +1802,9 @@ export class World {
         if (e.state === ST.CLIMB || (e.elev && g.inside[tileAt(u.x, u.y)] !== 1)) s *= 0.55;
         if (e.elev) s *= 0.6;
         const r = e.def.role;
-        // a miner at work is under his mantlet: no longer the easy mark he was on the way in
         if ((r === 'ladder' || r === 'sapper') && !e.screened && e.act !== ACT.DIG) s *= 0.6;
+        // a miner at work under the wall is the first mark: every second he digs brings the wall down
+        if (r === 'sapper' && e.act === ACT.DIG) s *= 0.45;
         if (e.def.leader) s *= 0.8;
         // the dragon is the one target worth an armoured hide's worth of arrows: every wound harries it
         if (e.def.role === 'dragon') s *= 0.4;
@@ -1816,7 +1900,8 @@ export class World {
     let dmg = u.def.atk * u.atkMul * mul * this.moraleMul(u.squad);
     if (u.hp < u.maxHp * 0.35) dmg *= 0.75;
     if (t.state === ST.CLIMB) dmg *= 1.6;
-    if (u.elev && !t.elev && !t.def.flying) dmg *= 0.6;
+    // striking down from the wall walk is awkward, except stones dropped on a miner's mantlet at the wall foot
+    if (u.elev && !t.elev && !t.def.flying) dmg *= t.act === ACT.DIG ? SAPPER_STONES : 0.6;
     if (t.def.cavalry && u.def.antiCav) dmg *= u.def.antiCav;
     if (u.def.cavalry && u.moveT > 0.8) {
       dmg *= 1.9;
@@ -2722,13 +2807,13 @@ export class World {
       e.timer -= dt;
       if (e.timer <= 0) {
         e.timer = 0.2;
-        const L = 5.5 * T;
+        const L = BREATH_LEN;
         const dmgTick = e.def.atk * e.atkMul * DRAGON_BREATH;
         this.dHash.each(e.x, e.y, L, (d) => {
           const a = Math.atan2(d.y - e.y, d.x - e.x);
           let da = Math.abs(a - ang);
           if (da > Math.PI) da = Math.PI * 2 - da;
-          if (da < 0.5) {
+          if (da < BREATH_HALF) {
             d.fireDeath = true;
             this.damage(d, dmgTick, 0.6, e, false);
             d.fireDeath = false;
@@ -2948,7 +3033,7 @@ export class World {
         this.damage(t, p.dmg, p.ap, p.src, ranged);
         if (p.kind === 'fire') {
           const i = tileAt(t.x, t.y);
-          this.fire[i] = Math.max(this.fire[i], 3);
+          this.fire[i] = Math.max(this.fire[i], this.grid.isElev(i) ? POT_FIRE_STONE : 3);
         }
         return;
       }
@@ -2960,7 +3045,7 @@ export class World {
     if (stray && this.rng.chance(0.5)) this.damage(stray, p.dmg * 0.7, p.ap, p.src, ranged);
     if (p.kind === 'fire') {
       const i = tileAt(p.tx, p.ty);
-      this.fire[i] = Math.max(this.fire[i], 2.5);
+      this.fire[i] = Math.max(this.fire[i], this.grid.isElev(i) ? POT_FIRE_STONE * 0.8 : 2.5);
     }
   }
 

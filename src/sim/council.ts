@@ -7,7 +7,7 @@
 import { GH, GW, TILE, Tile, UNITS } from './defs';
 import { cx, cy, idx, inb, tileAt, tx, ty } from './grid';
 import type { Squad, World } from './world';
-import { ST } from './world';
+import { ACT, ST } from './world';
 
 const T = TILE;
 const CS = 4; // threat cell size in tiles
@@ -81,6 +81,11 @@ export function findThreats(w: World): Threat[] {
           break;
         }
       }
+    }
+    if (e.def.role === 'sapper' && e.act === ACT.DIG) {
+      // a mine going in under the wall: men to the wall walk right above it, to drop stones on the mantlet
+      wgt = 6;
+      standTile = e.actTile;
     }
     if (!wgt) continue;
     if (e.def.big) wgt *= 4;

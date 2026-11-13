@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { GH, GW, TILE_INFO, Tile } from '../src/sim/defs';
-import { Grid, SPAWN_GAP, idx, tileAt } from '../src/sim/grid';
+import { Grid, SPAWN_GAP, cx, cy, idx, tileAt } from '../src/sim/grid';
+import { findThreats } from '../src/sim/council';
 import { RNG } from '../src/sim/rng';
 import { ENDLESS_CASTLES, ENDLESS_RESUPPLY, STAGES, dailyChallenge, endlessStage, planWaves, swarmWave, type Edge, type StageDef } from '../src/sim/stages';
 import { COUNCIL_IDS, COUNCIL_NAMES, GATE_BOOST, REPAIR_FRAC, councilDesc } from '../src/sim/warcouncil';
 import { josa } from '../src/sim/josa';
-import { ACT, BAND_STALL_T, BATTLE_HARD_CAP, CAP_HOLD_N, KEEP_PRESS_MAX, KEEP_PRESS_T, SAPPER_COVER, SAPPER_DIG_T, DRAGON_FLEE_HP, DRAGON_MAX_STAY, DRAGON_PAIN_DMG, DRAGON_PAIN_MAX, GARRISON_GRACE, GATE_SAFE_R, ST, TOWER_EMPTY_T, TREB_SPLASH_DMG, World, isEngine, type Unit } from '../src/sim/world';
+import { ACT, BAND_STALL_T, BATTLE_HARD_CAP, CAP_HOLD_N, KEEP_PRESS_MAX, KEEP_PRESS_T, SAPPER_COVER, SAPPER_DIG_T, SAPPER_STONES, POT_FIRE_STONE, BREATH_HALF, BREATH_LEN, DRAGON_FLEE_HP, DRAGON_MAX_STAY, DRAGON_PAIN_DMG, DRAGON_PAIN_MAX, GARRISON_GRACE, GATE_SAFE_R, ST, TOWER_EMPTY_T, TREB_SPLASH_DMG, World, isEngine, type Unit } from '../src/sim/world';
 import { newSave, newSquad } from '../src/meta/save';
 import { LEVY_BELOW, LEVY_MAX_SQUADS, UPGRADES, applyBattle, baseSupplies, battleConfig, defaultLineup, foodNeeded, lineupSoldiers, upgradeCost } from '../src/meta/progression';
 
@@ -216,7 +217,7 @@ describe('siege engines', () => {
     expect(w.ladders.some((l) => l.tower === tower)).toBe(true);
   });
 
-  it('a digging sapper works under a mantlet: missiles do less damage, a blow from the wall walk full', () => {
+  it('a digging sapper works under a mantlet: missiles do less damage, a ground blow full', () => {
     const { w, core } = lone('s4', 'w_sappers', 3);
     const sap = core[0];
     const bow = w.defs.find((u) => u.def.id === 'd_xbow')!;
@@ -232,6 +233,66 @@ describe('siege engines', () => {
     expect(shot).toBeCloseTo(blow * SAPPER_COVER, 5);
     expect(SAPPER_COVER).toBeLessThan(1);
     expect(SAPPER_DIG_T).toBeGreaterThanOrEqual(8);
+  });
+
+  it('stones from the wall walk hit a digging miner hard; the same blow on a man below who is not digging is weak', () => {
+    const { w, core } = lone('s4', 'w_sappers', 3);
+    const sap = core[0];
+    w.step();
+    const spear = w.defs.find((u) => u.def.id === 'd_spear')!;
+    spear.elev = true;
+    sap.elev = false;
+    const blow = (dig: boolean) => {
+      sap.act = dig ? ACT.DIG : ACT.NONE;
+      sap.hp = sap.maxHp;
+      spear.cd = 0;
+      w.meleeHit(spear, sap, 1);
+      return sap.maxHp - sap.hp;
+    };
+    const stones = blow(true);
+    const plain = blow(false);
+    expect(plain).toBeGreaterThan(0);
+    expect(stones / plain).toBeCloseTo(SAPPER_STONES / 0.6, 5);
+    expect(SAPPER_STONES).toBeGreaterThan(1);
+  });
+
+  it('a miner at work is every archer\'s first mark, and the squads send men to the wall walk above him', () => {
+    const { w, core } = lone('s4', 'w_sappers', 3);
+    const g = w.grid;
+    w.step();
+    const [a, b] = core;
+    for (const e of w.enemies) if (e !== a && e !== b) e.state = ST.FLED;
+    const wall = idx(30, 14);
+    expect(g.tiles[wall]).toBe(Tile.WALL);
+    // two miners at the wall foot, mirrored about an archer's line of sight: one digs, one does not
+    const bow = w.defs.find((u) => u.def.id === 'd_archer' || u.def.id === 'd_xbow')!;
+    a.x = a.px = cx(wall) - 16;
+    a.y = a.py = cy(wall);
+    b.x = b.px = cx(wall) - 16;
+    b.y = b.py = cy(wall) + 2 * 16;
+    bow.x = bow.px = cx(wall) + 3 * 16;
+    bow.y = bow.py = cy(wall) + 16;
+    for (const u of [a, b]) {
+      u.screened = false;
+      u.elev = false;
+    }
+    w.handleObstacle(a, wall);
+    expect(a.act).toBe(ACT.DIG);
+    w.activeEnemies.length = 0;
+    w.activeEnemies.push(a, b);
+    w.eHash.build(w.activeEnemies);
+    expect(w.pickRangedTarget(bow, bow.squad!)).toBe(a);
+    // the council marks the mine as a threat at the wall walk right above it
+    const th = findThreats(w);
+    expect(th.length).toBeGreaterThan(0);
+    expect(Math.hypot(th[0].x - cx(wall), th[0].y - cy(wall))).toBeLessThan(16);
+    // and an auto melee squad is sent there
+    for (let i = 0; i < 30; i++) {
+      a.hp = a.maxHp;
+      w.step();
+    }
+    const sent = w.squads.filter((q) => q.auto && q.alive > 0 && ['spear', 'sword', 'knight', 'militia'].includes(q.type.id) && q.destTile >= 0);
+    expect(sent.some((q) => Math.hypot(cx(q.destTile) - cx(wall), cy(q.destTile) - cy(wall)) < 2 * 16)).toBe(true);
   });
 
   it('a docked tower nobody climbs any more stops holding its band in the fight', () => {
@@ -653,6 +714,136 @@ describe('dragon', () => {
   });
 });
 
+describe('fire and breath', () => {
+  /** one holding spearman on the s3 west wall walk (x 38), nobody else on the field */
+  function onWall() {
+    const st = STAGES.find((x) => x.id === 's3')!;
+    const s = armyFor(3);
+    const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, 8));
+    const sq = w.squads.find((q) => q.type.id === 'spear')!;
+    w.placeSquad(sq, idx(38, 14));
+    sq.auto = false;
+    sq.stance = 'hold';
+    w.start();
+    w.pending = [];
+    for (const e of w.enemies) e.state = ST.FLED;
+    const top = sq.units.find((u) => u.elev)!;
+    for (const u of w.defs) if (u !== top) u.state = ST.EVAC;
+    return { w, top, sq };
+  }
+  const slotDist = (u: Unit) => Math.hypot(u.x - u.slotX, u.y - u.slotY);
+
+  it('a soldier steps off a burning tile within a second, stays within the hold leash, and returns once it is out', () => {
+    const { w, top } = onWall();
+    const slot = tileAt(top.slotX, top.slotY);
+    expect(tileAt(top.x, top.y)).toBe(slot);
+    w.fire[slot] = 3;
+    let off = -1;
+    for (let i = 0; i < 30 && off < 0; i++) {
+      w.step();
+      if (w.fire[tileAt(top.x, top.y)] <= 0) off = i;
+    }
+    expect(off).toBeGreaterThanOrEqual(0);
+    expect(top.elev, 'he keeps to the wall walk when a wall tile beside him is safe').toBe(true);
+    expect(slotDist(top)).toBeLessThanOrEqual(w.leash(top.squad!));
+    // he does not walk back into the fire while it burns
+    while (w.fire[slot] > 0) {
+      w.step();
+      expect(tileAt(top.x, top.y)).not.toBe(slot);
+    }
+    for (let i = 0; i < 30 * 3; i++) w.step();
+    expect(tileAt(top.x, top.y)).toBe(slot);
+    expect(slotDist(top)).toBeLessThan(4);
+    expect(top.hp, 'barely singed').toBeGreaterThan(top.maxHp * 0.9);
+  });
+
+  it('with the whole wall walk around him alight he steps down into the courtyard, and climbs back after', () => {
+    const { w, top } = onWall();
+    const slot = tileAt(top.slotX, top.slotY);
+    for (const j of [slot - GW, slot, slot + GW]) w.fire[j] = 3;
+    for (let i = 0; i < 30 && w.fire[tileAt(top.x, top.y)] > 0; i++) w.step();
+    const at = tileAt(top.x, top.y);
+    expect(w.fire[at]).toBe(0);
+    expect(top.elev).toBe(false);
+    expect(w.grid.inside[at]).toBe(1);
+    for (let i = 0; i < 30 * 7; i++) w.step();
+    expect(tileAt(top.x, top.y)).toBe(slot);
+    expect(top.elev).toBe(true);
+  });
+
+  it('a fire pot that bursts on wall stone burns out quickly; on the ground it burns on', () => {
+    const { w, top } = onWall();
+    w.step();
+    const enemy = w.enemies[0];
+    const slot = tileAt(top.x, top.y);
+    const ground = slot + 2; // two tiles east: the courtyard
+    expect(w.grid.isElev(slot)).toBe(true);
+    expect(w.grid.isElev(ground)).toBe(false);
+    for (const [i, hit] of [
+      [slot, true],
+      [ground, false],
+    ] as const) {
+      w.fire[i] = 0;
+      w.land({ x: 0, y: 0, sx: 0, sy: 0, tx: cx(i), ty: cy(i), t: 1, dur: 1, target: hit ? top : null, side: 1, dmg: 1, ap: 0, kind: 'fire', structTile: -1, area: false, src: enemy, keep: false });
+    }
+    expect(w.fire[slot]).toBeCloseTo(POT_FIRE_STONE, 5);
+    expect(w.fire[ground]).toBeCloseTo(2.5, 5);
+    expect(POT_FIRE_STONE).toBeLessThan(2);
+  });
+
+  it('soldiers in a breathing dragon\'s cone get out of it, and suffer far less than men who stay', () => {
+    const st = STAGES.find((x) => x.id === 's9')!;
+    const run = (frozen: boolean) => {
+      const s = armyFor(9);
+      const w = new World(battleConfig(s, st, defaultLineup(s, st), {}, 99));
+      const sq = w.squads.find((q) => q.type.id === 'spear')!;
+      w.start();
+      w.pending = [];
+      w.spawnBand({ band: 'c_dragon', edge: 'W', span: [16, 18], delay: 0 }, 0);
+      const d = w.enemies.find((e) => e.def.role === 'dragon')!;
+      for (const e of w.enemies) if (e !== d) e.state = ST.FLED;
+      const men = sq.units.filter((u) => u.state === ST.ACTIVE && !u.elev);
+      expect(men.length).toBeGreaterThan(3);
+      for (const u of w.defs) if (!men.includes(u)) u.state = ST.EVAC;
+      sq.auto = false;
+      sq.stance = 'hold';
+      // the dragon starts a breath at the squad from 3 tiles away
+      let mx = 0;
+      let my = 0;
+      for (const u of men) {
+        mx += u.x / men.length;
+        my += u.y / men.length;
+      }
+      d.x = d.px = mx - 3 * 16;
+      d.y = d.py = my;
+      d.fx = 1;
+      d.fy = 0;
+      d.fState = 1;
+      d.fT = 2.6;
+      d.timer = 0.2;
+      const hp0 = men.reduce((a, u) => a + u.hp, 0);
+      for (let i = 0; i < Math.round(30 * 2.6); i++) {
+        if (frozen) for (const u of men) u.cd = u.retarget = 99;
+        if (frozen) for (const u of men) [u.slotX, u.slotY] = [u.x, u.y];
+        const pos = frozen ? men.map((u) => [u.x, u.y]) : [];
+        w.step();
+        if (frozen) men.forEach((u, k) => ([u.x, u.y] = pos[k]));
+      }
+      const inCone = men.filter((u) => {
+        if (u.state !== ST.ACTIVE) return true;
+        const r = Math.hypot(u.x - d.x, u.y - d.y);
+        return r < BREATH_LEN && Math.abs(Math.atan2(u.y - d.y, u.x - d.x)) < BREATH_HALF;
+      }).length;
+      return { lost: hp0 - men.reduce((a, u) => a + Math.max(0, u.hp), 0), inCone, n: men.length };
+    };
+    const dodge = run(false);
+    const stay = run(true);
+    expect(stay.inCone).toBeGreaterThan(0);
+    expect(dodge.inCone).toBe(0);
+    expect(dodge.lost).toBeLessThan(stay.lost * 0.6);
+  });
+});
+
 describe('keep defence', () => {
   it('shooters leave a quiet wall to bring enemies at the keep within range', () => {
     const st = STAGES.find((x) => x.id === 's8')!;
@@ -924,22 +1115,28 @@ describe('war council', () => {
     for (const e of sc.nextWaveEdges()) expect(rep.text).toContain({ W: '서쪽', N: '북쪽', S: '남쪽', E: '동쪽' }[e]!);
   });
 
-  it('the auto-commander decides an untaken council when the next wave starts; without it nothing happens', () => {
+  it('an untaken council is decided by the council itself when the next wave starts, auto-commander or not', () => {
     const a = atCouncil('s6', 11, true);
     const n = atCouncil('s6', 11, false);
     for (const w of [a, n]) {
       w.events.length = 0;
       w.skipIntermission();
       expect(w.state).toBe('battle');
+      expect(w.councilLog.length).toBe(1);
+      const ev = w.events.find((e) => e.type === 'council')!;
+      expect(ev.text).toContain('작전 회의가');
+      expect(ev.text).toContain(COUNCIL_NAMES[w.councilLog[0]]);
     }
-    expect(a.councilLog.length).toBe(1);
-    const ev = a.events.find((e) => e.type === 'council')!;
-    expect(ev.text).toContain('작전 회의가');
-    expect(ev.text).toContain(COUNCIL_NAMES[a.councilLog[0]]);
-    expect(n.councilLog.length).toBe(0);
-    expect(n.events.some((e) => e.type === 'council')).toBe(false);
-    // the auto pick answers the castle's need: with the stores empty of food, it forages
-    const f = atCouncil('s6', 12, true);
+    // letting the offer lapse never costs the pick: the same option with or without the auto-commander
+    expect(n.councilLog).toEqual(a.councilLog);
+    // a pick the player made stands, and nothing more is added when the wave starts
+    const p = atCouncil('s6', 11, false);
+    const other = p.councilOffer.find((id) => id !== a.councilLog[0])!;
+    expect(p.chooseCouncil(other)).toBe(true);
+    p.skipIntermission();
+    expect(p.councilLog).toEqual([other]);
+    // the pick answers the castle's need: with the stores empty of food, it forages
+    const f = atCouncil('s6', 12, false);
     f.councilOffer = ['scout', 'forage', 'rest'];
     f.supplies.food = 0;
     f.skipIntermission();
@@ -1139,7 +1336,7 @@ describe('daily and endless', () => {
   it('a supply train reaches the endless castle before every later wave, and the food forecast counts it', () => {
     const st = endlessStage(3);
     const s = armyFor(8);
-    s.settings.autoCommand = false; // no council pick in between (forage would add food too)
+    s.settings.autoCommand = false;
     const ids = defaultLineup(s, st);
     const w = new World(battleConfig(s, st, ids, {}, 11));
     w.start();
@@ -1150,6 +1347,8 @@ describe('daily and endless', () => {
       food = w.supplies.food;
       mats = w.supplies.mats;
       w.events.length = 0;
+      // no council offer in between: a lapsed offer is decided by the council, and forage would add food too
+      if (w.state === 'intermission') w.councilOffer = [];
       w.step();
     }
     expect(w.waveIdx).toBe(1);

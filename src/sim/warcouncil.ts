@@ -1,7 +1,7 @@
 /**
  * War council between waves (작전 회의): each intermission offers three of the options below, drawn
- * from the seed and the wave number (so a replay offers the same choice). The player picks one; with
- * the auto-commander on, the council picks the most needed option itself when the next wave starts.
+ * from the seed and the wave number (so a replay offers the same choice). The player picks one; if
+ * nobody picks, the council takes the most needed option itself when the next wave starts.
  * Every option names its exact effect, and amounts are fixed when the offer is made.
  */
 import { BANDS, Tile } from './defs';
@@ -104,7 +104,7 @@ export function councilOptionList(w: World): CouncilOption[] {
   return w.councilOffer.map((id) => ({ id, name: COUNCIL_NAMES[id], desc: councilDesc(w, id) }));
 }
 
-/** Carry out a council decision. `auto` = chosen by the auto-commander. */
+/** Carry out a council decision. `auto` = the council chose it itself (no pick before the next wave). */
 export function applyCouncil(w: World, id: string, auto: boolean) {
   const g = w.grid;
   const a = w.councilAmt;
@@ -170,7 +170,7 @@ export function scoutReport(w: World): string {
   return '정찰 보고 — ' + [...by].map(([e, l]) => `${EDGE_KO[e]}: ${l.join('·')}`).join(' / ');
 }
 
-/** How much the castle needs each option right now (auto-commander's pick; higher = more needed). */
+/** How much the castle needs each option right now (the council's own pick; higher = more needed). */
 export function councilNeed(w: World, id: string): number {
   const g = w.grid;
   const a = w.councilAmt;
@@ -229,9 +229,13 @@ export function councilNeed(w: World, id: string): number {
   return 0.5; // scout
 }
 
-/** Next wave starting: an untaken offer is decided by the auto-commander, or lapses. */
+/**
+ * Next wave starting: an offer the player has not taken is decided by the council itself (the option
+ * the castle needs most), whether or not the auto-commander is on. Letting the night pass is never worse
+ * than a sensible pick, so a player who gives no orders is not punished for it; picking well still pays.
+ */
 export function closeCouncil(w: World) {
-  if (!w.councilPick && w.councilOffer.length && w.autoCommand) {
+  if (!w.councilPick && w.councilOffer.length) {
     let best = w.councilOffer[0];
     let bs = -Infinity;
     for (const id of w.councilOffer) {
