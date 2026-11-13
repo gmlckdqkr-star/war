@@ -311,7 +311,7 @@ export const BREATH_REACT = 0.6;
  * left half dug, so a mine has to be finished within one assault.
  */
 export const SAPPER_DIG_T = 12;
-export const SAPPER_COVER = 0.8;
+export const SAPPER_COVER = 0.6;
 export const SAPPER_STONES = 2.4;
 
 /** a band that has neither dealt damage nor been in melee for this long assaults (or, if weak, withdraws) */
