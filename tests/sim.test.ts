@@ -6,7 +6,7 @@ import { RNG } from '../src/sim/rng';
 import { ENDLESS_CASTLES, ENDLESS_RESUPPLY, STAGES, dailyChallenge, endlessStage, planWaves, swarmWave, type Edge, type StageDef } from '../src/sim/stages';
 import { COUNCIL_IDS, COUNCIL_NAMES, GATE_BOOST, REPAIR_FRAC, councilDesc } from '../src/sim/warcouncil';
 import { josa } from '../src/sim/josa';
-import { ACT, BAND_STALL_T, BATTLE_HARD_CAP, CAP_HOLD_N, KEEP_PRESS_MAX, KEEP_PRESS_T, SAPPER_COVER, SAPPER_DIG_T, SAPPER_STONES, POT_FIRE_STONE, BREATH_HALF, BREATH_LEN, DRAGON_FLEE_HP, DRAGON_MAX_STAY, DRAGON_PAIN_DMG, DRAGON_PAIN_MAX, GARRISON_GRACE, GATE_SAFE_R, ST, TOWER_EMPTY_T, TREB_SPLASH_DMG, World, isEngine, type Unit } from '../src/sim/world';
+import { ACT, BAND_STALL_T, BATTLE_HARD_CAP, CAP_HOLD_N, KEEP_PRESS_MAX, KEEP_PRESS_T, SAPPER_COVER, SAPPER_DIG_T, SAPPER_STONES, POT_FIRE_STONE, BREATH_HALF, BREATH_LEN, BREATH_REACT, BREATH_T, DRAGON_FLEE_HP, DRAGON_MAX_STAY, DRAGON_PAIN_DMG, DRAGON_PAIN_MAX, GARRISON_GRACE, GATE_SAFE_R, ST, TOWER_EMPTY_T, TREB_SPLASH_DMG, World, isEngine, type Unit } from '../src/sim/world';
 import { newSave, newSquad } from '../src/meta/save';
 import { LEVY_BELOW, LEVY_MAX_SQUADS, UPGRADES, applyBattle, baseSupplies, battleConfig, defaultLineup, foodNeeded, lineupSoldiers, upgradeCost } from '../src/meta/progression';
 
@@ -830,7 +830,7 @@ describe('fire and breath', () => {
     expect(POT_FIRE_STONE).toBeLessThan(2);
   });
 
-  it('soldiers in a breathing dragon\'s cone get out of it, and suffer far less than men who stay', () => {
+  it('soldiers in a breathing dragon\'s cone get out of it after the first gout, and suffer far less than men who stay', () => {
     const st = STAGES.find((x) => x.id === 's9')!;
     const run = (frozen: boolean) => {
       const s = armyFor(9);
@@ -861,23 +861,31 @@ describe('fire and breath', () => {
       d.fT = 2.6;
       d.timer = 0.2;
       const hp0 = men.reduce((a, u) => a + u.hp, 0);
-      for (let i = 0; i < Math.round(30 * 2.6); i++) {
+      const coneCount = () =>
+        men.filter((u) => {
+          if (u.state !== ST.ACTIVE) return true;
+          const r = Math.hypot(u.x - d.x, u.y - d.y);
+          return r < BREATH_LEN && Math.abs(Math.atan2(u.y - d.y, u.x - d.x)) < BREATH_HALF;
+        }).length;
+      let early = -1;
+      for (let i = 0; i < Math.round(30 * BREATH_T); i++) {
+        if (i === Math.round(30 * (BREATH_REACT - 0.1))) early = coneCount();
         if (frozen) for (const u of men) u.cd = u.retarget = 99;
         if (frozen) for (const u of men) [u.slotX, u.slotY] = [u.x, u.y];
         const pos = frozen ? men.map((u) => [u.x, u.y]) : [];
         w.step();
         if (frozen) men.forEach((u, k) => ([u.x, u.y] = pos[k]));
       }
-      const inCone = men.filter((u) => {
-        if (u.state !== ST.ACTIVE) return true;
-        const r = Math.hypot(u.x - d.x, u.y - d.y);
-        return r < BREATH_LEN && Math.abs(Math.atan2(u.y - d.y, u.x - d.x)) < BREATH_HALF;
-      }).length;
-      return { lost: hp0 - men.reduce((a, u) => a + Math.max(0, u.hp), 0), inCone, n: men.length };
+      const inCone = coneCount();
+      return { lost: hp0 - men.reduce((a, u) => a + Math.max(0, u.hp), 0), inCone, early, n: men.length };
     };
     const dodge = run(false);
     const stay = run(true);
     expect(stay.inCone).toBeGreaterThan(0);
+    // the first gout catches them where they stand (BREATH_REACT; only a man whose own tile caught fire
+    // steps off it at once); they are out of the cone before it ends
+    expect(stay.early).toBeGreaterThan(3);
+    expect(dodge.early).toBeGreaterThanOrEqual(stay.early * 0.75);
     expect(dodge.inCone).toBe(0);
     expect(dodge.lost).toBeLessThan(stay.lost * 0.6);
   });

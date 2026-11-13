@@ -292,6 +292,13 @@ export const POT_FIRE_STONE = 1.2;
 /** the breath's cone: how far it reaches (px) and its half-angle (rad) */
 export const BREATH_LEN = 5.5 * TILE;
 export const BREATH_HALF = 0.5;
+/** how long one breath lasts (s) */
+export const BREATH_T = 2.6;
+/**
+ * Soldiers start out of a breath's cone only this long after it begins (s): the roar and the first gout
+ * of flame catch them where they stand. They dodge the rest of it, not all of it.
+ */
+export const BREATH_REACT = 0.6;
 
 /**
  * A sapper's mine takes this long to dig (s). He works at the wall foot under a timber mantlet that
@@ -409,7 +416,7 @@ export class World {
   activeEnemies: Unit[] = [];
   downed: Unit[] = [];
   terrorUnits: Unit[] = [];
-  /** dragons breathing fire this tick (defenders step out of the cone) */
+  /** dragons breathing fire this tick, once the soldiers have seen it coming (BREATH_REACT): they step out of the cone */
   breathing: Unit[] = [];
   hpScale: number;
   atkScale: number;
@@ -837,7 +844,7 @@ export class World {
     }
     for (const u of this.enemies) if (u.state === ST.ACTIVE || u.state === ST.CLIMB) this.activeEnemies.push(u);
     this.breathing.length = 0;
-    for (const e of this.activeEnemies) if (e.def.role === 'dragon' && e.fState === 1 && !e.fleeing) this.breathing.push(e);
+    for (const e of this.activeEnemies) if (e.def.role === 'dragon' && e.fState === 1 && !e.fleeing && e.fT <= BREATH_T - BREATH_REACT) this.breathing.push(e);
     this.dHash.build(this.activeDefs);
     this.eHash.build(this.activeEnemies);
     if (this.fieldsDirty && this.t - this.lastFieldT > 0.35) this.recomputeFields();
@@ -2815,7 +2822,7 @@ export class World {
       const d = Math.hypot(e.ftx - e.x, e.fty - e.y);
       if (d < 4.2 * T) {
         e.fState = 1;
-        e.fT = 2.6;
+        e.fT = BREATH_T;
         e.fx = (e.ftx - e.x) / (d || 1);
         e.fy = (e.fty - e.y) / (d || 1);
         this.fx.push({ k: 'roar', x: e.x, y: e.y });
