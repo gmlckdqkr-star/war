@@ -955,6 +955,8 @@ export class BattleView {
     toast(fixParticles(e.text), e.level === 'good' ? 'good' : e.level, jump, e.level === 'danger' ? 3000 : 2000);
     if (e.type === 'breach') this.firstHint('breach', '돌파구! 근접 분대를 보내거나 "본성 후퇴"를 누르세요.');
     if (e.type === 'rout') this.firstHint('rout', '사기가 무너진 분대는 도주합니다. "함성"으로 붙잡으세요.');
+    // the council decided an offer nobody took (warcouncil.closeCouncil): say once that this is how it works
+    if (e.type === 'council' && e.text.startsWith('작전 회의가')) this.firstHint('council', '작전 회의를 고르지 않으면 회의가 가장 급한 것을 택합니다. 직접 골라도 됩니다.');
   }
 
   private firstHint(key: string, text: string) {
