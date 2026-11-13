@@ -18,9 +18,11 @@ import {
 } from './defs';
 import { Grid, cx, cy, idx, inb, newField, tileAt, tx, ty, type Field, N8 } from './grid';
 import { SpatialHash } from './hash';
+import { josa } from './josa';
 import { RNG } from './rng';
-import type { Edge, StageDef, Supplies, WaveGroup } from './stages';
-import { runCouncil, autoCommander } from './council';
+import { planWaves, type Edge, type StageDef, type Supplies, type WaveGroup } from './stages';
+import { applyCouncil, closeCouncil, councilOptionList, openCouncil } from './warcouncil';
+import { CouncilState, runCouncil, autoCommander } from './council';
 
 export const ST = { ACTIVE: 0, DOWN: 1, DEAD: 2, CARRIED: 3, EVAC: 4, FLED: 5, CLIMB: 6 } as const;
 export const ACT = { NONE: 0, PLANT: 1, DIG: 2, DOCKED: 3, SET: 4, PICKUP: 5, DONE_LADDER: 6 } as const;
@@ -74,6 +76,16 @@ export interface Unit {
   spawnY: number;
   kills: number;
   fireDeath: boolean;
+  /** siege-engine crew morale 0..100 (engines only, 0 for everyone else); engines ignore band collapse */
+  crew: number;
+  /** escort slot index inside a convoy band (-1 = not an escort) */
+  escortIdx: number;
+  /** battle time the unit appeared */
+  bornT: number;
+  /** recent heavy hits (dragon: ballista bolts), decays over time */
+  pain: number;
+  /** a convoy core unit with escorts close around it: harder to pick out and hit with missiles */
+  screened: boolean;
 }
 
 export interface Squad {
@@ -121,6 +133,25 @@ export interface Band {
   broken: boolean;
   field: FieldKind;
   wave: number;
+  /** units the band escorts: siege engines, or sappers screened by shields */
+  core: Unit[];
+  /** escorts keep formation around the core instead of running ahead */
+  convoy: boolean;
+  /** convoy anchor (core centroid) and its forward direction */
+  ax: number;
+  ay: number;
+  fdx: number;
+  fdy: number;
+  /** convoy pace in px/s (slowest living member) */
+  pace: number;
+  /** most escorts are in their screen slots */
+  formed: boolean;
+  /** battle time the band broke (-1 while it holds) */
+  brokenT: number;
+  /** last time a member dealt damage, fought in melee, climbed, dug or rammed */
+  contactT: number;
+  /** stalled once: everyone advances, archers stop hanging back */
+  assault: boolean;
 }
 
 export interface Ladder {
@@ -225,11 +256,109 @@ export interface BattleResult {
 export const ABILITY_INFO: Record<AbilityId, { name: string; cd: number; desc: string; needsTarget: boolean }> = {
   rally: { name: '함성', cd: 40, desc: '지점 주변 분대의 사기 +35, 도주 중인 분대를 붙잡음', needsTarget: true },
   volley: { name: '일제사격', cd: 28, desc: '사거리 안의 모든 궁수·석궁이 지정 지점에 화살비', needsTarget: true },
-  oil: { name: '끓는 기름', cd: 38, desc: '성벽·성문 앞 적에게 큰 화염 피해, 사다리 파괴', needsTarget: true },
+  oil: { name: '끓는 기름', cd: 46, desc: '성벽·성문 앞 적에게 큰 화염 피해, 사다리 파괴', needsTarget: true },
   reserve: { name: '증원', cd: 999, desc: '본성 앞에 민병대 10명 소집 (전투당 1회, 식량 10)', needsTarget: false },
 };
 
 const T = TILE;
+
+/** the dragon withdraws below this HP fraction */
+export const DRAGON_FLEE_HP = 0.35;
+/**
+ * ...or when harried past this much pain: each ballista bolt adds 1, any other wound adds 1 per
+ * DRAGON_PAIN_DMG of its max HP, and pain wears off at 1 per DRAGON_PAIN_DECAY s. A steady storm of
+ * arrows and bolts drives it off long before it is badly hurt; a few stray shots never will.
+ */
+export const DRAGON_PAIN_MAX = 8;
+export const DRAGON_PAIN_DECAY = 6;
+export const DRAGON_PAIN_DMG = 0.03;
+/**
+ * The dragon answers to nothing but its wounds: it stays, whatever becomes of its retinue, until it is
+ * badly hurt (DRAGON_FLEE_HP) or harried by bolts and arrows (DRAGON_PAIN_MAX). Only a castle that can
+ * barely hurt it sees it leave on its own, sated, after this long (s).
+ */
+export const DRAGON_MAX_STAY = 240;
+/**
+ * breath damage per 0.2 s tick, as a fraction of the dragon's attack. The dragon now stays until it is
+ * hurt, harried or tired (several passes, not one or two), so each pass burns less than it used to.
+ */
+export const DRAGON_BREATH = 0.13;
+/**
+ * A fire pot that bursts on the stone of a wall walk or tower burns out after this long (s); on the
+ * ground (grass, timber, a courtyard) it burns 2.5-3 s. Wall-top cover then means something against
+ * cultists: a miss no longer leaves a fire burning under the merlons for as long as a hit does.
+ */
+export const POT_FIRE_STONE = 1.2;
+/** the breath's cone: how far it reaches (px) and its half-angle (rad) */
+export const BREATH_LEN = 5.5 * TILE;
+export const BREATH_HALF = 0.5;
+/** how long one breath lasts (s) */
+export const BREATH_T = 2.6;
+/**
+ * Soldiers start out of a breath's cone only this long after it begins (s): the roar and the first gout
+ * of flame catch them where they stand. They dodge the rest of it, not all of it.
+ */
+export const BREATH_REACT = 0.6;
+
+/**
+ * A sapper's mine takes this long to dig (s). He works at the wall foot under a timber mantlet that
+ * catches some of the missiles (ranged damage x SAPPER_COVER), but a miner at work is still the first
+ * mark of every archer in range, and the squads' council sends spearmen to the wall walk above him,
+ * where stones dropped on the mantlet hit him hard (a blow from the wall walk x SAPPER_STONES instead of
+ * the usual x0.6 against men below). Boiling oil does the rest. The gallery stays dug when he falls
+ * (World.mineProg): the next miner at that stretch of wall carries on. One gallery is one tunnel: more
+ * miners at the same wall tile do not dig it any faster. Between waves the garrison fills in what was
+ * left half dug, so a mine has to be finished within one assault.
+ */
+export const SAPPER_DIG_T = 12;
+export const SAPPER_COVER = 0.6;
+export const SAPPER_STONES = 2.4;
+
+/** a band that has neither dealt damage nor been in melee for this long assaults (or, if weak, withdraws) */
+export const BAND_STALL_T = 75;
+/** a docked siege tower with no one left in its band to climb it withdraws after this long without progress (s) */
+export const TOWER_EMPTY_T = 12;
+/** missiles an enemy archer / crossbowman / javelin thrower carries; stones a trebuchet brings */
+export const ENEMY_QUIVER = 40;
+export const TREB_STONES = 16;
+/** a trebuchet stone is a wall-breaker: men within TREB_SPLASH_R px of the impact take TREB_SPLASH_DMG (x attack scale) */
+export const TREB_SPLASH_DMG = 14;
+export const TREB_SPLASH_R = 14;
+/**
+ * No battle runs longer than this (game seconds, endless mode excepted). Then the siege is decided as it
+ * stands: if the attackers hold ground inside the walls or the keep is nearly down the castle is lost,
+ * otherwise they lift the siege (see liftSiege).
+ */
+export const BATTLE_HARD_CAP = 900;
+/** with no defender standing for this long while enemies remain in the field, the castle is lost (s) */
+export const GARRISON_GRACE = 10;
+/** at the cap: this many attackers inside the walls, or the keep below this share, and the castle is lost */
+export const CAP_HOLD_N = 4;
+export const CAP_KEEP_MIN = 0.25;
+/**
+ * Attackers who stay at the keep break in: every second of an unbroken keep assault adds 1/KEEP_PRESS_T to
+ * the damage they do to it (up to KEEP_PRESS_MAX extra). It ebbs at half that rate once they are driven off.
+ */
+export const KEEP_PRESS_T = 45;
+export const KEEP_PRESS_MAX = 3;
+/** boiling oil: fire damage to every climber and wall-foot attacker in the splash (x fire weakness, x2.5 vs giants) */
+export const OIL_DMG = 50;
+/** morale the scalded bands lose */
+export const OIL_MORALE = 6;
+const SUPPLY_NAMES: Record<keyof Supplies, string> = { food: '식량', arrows: '화살', mats: '자재', meds: '의약품' };
+
+/** extra reach (px) and damage multiplier for enemies inside the walls striking defenders on the wall top */
+export const WALLTOP_REACH = 6;
+export const WALLTOP_HIT_MUL = 0.7;
+
+/** defenders may use a gate only while no enemy is within this many tiles of it */
+export const GATE_SAFE_R = 3;
+
+/** rams, siege towers and trebuchets: crewed machines with their own morale */
+export function isEngine(u: Unit) {
+  const r = u.def.role;
+  return r === 'ram' || r === 'tower' || r === 'treb';
+}
 
 export class World {
   cfg: BattleConfig;
@@ -246,6 +375,10 @@ export class World {
   ladders: Ladder[] = [];
   projectiles: Projectile[] = [];
   fire: Float32Array = new Float32Array(GW * GH);
+  /** seconds of mining already dug under each wall tile: a gallery stays dug when its miner falls */
+  mineProg: Float32Array = new Float32Array(GW * GH);
+  /** sim time a gallery was last dug (one miner's work per tile per tick) */
+  mineT: Float64Array = new Float64Array(GW * GH).fill(-1);
   fx: Fx[] = [];
   events: GameEvent[] = [];
   dirtyTiles: number[] = [];
@@ -263,9 +396,19 @@ export class World {
   fields: Record<FieldKind, Field> = { breach: newField(), escalade: newField(), ram: newField() };
   retreatField = newField();
   infirmField = newField();
+  /** way off the map for fleeing ground enemies; rebuilt on first use after the walls change */
+  exitField = newField();
+  exitDirty = true;
   fieldsDirty = true;
   lastFieldT = -10;
+  /** gate state changed: squads' approach fields need a refresh (throttled) */
+  defFieldsDirty = false;
+  lastDefFieldT = -10;
+  /** number of intact gates currently barred to defenders */
+  gatesShut = 0;
   councilT = 0;
+  /** per-world council scratch state (keeps battles independent of each other) */
+  council = new CouncilState();
   moraleT = 0;
   dHash = new SpatialHash<Unit>(32);
   eHash = new SpatialHash<Unit>(32);
@@ -273,6 +416,8 @@ export class World {
   activeEnemies: Unit[] = [];
   downed: Unit[] = [];
   terrorUnits: Unit[] = [];
+  /** dragons breathing fire this tick, once the soldiers have seen it coming (BREATH_REACT): they step out of the cone */
+  breathing: Unit[] = [];
   hpScale: number;
   atkScale: number;
   up: Record<string, number>;
@@ -283,31 +428,54 @@ export class World {
   alertCd: Record<string, number> = {};
   mods: Set<string>;
   hasDragonEver = false;
+  /** dragons already counted in stats.dragons (driven off or slain), by unit id */
+  dragonsCounted = new Set<number>();
   lastKeepAlert = -10;
+  /** how long no defender has been standing (see checkEnd) */
+  wipedT = 0;
+  /** keep HP at the last keep alert (alerts repeat per 10% lost, or after a lull) */
+  keepAlertHp = Infinity;
+  /** last time anyone struck the keep, and how long the current keep assault has been going on */
+  lastKeepHit = -10;
+  keepPress = 0;
   result: BattleResult | null = null;
   /** per-world id counter keeps battles reproducible for a given seed */
   uid = 1;
+  /** wall HP multiplier of this battle (masonry research, daily mods) */
+  structHpMul = 1;
+  /** war council: ids offered this intermission, their amounts, and every pick applied so far */
+  councilOffer: string[] = [];
+  councilAmt: Record<string, number> = {};
+  councilLog: string[] = [];
+  /** gates the council has already strengthened (once each) */
+  gateBoosted = new Set<number>();
+  /** arrows that came into the stores this battle (start, recovered, council) */
+  arrowsIn = 0;
 
   constructor(cfg: BattleConfig) {
     this.cfg = cfg;
-    this.stage = cfg.stage;
+    // the approaches of this battle's waves are fixed now, from the seed (see planWaves)
+    this.stage = { ...cfg.stage, waves: planWaves(cfg.stage, cfg.seed) };
     this.rng = new RNG(cfg.seed);
     this.up = cfg.upgrades;
     this.mods = new Set(cfg.mods ?? []);
     this.autoCommand = !!cfg.autoCommand;
     const lvl = cfg.stage.level;
-    const diff = cfg.difficulty === 'easy' ? 0.72 : cfg.difficulty === 'hard' ? 1.22 : 1;
-    this.hpScale = lvl * diff;
-    this.atkScale = Math.sqrt(lvl) * diff;
+    const diff = cfg.difficulty === 'easy' ? 0.72 : cfg.difficulty === 'hard' ? 1.18 : 1;
+    const elite = cfg.stage.enemyMul ?? 1;
+    this.hpScale = lvl * diff * elite;
+    this.atkScale = Math.sqrt(lvl) * diff * elite;
     const stageRng = new RNG(cfg.seed ^ 0x5bd1e995);
     cfg.stage.build(this.grid, stageRng);
     let hpMul = 1 + 0.12 * (this.up.masonry ?? 0);
     if (this.mods.has('brittle')) hpMul *= 0.65;
+    this.structHpMul = hpMul;
     this.grid.finalize(hpMul);
     this.keepMax = cfg.stage.keepHp * (1 + 0.06 * (this.up.masonry ?? 0));
     this.keepHp = this.keepMax;
     this.supplies = { ...cfg.supplies };
     this.startSupplies = { ...cfg.supplies };
+    this.arrowsIn = cfg.supplies.arrows;
     const cdMul = 1 - 0.08 * (this.up.command ?? 0);
     const mk = (id: AbilityId) => ({ cd: 0, max: ABILITY_INFO[id].cd * cdMul, unlocked: cfg.stage.abilities.includes(id), used: 0 });
     this.abilities = { rally: mk('rally'), volley: mk('volley'), oil: mk('oil'), reserve: mk('reserve') };
@@ -427,6 +595,11 @@ export class World {
       spawnY: y,
       kills: 0,
       fireDeath: false,
+      crew: 0,
+      escortIdx: -1,
+      bornT: this.t,
+      pain: 0,
+      screened: false,
     };
     this.units.push(u);
     return u;
@@ -449,6 +622,7 @@ export class World {
       if (edges.has('W')) s += (GW - tx(i)) * 2;
       if (edges.has('N')) s += (GH - ty(i)) * 0.8;
       if (edges.has('S')) s += ty(i) * 0.8;
+      if (edges.has('E')) s += tx(i) * 0.5;
       return s;
     };
     gates.sort((a, b) => expo(b) - expo(a));
@@ -669,6 +843,8 @@ export class World {
       else if (u.state === ST.DOWN) this.downed.push(u);
     }
     for (const u of this.enemies) if (u.state === ST.ACTIVE || u.state === ST.CLIMB) this.activeEnemies.push(u);
+    this.breathing.length = 0;
+    for (const e of this.activeEnemies) if (e.def.role === 'dragon' && e.fState === 1 && !e.fleeing && e.fT <= BREATH_T - BREATH_REACT) this.breathing.push(e);
     this.dHash.build(this.activeDefs);
     this.eHash.build(this.activeEnemies);
     if (this.fieldsDirty && this.t - this.lastFieldT > 0.35) this.recomputeFields();
@@ -678,7 +854,9 @@ export class World {
       this.moraleT = 0.25;
       this.terrorUnits = this.activeEnemies.filter((e) => e.def.terror);
       for (const sq of this.squads) this.updateSquadCentroid(sq);
+      this.updateGates();
     }
+    if (this.defFieldsDirty && this.t - this.lastDefFieldT >= 0.5) this.refreshSquadFields();
     this.councilT -= dt;
     if (this.councilT <= 0) {
       this.councilT = 0.5;
@@ -698,10 +876,73 @@ export class World {
       if (a.cd > 0) a.cd = Math.max(0, a.cd - dt);
     }
     for (const k in this.alertCd) this.alertCd[k] -= dt;
+    if (this.t - this.lastKeepHit < 1.5) this.keepPress = Math.min(KEEP_PRESS_MAX * KEEP_PRESS_T, this.keepPress + dt);
+    else if (this.keepPress > 0) this.keepPress = Math.max(0, this.keepPress - dt * 0.5);
     this.cleanup();
     this.checkEnd();
+    if (this.t >= BATTLE_HARD_CAP && this.stage.id !== 'endless' && (this.state === 'battle' || this.state === 'intermission')) this.liftSiege();
     if (this.fx.length > 3000) this.fx.splice(0, this.fx.length - 1500);
     if (this.events.length > 200) this.events.splice(0, this.events.length - 100);
+  }
+
+  /**
+   * A gate opens for defenders only while no enemy is within GATE_SAFE_R tiles of it (a little more to
+   * reopen, so it does not flicker). A barred gate blocks defenders like a wall; fields refresh on change.
+   */
+  updateGates() {
+    const g = this.grid;
+    let shut = 0;
+    let changed = false;
+    for (const i of g.structTiles) {
+      if (g.tiles[i] !== Tile.GATE) continue;
+      const r = (g.gateShut[i] ? GATE_SAFE_R + 0.5 : GATE_SAFE_R) * T;
+      const x = cx(i);
+      const y = cy(i);
+      const danger = !!this.eHash.best(x, y, r, (e) => (e.fleeing || e.def.flying || e.state !== ST.ACTIVE ? Infinity : 0));
+      if (danger !== !!g.gateShut[i]) {
+        g.gateShut[i] = danger ? 1 : 0;
+        changed = true;
+      }
+      if (danger) shut++;
+    }
+    // gates that were rebuilt from rubble or broken since: never left barred
+    if (this.gatesShut > 0 || changed)
+      for (let i = 0; i < g.n; i++)
+        if (g.gateShut[i] && g.tiles[i] !== Tile.GATE) {
+          g.gateShut[i] = 0;
+          changed = true;
+        }
+    this.gatesShut = shut;
+    if (changed) this.defFieldsDirty = true;
+  }
+
+  /** Is this gate tile open to defenders right now? */
+  gateOpen(i: number) {
+    return this.grid.tiles[i] === Tile.GATE && !this.grid.gateShut[i];
+  }
+
+  /**
+   * A gate opened or shut: only paths between the field and the courtyard change, so only squads with
+   * a post or a man outside the walls need new fields (and the retreat fields, if anyone is outside).
+   */
+  refreshSquadFields() {
+    this.defFieldsDirty = false;
+    this.lastDefFieldT = this.t;
+    const g = this.grid;
+    const out = (i: number) => g.inside[i] === 0 && !g.isBoundary(i);
+    for (const sq of this.squads) {
+      sq.tfieldTile = -1; // per-task approach fields are rebuilt on their next use
+      if (sq.alive === 0 || !sq.slots.length) continue;
+      let affected = sq.slots.some(out);
+      if (!affected)
+        for (const u of sq.units)
+          if (u.state === ST.ACTIVE && out(tileAt(u.x, u.y))) {
+            affected = true;
+            break;
+          }
+      if (affected) g.defenderField(sq.slots, sq.field);
+    }
+    if (this.activeDefs.some((u) => out(tileAt(u.x, u.y)))) this.computeDefenderFields();
   }
 
   recomputeFields() {
@@ -710,6 +951,7 @@ export class World {
     this.grid.enemyField('breach', this.fields.breach);
     this.grid.enemyField('escalade', this.fields.escalade);
     this.grid.enemyField('ram', this.fields.ram);
+    this.exitDirty = true;
     this.computeDefenderFields();
   }
 
@@ -718,10 +960,37 @@ export class World {
   // ======================================================================
 
   startWave(w: number) {
+    // an open war council is decided (auto-commander) or lapses before the rations are handed out
+    if (this.state === 'intermission') closeCouncil(this);
+    // galleries nobody is digging any more are filled in between the assaults
+    if (w > 0) {
+      let filled = 0;
+      for (let i = 0; i < this.mineProg.length; i++) {
+        if (this.mineProg[i] <= 0) continue;
+        if (this.activeEnemies.some((e) => e.act === ACT.DIG && e.actTile === i && e.state === ST.ACTIVE)) continue;
+        this.mineProg[i] = 0;
+        filled++;
+      }
+      if (filled) this.event('minefilled', '수비대가 반쯤 파인 갱도를 메웠습니다.', 'good');
+    }
     this.waveIdx = w;
     this.waveT = 0;
     this.pending = [...this.stage.waves[w].groups].sort((a, b) => a.delay - b.delay);
     this.state = 'battle';
+    // a supply train (endless) reaches the castle before every later wave, cleared or not; the stores
+    // hold no more than they did when the siege began
+    const sup = this.stage.resupply;
+    if (sup && w > 0) {
+      const got: string[] = [];
+      for (const k of ['food', 'arrows', 'mats', 'meds'] as const) {
+        const n = Math.floor(Math.min(sup[k] ?? 0, this.startSupplies[k] - this.supplies[k]));
+        if (n <= 0) continue;
+        this.supplies[k] += n;
+        if (k === 'arrows') this.arrowsIn += n;
+        got.push(`${SUPPLY_NAMES[k]} +${n}`);
+      }
+      if (got.length) this.event('resupply', `보급 마차가 도착했습니다: ${got.join(', ')}`, 'info');
+    }
     // food ration per wave
     const mouths = Math.ceil(this.defs.filter((u) => u.state === ST.ACTIVE).length / 2);
     if (this.supplies.food >= mouths) {
@@ -767,15 +1036,51 @@ export class World {
           this.shotsWave = 0;
           if (rec > 0) {
             this.supplies.arrows += rec;
+            this.arrowsIn += rec;
             this.event('arrows', `전장에서 화살 ${rec}개를 회수했습니다.`, 'info');
           }
           this.event('cleared', `물결을 막아냈습니다! 다음 공세까지 ${Math.round(this.interT)}초`, 'good');
           for (const sq of this.squads) sq.morale = Math.min(100, sq.morale + 10);
+          openCouncil(this);
         }
       } else if (!last && this.waveT > (wave.maxTime ?? 105)) {
         this.startWave(this.waveIdx + 1);
       }
     }
+  }
+
+  // ---------------------------------------------------------------- war council (between waves)
+  // Each intermission offers three options (src/sim/warcouncil.ts); one may be taken.
+
+  /** id of the option picked during the current intermission, or null */
+  councilPick: string | null = null;
+
+  /** Options the player can pick right now (empty when not in an intermission or already picked). */
+  councilOptions(): { id: string; name: string; desc: string }[] {
+    if (this.state !== 'intermission' || this.councilPick) return [];
+    return councilOptionList(this);
+  }
+
+  /** Apply one council option. Returns false if not allowed now. */
+  chooseCouncil(id: string): boolean {
+    if (this.state !== 'intermission' || this.councilPick || !this.councilOffer.includes(id)) return false;
+    applyCouncil(this, id, false);
+    return true;
+  }
+
+  /** a gate's full strength at the start of this battle (research and daily mods included) */
+  gateBaseHp() {
+    return TILE_INFO[Tile.GATE].maxHp * this.structHpMul;
+  }
+
+  /** Edges ('W' | 'N' | 'S' | 'E') the upcoming wave will come from: the first wave while deploying,
+   *  the next wave during an intermission, the current wave during battle. Used for approach arrows. */
+  nextWaveEdges(): string[] {
+    const waves = this.stage.waves;
+    if (!waves.length) return [];
+    const idx = this.state === 'deploy' ? 0 : this.state === 'intermission' ? this.waveIdx + 1 : Math.max(0, this.waveIdx);
+    const wv = waves[Math.min(idx, waves.length - 1)];
+    return [...new Set(wv.groups.map((g) => g.edge as string))];
   }
 
   /** Player may call the next wave early during intermission (small gold bonus). */
@@ -790,24 +1095,9 @@ export class World {
     if (!tpl) return;
     const grid = this.grid;
     const r = this.rng;
-    let ex = 0;
-    let ey = 0;
     const along = r.range(g.span[0], g.span[1]);
-    if (g.edge === 'W') {
-      ex = 0;
-      ey = along;
-    } else if (g.edge === 'N') {
-      ex = along;
-      ey = 0;
-    } else if (g.edge === 'S') {
-      ex = along;
-      ey = GH - 1;
-    } else {
-      ex = GW - 1;
-      ey = along;
-    }
     const ok = (i: number) => grid.openGround(i) && !grid.inside[i];
-    let st = grid.nearestTile(idx(Math.round(Math.min(GW - 1, ex)), Math.round(Math.min(GH - 1, ey))), ok, 30);
+    const st = grid.spawnTile(g.edge, along);
     if (st < 0) return;
     const bx = cx(st);
     const by = cy(st);
@@ -821,11 +1111,24 @@ export class World {
       broken: false,
       field: tpl.field,
       wave: this.waveIdx,
+      core: [],
+      convoy: false,
+      ax: bx,
+      ay: by,
+      fdx: 1,
+      fdy: 0,
+      pace: 0,
+      formed: false,
+      brokenT: -1,
+      contactT: this.t,
+      assault: false,
     };
     const list: string[] = [];
     if (tpl.leader) list.push(tpl.leader);
     for (const [id, n] of tpl.members) for (let i = 0; i < n; i++) list.push(id);
     const spread = 1.2 + Math.sqrt(list.length) * 0.55;
+    // endless waves grow stronger one by one
+    const waveMul = this.stage.waves[this.waveIdx]?.mul ?? 1;
     for (let i = 0; i < list.length; i++) {
       const def = UNITS[list[i]];
       let px = bx;
@@ -834,8 +1137,9 @@ export class World {
         for (let tries = 0; tries < 8; tries++) {
           const ang = r.range(0, Math.PI * 2);
           const rad = i === 0 ? 0 : r.range(0.3, spread) * T;
-          const qx = Math.max(2, Math.min(WORLD_W - 2, bx + Math.cos(ang) * rad - (g.edge === 'W' ? rad * 0.5 : 0)));
-          const qy = Math.max(2, Math.min(WORLD_H - 2, by + Math.sin(ang) * rad));
+          // the band fans out along its edge and back from it, never forward toward the walls
+          const qx = Math.max(2, Math.min(WORLD_W - 2, bx + Math.cos(ang) * rad - (g.edge === 'W' ? rad * 0.5 : g.edge === 'E' ? -rad * 0.5 : 0)));
+          const qy = Math.max(2, Math.min(WORLD_H - 2, by + Math.sin(ang) * rad - (g.edge === 'N' ? rad * 0.5 : g.edge === 'S' ? -rad * 0.5 : 0)));
           if (ok(tileAt(qx, qy))) {
             px = qx;
             py = qy;
@@ -843,21 +1147,33 @@ export class World {
           }
         }
       } else {
-        px = g.edge === 'W' ? 4 : bx;
+        px = g.edge === 'W' ? 4 : g.edge === 'E' ? WORLD_W - 4 : bx;
         py = g.edge === 'N' ? 4 : g.edge === 'S' ? WORLD_H - 4 : by;
         if (def.role === 'dragon') this.hasDragonEver = true;
       }
       const u = this.makeUnit(def, 1, px, py);
-      u.maxHp = u.hp = def.hp * this.hpScale;
-      u.atkMul = this.atkScale;
+      u.maxHp = u.hp = def.hp * this.hpScale * waveMul;
+      u.atkMul = this.atkScale * waveMul;
       u.band = band;
-      u.spawnX = g.edge === 'W' ? -20 : px;
+      if (def.role === 'ranged') u.ammo = u.maxAmmo = ENEMY_QUIVER;
+      else if (def.role === 'treb') u.ammo = u.maxAmmo = TREB_STONES;
+      u.spawnX = g.edge === 'W' ? -20 : g.edge === 'E' ? WORLD_W + 20 : px;
       u.spawnY = g.edge === 'N' ? -20 : g.edge === 'S' ? WORLD_H + 20 : py;
       if (def.leader && !band.leader) band.leader = u;
       band.units.push(u);
       this.enemies.push(u);
     }
     band.startCount = band.units.length;
+    // convoy: siege engines (and sappers) travel inside a screen of escorts at the slowest member's pace
+    for (const u of band.units) {
+      if (isEngine(u)) {
+        u.crew = 100;
+        band.core.push(u);
+      } else if (u.def.role === 'sapper') band.core.push(u);
+    }
+    let escorts = 0;
+    if (band.core.length) for (const u of band.units) if (!band.core.includes(u)) u.escortIdx = escorts++;
+    band.convoy = band.core.length > 0 && escorts > 0;
     this.bands.push(band);
     if (tpl.faction === 'wyrm' && tpl.leader === 'c_dragon') this.event('dragon', '잿불 고룡이 나타났습니다!', 'danger', bx, by);
   }
@@ -935,17 +1251,231 @@ export class World {
   }
 
   updateBandMorale(b: Band, dt: number) {
-    if (b.broken) return;
+    if (b.convoy) this.updateConvoy(b);
     let alive = 0;
-    for (const u of b.units) if (u.state === ST.ACTIVE || u.state === ST.CLIMB) alive++;
+    let fighting = 0;
+    let men = 0;
+    for (const u of b.units)
+      if (u.state === ST.ACTIVE || u.state === ST.CLIMB) {
+        alive++;
+        if (!u.fleeing) {
+          fighting++;
+          if (!isEngine(u)) men++;
+        }
+      }
     if (alive === 0) return;
+    // a siege tower at the wall with nobody left to climb it is an empty box: its crew pulls it back
+    if (men === 0 && this.t - b.contactT > TOWER_EMPTY_T)
+      for (const u of b.units) if (u.state === ST.ACTIVE && u.act === ACT.DOCKED && !u.fleeing) this.engineRetreat(u);
+    if (fighting > 0 && this.t - b.contactT > BAND_STALL_T) this.bandStalled(b, fighting);
+    if (b.broken) return;
     if (b.leader && b.leader.state === ST.ACTIVE && b.morale < b.tpl.morale) b.morale = Math.min(b.tpl.morale, b.morale + (b.leader.def.aura ?? 0) * 0.6 * dt);
     if (b.morale < 15) this.breakBand(b);
+  }
+
+  /** No progress for a long while: a strong band storms the walls, a weak (or already stalled) one withdraws. */
+  bandStalled(b: Band, fighting: number) {
+    b.contactT = this.t;
+    let x = 0;
+    let y = 0;
+    let n = 0;
+    for (const u of b.units)
+      if ((u.state === ST.ACTIVE || u.state === ST.CLIMB) && !u.fleeing) {
+        x += u.x;
+        y += u.y;
+        n++;
+      }
+    if (n) {
+      x /= n;
+      y /= n;
+    }
+    if (!b.broken && !b.assault && fighting >= Math.max(3, b.startCount * 0.35)) {
+      b.assault = true;
+      this.endConvoy(b);
+      this.event('assault', `${josa(b.tpl.name, '이/가')} 총공격에 나섭니다!`, 'warn', x, y);
+      return;
+    }
+    // withdraw: everyone still standing leaves the field (the dragon keeps its own counsel)
+    for (const u of b.units) {
+      if (u.state !== ST.ACTIVE || u.fleeing || u.def.role === 'dragon') continue;
+      if (isEngine(u)) this.engineRetreat(u);
+      else u.fleeing = true;
+    }
+    if (!b.broken) {
+      b.broken = true;
+      b.brokenT = this.t;
+    }
+    this.endConvoy(b);
+    this.event('withdraw', `${josa(b.tpl.name, '이/가')} 싸움을 포기하고 물러납니다.`, 'good', x, y);
+  }
+
+  /** Every man of the band still in the fight is a missile trooper with an empty quiver. */
+  bandShotOut(b: Band) {
+    let men = 0;
+    for (const u of b.units) {
+      if ((u.state !== ST.ACTIVE && u.state !== ST.CLIMB) || u.fleeing || isEngine(u)) continue;
+      if (!(u.def.role === 'ranged' && u.ammo < 1)) return false;
+      men++;
+    }
+    return men > 0;
+  }
+
+  /**
+   * Missile troops who have shot their quivers empty come forward to fight hand to hand, but hacking at a
+   * wall or gate with a bow or a crossbow butt would take them all day: a band with nothing left to shoot
+   * and nobody to fight goes home.
+   */
+  bandSpent(b: Band) {
+    let x = 0;
+    let y = 0;
+    let n = 0;
+    for (const u of b.units) {
+      if (u.state !== ST.ACTIVE || u.fleeing) continue;
+      x += u.x;
+      y += u.y;
+      n++;
+      if (isEngine(u)) this.engineRetreat(u);
+      else u.fleeing = true;
+    }
+    b.broken = true;
+    b.brokenT = this.t;
+    this.endConvoy(b);
+    if (n) this.event('withdraw', `${josa(b.tpl.name, '이/가')} 화살을 다 쏘고 물러납니다.`, 'good', x / n, y / n);
+  }
+
+  /** Convoy bookkeeping: anchor on the core, forward direction along its path, pace of the slowest member. */
+  updateConvoy(b: Band) {
+    if (b.broken) {
+      this.endConvoy(b);
+      return;
+    }
+    let lead: Unit | null = null;
+    let ld = Infinity;
+    for (const c of b.core) {
+      if (c.state !== ST.ACTIVE || c.fleeing) continue;
+      if (c.def.role === 'tower' && c.act === ACT.DOCKED) {
+        this.endConvoy(b); // docked: the escort storms the tower
+        return;
+      }
+      // anchor on the most advanced core unit so the screen walks in front of all of them
+      const d = this.fieldFor(c).dist[tileAt(c.x, c.y)];
+      if (!lead || d < ld) {
+        lead = c;
+        ld = d;
+      }
+    }
+    let esc = 0;
+    let pace = Infinity;
+    for (const u of b.units) {
+      if (u.escortIdx < 0 || u.state !== ST.ACTIVE || u.fleeing) continue;
+      esc++;
+      pace = Math.min(pace, u.def.speed);
+    }
+    if (!lead || !esc) {
+      this.endConvoy(b);
+      return;
+    }
+    b.ax = lead.x;
+    b.ay = lead.y;
+    b.pace = pace * T;
+    let fx: number;
+    let fy: number;
+    if (lead.def.role === 'treb' && lead.act === ACT.SET && lead.actTile >= 0) {
+      fx = cx(lead.actTile) - b.ax;
+      fy = cy(lead.actTile) - b.ay;
+    } else {
+      const f = this.fieldFor(lead);
+      let i = tileAt(b.ax, b.ay);
+      for (let k = 0; k < 3; k++) {
+        const nx = f.next[i];
+        if (nx < 0) break;
+        i = nx;
+      }
+      fx = cx(i) - b.ax;
+      fy = cy(i) - b.ay;
+    }
+    const m = Math.hypot(fx, fy);
+    if (m > 1) {
+      const nx = b.fdx * 0.85 + (fx / m) * 0.15;
+      const ny = b.fdy * 0.85 + (fy / m) * 0.15;
+      const mm = Math.hypot(nx, ny) || 1;
+      b.fdx = nx / mm;
+      b.fdy = ny / mm;
+    }
+    // formed: most escorts hold their slots; screened: a core unit with two escorts right next to it
+    let inSlot = 0;
+    for (const u of b.units) {
+      if (u.escortIdx < 0 || u.state !== ST.ACTIVE || u.fleeing) continue;
+      const [sx, sy] = this.convoySlot(u, b);
+      if (Math.hypot(u.x - sx, u.y - sy) < 1.5 * T) inSlot++;
+    }
+    b.formed = inSlot * 2 >= esc;
+    const R2 = (2 * T) ** 2;
+    for (const c of b.core) {
+      let near = 0;
+      if (c.state === ST.ACTIVE && !c.fleeing)
+        for (const u of b.units)
+          if (u.escortIdx >= 0 && u.state === ST.ACTIVE && !u.fleeing && (u.x - c.x) ** 2 + (u.y - c.y) ** 2 < R2 + c.def.r * c.def.r * 4) near++;
+      // a miner at work sits at the wall foot, right under the archers: the shields cannot cover him there
+      c.screened = near >= 2 && c.act !== ACT.DIG;
+    }
+  }
+
+  endConvoy(b: Band) {
+    b.convoy = false;
+    for (const c of b.core) c.screened = false;
+  }
+
+  /** Where an escort stands: an arc screening the front and flanks of its core. */
+  convoySlot(e: Unit, b: Band): [number, number] {
+    const per = 5;
+    const total = b.startCount - b.core.length;
+    const k = e.escortIdx;
+    const row = Math.floor(k / per);
+    const inRow = Math.max(1, Math.min(per, total - row * per));
+    const j = k % per;
+    const A = 1.35;
+    const ang = inRow > 1 ? -A + (2 * A * j) / (inRow - 1) : 0;
+    let coreR = 0;
+    for (const c of b.core) coreR = Math.max(coreR, c.def.r);
+    const R = coreR + (0.9 + row * 0.85) * T;
+    const lx = -b.fdy;
+    const ly = b.fdx;
+    const ca = Math.cos(ang);
+    const sa = Math.sin(ang);
+    const g = this.grid;
+    const at = tileAt(b.ax, b.ay);
+    const ok = (px: number, py: number) => {
+      if (px < 2 || py < 2 || px > WORLD_W - 2 || py > WORLD_H - 2) return false;
+      const t = tileAt(px, py);
+      return g.openGround(t) && g.inside[t] === g.inside[at];
+    };
+    let sx = b.ax + R * (ca * b.fdx + sa * lx);
+    let sy = b.ay + R * (ca * b.fdy + sa * ly);
+    if (ok(sx, sy)) return [sx, sy];
+    // the front is blocked (wall, cliff): close in behind the core instead
+    sx = b.ax + R * (-ca * b.fdx + sa * lx);
+    sy = b.ay + R * (-ca * b.fdy + sa * ly);
+    if (ok(sx, sy)) return [sx, sy];
+    return [b.ax + ((e.id % 5) - 2) * 3, b.ay + ((e.id % 3) - 1) * 3];
+  }
+
+  /** A crewed engine gives up: too damaged or its crew lost heart. */
+  engineRetreat(e: Unit) {
+    if (e.fleeing) return;
+    e.fleeing = true;
+    e.act = ACT.NONE;
+    if (e.def.role === 'tower') {
+      const lad = this.ladders.find((l) => l.tower === e);
+      if (lad) this.removeLadder(lad, false);
+    }
+    this.event('enginefled', `${josa(e.def.name, '이/가')} 물러납니다!`, 'good', e.x, e.y);
   }
 
   breakBand(b: Band) {
     if (b.broken) return;
     b.broken = true;
+    b.brokenT = this.t;
     let x = 0;
     let y = 0;
     let n = 0;
@@ -954,13 +1484,20 @@ export class World {
       x += u.x;
       y += u.y;
       n++;
-      const cornered = u.elev || this.grid.inside[tileAt(u.x, u.y)] === 1;
-      if (!(u.def.fearless && u.hp > u.maxHp * 0.4) && !cornered) u.fleeing = true;
+      if (isEngine(u)) {
+        // the crew is shaken when its escort scatters, but keeps working the machine
+        u.crew = Math.max(0, u.crew - 30);
+        continue;
+      }
+      if (u.def.role === 'sapper' && u.act === ACT.DIG) continue; // committed to the mine
+      if (u.def.role === 'dragon') continue; // a dragon does not care whether its kobolds run
+      // men inside the walls run too, by the way they came in; only those with no way out fight on (fleeOff)
+      if (!(u.def.fearless && u.hp > u.maxHp * 0.4)) u.fleeing = true;
     }
     if (n) {
       x /= n;
       y /= n;
-      this.event('broken', `${b.tpl.name}이(가) 무너져 달아납니다!`, 'good', x, y);
+      this.event('broken', `${josa(b.tpl.name, '이/가')} 무너져 달아납니다!`, 'good', x, y);
       for (const sq of this.squads) if (sq.alive && Math.hypot(sq.cx - x, sq.cy - y) < 10 * T) sq.morale = Math.min(100, sq.morale + 8);
     }
   }
@@ -1024,12 +1561,32 @@ export class World {
   walkField(u: Unit, f: Field, gx: number, gy: number, mul = 1) {
     const i = tileAt(u.x, u.y);
     const d = f.dist[i];
+    if (!isFinite(d) && this.gatesShut > 0 && u.side === 0) {
+      // cut off by a barred gate: wait at it until it opens (walking straight would just hug the wall)
+      const gt = this.nearestShutGate(u);
+      if (gt >= 0 && Math.hypot(cx(gt) - gx, cy(gt) - gy) > 1.5 * T) return this.moveToward(u, cx(gt), cy(gt), mul);
+    }
     if (d <= 1.5 || !isFinite(d)) return this.moveToward(u, gx, gy, mul);
     const n = f.next[i];
     if (n < 0) return this.moveToward(u, gx, gy, mul);
     const j = ((u.id * 13) % 7) - 3;
     this.moveToward(u, cx(n) + j * 0.9, cy(n) + ((u.id * 7) % 5 - 2) * 0.9, mul);
     return false;
+  }
+
+  nearestShutGate(u: Unit): number {
+    const g = this.grid;
+    let best = -1;
+    let bd = Infinity;
+    for (const i of g.structTiles) {
+      if (g.tiles[i] !== Tile.GATE || !g.gateShut[i]) continue;
+      const d = Math.hypot(cx(i) - u.x, cy(i) - u.y);
+      if (d < bd) {
+        bd = d;
+        best = i;
+      }
+    }
+    return best;
   }
 
   moveToSlot(u: Unit) {
@@ -1039,7 +1596,72 @@ export class World {
       u.moveT = 0;
       return true;
     }
+    // the post is burning (or in a dragon's breath): wait beside it instead of walking back into the flames
+    if (d < 3 * T && this.tileDanger(tileAt(u.slotX, u.slotY)) > 0) {
+      u.moveT = 0;
+      return true;
+    }
     return this.walkField(u, sq.field, u.slotX, u.slotY);
+  }
+
+  /**
+   * How dangerous a tile is to stand on: 1 if it burns, plus 1 (more toward the axis) for every dragon
+   * breathing a cone over it. 0 = safe.
+   */
+  tileDanger(i: number): number {
+    let d = this.fire[i] > 0 ? 1 : 0;
+    if (this.breathing.length) {
+      const x = cx(i);
+      const y = cy(i);
+      for (const e of this.breathing) {
+        const dx = x - e.x;
+        const dy = y - e.y;
+        // the dragon drifts forward as it breathes: a little margin on the reach and the angle
+        if (dx * dx + dy * dy > (BREATH_LEN + T) ** 2) continue;
+        let da = Math.abs(Math.atan2(dy, dx) - Math.atan2(e.fy, e.fx));
+        if (da > Math.PI) da = Math.PI * 2 - da;
+        const half = BREATH_HALF + 0.2;
+        if (da < half) d += 1 + (half - da);
+      }
+    }
+    return d;
+  }
+
+  /**
+   * Fire and breath are the soldiers' own business (GAME_DESIGN §5: micro is the AI's): a defender on a
+   * burning tile or in a dragon's breath steps to the safest neighbouring tile. He keeps to his level
+   * (a single step stays inside even a holding squad's 1.3-tile leash); off the wall walk he goes only
+   * down into the courtyard, and only when nothing on the wall is safer. No RNG. Returns true if he moves.
+   */
+  avoidDanger(u: Unit): boolean {
+    const g = this.grid;
+    const ti = tileAt(u.x, u.y);
+    const here = this.tileDanger(ti);
+    if (here <= 0) return false;
+    const x = tx(ti);
+    const y = ty(ti);
+    const el = g.isElev(ti);
+    let best = -1;
+    let bs = Infinity;
+    for (const [dx, dy] of N8) {
+      const xx = x + dx;
+      const yy = y + dy;
+      if (!inb(xx, yy)) continue;
+      const j = idx(xx, yy);
+      if (!g.defCanMove(ti, j)) continue;
+      const down = g.isElev(j) !== el;
+      if (down && !(el && g.inside[j] === 1)) continue;
+      const dj = this.tileDanger(j);
+      if (dj >= here) continue;
+      const s = dj * 600 + (down ? 300 : 0) + Math.hypot(cx(j) - u.slotX, cy(j) - u.slotY) + Math.hypot(dx, dy) * 4;
+      if (s < bs) {
+        bs = s;
+        best = j;
+      }
+    }
+    if (best < 0) return false;
+    this.moveToward(u, cx(best), cy(best));
+    return true;
   }
 
   /** Is there an intact structure (or keep/cliff) between two ground points? */
@@ -1132,6 +1754,8 @@ export class World {
       return;
     }
     const role = u.def.role;
+    // an engineer at work stays at it (putting out a burning wall is his job); everyone else steps clear
+    if (!(role === 'engineer' && sq.taskTile >= 0) && this.avoidDanger(u)) return;
     if (role === 'engineer' && this.engineerAI(u, sq)) return;
     if (role === 'surgeon' && this.surgeonAI(u)) return;
     this.combatAI(u, sq);
@@ -1200,10 +1824,15 @@ export class World {
         if (e.state === ST.CLIMB || (e.elev && g.inside[tileAt(u.x, u.y)] !== 1)) s *= 0.55;
         if (e.elev) s *= 0.6;
         const r = e.def.role;
-        if (r === 'ladder' || r === 'sapper') s *= 0.6;
+        if ((r === 'ladder' || r === 'sapper') && !e.screened && e.act !== ACT.DIG) s *= 0.6;
+        // a miner at work under the wall is the first mark: every second he digs brings the wall down
+        if (r === 'sapper' && e.act === ACT.DIG) s *= 0.45;
         if (e.def.leader) s *= 0.8;
+        // the dragon is the one target worth an armoured hide's worth of arrows: every wound harries it
+        if (e.def.role === 'dragon') s *= 0.4;
         if (e.def.role === 'healer') s *= 0.75;
         if (e.fleeing) s *= 1.8;
+        if (e.screened && e !== sq.focus) s *= 2.5; // hidden behind the escort's shields
       }
       return s;
     });
@@ -1293,7 +1922,8 @@ export class World {
     let dmg = u.def.atk * u.atkMul * mul * this.moraleMul(u.squad);
     if (u.hp < u.maxHp * 0.35) dmg *= 0.75;
     if (t.state === ST.CLIMB) dmg *= 1.6;
-    if (u.elev && !t.elev && !t.def.flying) dmg *= 0.6;
+    // striking down from the wall walk is awkward, except stones dropped on a miner's mantlet at the wall foot
+    if (u.elev && !t.elev && !t.def.flying) dmg *= t.act === ACT.DIG ? SAPPER_STONES : 0.6;
     if (t.def.cavalry && u.def.antiCav) dmg *= u.def.antiCav;
     if (u.def.cavalry && u.moveT > 0.8) {
       dmg *= 1.9;
@@ -1316,6 +1946,7 @@ export class World {
     if (sq && sq.morale < 40) acc *= 0.8;
     if (t.def.big) acc = Math.min(0.97, acc * 1.3);
     if (t.state === ST.CLIMB) acc *= 1.1;
+    if (t.screened && !t.def.big) acc *= 0.55;
     const hit = this.rng.chance(acc);
     const dmg = u.def.atk * u.rangedMul * this.moraleMul(sq);
     this.launch(u, t, hit, dmg, u.def.ap ?? 0, u.def.proj ?? 'arrow');
@@ -1362,7 +1993,9 @@ export class World {
     const wx = cx(tt) + ((u.id % 5) - 2) * 2.5;
     const wy = cy(tt) + ((u.id % 3) - 1) * 3;
     const d = Math.hypot(wx - u.x, wy - u.y);
-    if (d > 0.9 * T) {
+    // a barred gate is mended from behind it (the crew cannot stand in the gateway)
+    const barred = g.tiles[tt] === Tile.GATE && g.gateShut[tt] === 1;
+    if (d > (barred ? 1.6 : 0.9) * T) {
       if (this.walkTo(u, tt, wx, wy)) return true;
       return true;
     }
@@ -1381,6 +2014,11 @@ export class World {
       this.supplies.mats = Math.max(0, this.supplies.mats - amt / 22);
       if (this.rng.chance(0.04)) this.fx.push({ k: 'repair', x: cx(tt), y: cy(tt) });
     } else if (kind === 2 || kind === 3) {
+      if (!g.wallLine[tt]) {
+        // only the castle's own wall line can be rebuilt (never decorative field rubble)
+        sq.taskTile = -1;
+        return false;
+      }
       const need = kind === 2 ? 40 : 60;
       if (this.supplies.mats < need) {
         this.alert('nomats', '자재가 부족해 재건할 수 없습니다.', 'warn');
@@ -1394,7 +2032,9 @@ export class World {
         if (!blocked) {
           this.supplies.mats -= need;
           g.tiles[tt] = kind === 2 ? Tile.GATE : Tile.WALL;
-          g.maxHp[tt] = TILE_INFO[g.tiles[tt]].maxHp * (1 + 0.12 * (this.up.masonry ?? 0));
+          // the same strength as the castle's own walls this battle (research and daily mods alike)
+          g.maxHp[tt] = TILE_INFO[g.tiles[tt]].maxHp * this.structHpMul;
+          if (kind === 2) this.gateBoosted.delete(tt); // a new gate: the council may strengthen it again
           g.hp[tt] = g.maxHp[tt] * 0.35;
           g.refreshStructs();
           this.fieldsDirty = true;
@@ -1412,10 +2052,18 @@ export class World {
   /** Defender walk to a tile using a cached per-unit approach (squad field if same, else direct). */
   walkTo(u: Unit, tile: number, gx: number, gy: number): boolean {
     const sq = u.squad!;
+    const g = this.grid;
     if (!sq.tfield) sq.tfield = newField();
     if (sq.tfieldTile !== tile || this.fieldsDirty) {
       sq.tfieldTile = tile;
-      this.grid.defenderField([tile], sq.tfield);
+      const goals = [tile];
+      if (g.tiles[tile] === Tile.GATE && g.gateShut[tile])
+        for (let k = 0; k < 4; k++) {
+          const x = tx(tile) + N8[k][0];
+          const y = ty(tile) + N8[k][1];
+          if (inb(x, y) && g.inside[idx(x, y)]) goals.push(idx(x, y));
+        }
+      g.defenderField(goals, sq.tfield);
     }
     return this.walkField(u, sq.tfield, gx, gy);
   }
@@ -1576,18 +2224,17 @@ export class World {
     e.retarget -= dt;
     if (e.def.regen && e.hp < e.maxHp) e.hp = Math.min(e.maxHp, e.hp + e.def.regen * dt);
     const role = e.def.role;
+    if (e.crew > 0 && !e.fleeing) {
+      // engines answer to their own crew, not to the escort band: they leave only when wrecked or shattered
+      e.crew = Math.min(100, e.crew + 0.6 * dt);
+      if (e.hp < e.maxHp * 0.25 || e.crew < 20) this.engineRetreat(e);
+    }
     if (role === 'dragon' || role === 'flyer') {
       this.flyerAI(e, dt);
       return;
     }
     if (e.fleeing) {
-      const sx = e.spawnX;
-      const sy = e.spawnY;
-      this.moveToward(e, sx, sy, 1.05);
-      if (e.x < 3 || e.y < 3 || e.y > WORLD_H - 3 || e.x > WORLD_W - 3) {
-        e.state = ST.FLED;
-        this.stats.routed++;
-      }
+      this.fleeOff(e);
       return;
     }
     if (e.act === ACT.PLANT || e.act === ACT.DIG || e.act === ACT.DOCKED) {
@@ -1605,8 +2252,10 @@ export class World {
         if (this.rng.chance(0.03)) this.fx.push({ k: 'eheal', x: w.x, y: w.y });
       }
     }
-    const ranged = e.def.range > 0;
+    const ranged = e.def.range > 0 && e.ammo >= 1;
     const noFight = role === 'ram' || role === 'tower';
+    const assault = !!e.band && e.band.assault;
+    const convoy = e.escortIdx >= 0 && e.band && e.band.convoy ? e.band : null;
     if (!noFight && (e.retarget <= 0 || (e.target && e.target.state !== ST.ACTIVE))) {
       e.retarget = 0.35 + this.rng.next() * 0.25;
       e.target = ranged ? this.enemyRangedTarget(e) : this.enemyMeleeTarget(e);
@@ -1615,7 +2264,7 @@ export class World {
     if (t && t.state === ST.ACTIVE && !noFight) {
       const d = Math.hypot(t.x - e.x, t.y - e.y);
       if (ranged) {
-        if (e.def.kite) {
+        if (e.def.kite && !assault) {
           const threat = this.dHash.best(e.x, e.y, 2.6 * T, (o) => (o.def.range === 0 && o.elev === e.elev ? 0 : Infinity));
           if (threat) {
             const ax = e.x - threat.x;
@@ -1629,17 +2278,23 @@ export class World {
           e.fx = (t.x - e.x) / (d || 1);
           e.fy = (t.y - e.y) / (d || 1);
           if (e.cd <= 0) this.enemyShoot(e, t);
-          return;
+          if (!assault) return; // storming: shoot on the move
         }
       } else {
-        const reach = e.def.r + t.def.r + e.def.reach + 1;
-        if (d <= reach) {
+        const up = t.elev && !e.elev && e.def.role !== 'giant';
+        if (up && !this.reachesWallTop(e, t)) {
+          // a wall-top defender is only reachable from right beside the wall, inside the castle
+          e.target = null;
+        }
+        const reach = e.def.r + t.def.r + e.def.reach + (up ? WALLTOP_REACH : 1);
+        if (e.target && d <= reach) {
           e.fx = (t.x - e.x) / (d || 1);
           e.fy = (t.y - e.y) / (d || 1);
           if (e.cd <= 0) {
             e.cd = e.def.cd * this.rng.range(0.9, 1.1);
             let dmg = e.def.atk * e.atkMul;
             if (e.elev && !t.elev) dmg *= 0.8;
+            if (up) dmg *= WALLTOP_HIT_MUL; // striking up at the wall walk
             if (e.def.cavalry && e.moveT > 0.8) dmg *= 1.8;
             if (t.def.cavalry && e.def.antiCav) dmg *= e.def.antiCav;
             if (e.band && e.band.broken) dmg *= 0.8;
@@ -1650,11 +2305,17 @@ export class World {
           }
           return;
         }
-        if (d < 3.5 * T) {
+        if (e.target && d < 3.5 * T && !(convoy && Math.hypot(t.x - convoy.ax, t.y - convoy.ay) > 5 * T)) {
           this.moveToward(e, t.x, t.y);
           return;
         }
       }
+    }
+    if (convoy) {
+      // escort: keep the screen around the engine / sappers, at their pace
+      const [sx, sy] = this.convoySlot(e, convoy);
+      this.moveToward(e, sx, sy);
+      return;
     }
     // advance along the path field
     const f = this.fieldFor(e);
@@ -1668,6 +2329,7 @@ export class World {
       this.moveToward(e, this.grid.keepX, this.grid.keepY);
       return;
     }
+    if (role === 'tower' && this.grid.wallLine[n] && !this.grid.isStruct(n) && this.towerBesideBreach(e, n)) return;
     const inf = TILE_INFO[this.grid.tiles[n]];
     if (inf.struct && !(e.elev && inf.elev)) {
       const d = Math.hypot(cx(n) - e.x, cy(n) - e.y);
@@ -1681,14 +2343,111 @@ export class World {
     }
     const j = ((e.id * 7919) % 9) - 4;
     const k = ((e.id * 104729) % 9) - 4;
-    this.moveToward(e, cx(n) + j * 1.1, cy(n) + k * 1.1);
+    // screened sappers walk a little slower than their shield escort so the screen stays in front
+    const b = e.band;
+    const mul = role === 'sapper' && b && b.convoy ? Math.min(1, ((b.formed ? 0.85 : 0.35) * b.pace) / (e.def.speed * T)) : 1;
+    this.moveToward(e, cx(n) + j * 1.1, cy(n) + k * 1.1, mul);
+  }
+
+  /**
+   * A fleeing ground enemy leaves the map by the way out (exit field): out of the courtyard through the
+   * breach or gate it came in by, round the walls, off the nearest edge. From a wall top it drops down.
+   */
+  fleeOff(e: Unit) {
+    const i = tileAt(e.x, e.y);
+    let gx = e.spawnX;
+    let gy = e.spawnY;
+    if (this.exitDirty) {
+      this.exitDirty = false;
+      this.grid.exitField(this.exitField);
+    }
+    const f = this.exitField;
+    if (e.elev) {
+      // on the wall walk: climb down on whichever side has the shorter way out
+      let best = -1;
+      let bd = Infinity;
+      for (const [dx, dy] of N8) {
+        const x = tx(i) + dx;
+        const y = ty(i) + dy;
+        if (!inb(x, y)) continue;
+        const j = idx(x, y);
+        if (f.dist[j] < bd) {
+          bd = f.dist[j];
+          best = j;
+        }
+      }
+      if (best >= 0) {
+        gx = cx(best);
+        gy = cy(best);
+      }
+    } else {
+      const n = f.next[i];
+      if (!isFinite(f.dist[i])) {
+        // trapped inside with no way out on foot (gates shut, no breach): a cornered man fights on,
+        // an abandoned engine just stands there
+        if (!isEngine(e)) e.fleeing = false;
+        return;
+      }
+      if (n >= 0) {
+        gx = cx(n) + (((e.id * 7919) % 5) - 2) * 1.5;
+        gy = cy(n) + (((e.id * 104729) % 5) - 2) * 1.5;
+      } else if (f.dist[i] === 0) {
+        // on the border: straight off the nearest edge
+        const x = tx(i);
+        const y = ty(i);
+        const d = [x, GW - 1 - x, y, GH - 1 - y];
+        const k = d.indexOf(Math.min(...d));
+        gx = k === 0 ? -20 : k === 1 ? WORLD_W + 20 : e.x;
+        gy = k === 2 ? -20 : k === 3 ? WORLD_H + 20 : e.y;
+      }
+    }
+    this.moveToward(e, gx, gy, 1.05);
+    if (e.x < 3 || e.y < 3 || e.y > WORLD_H - 3 || e.x > WORLD_W - 3) {
+      e.state = ST.FLED;
+      this.stats.routed++;
+    }
+  }
+
+  /** A siege tower reaching a breach docks against the intact wall beside it rather than rolling inside. */
+  towerBesideBreach(e: Unit, n: number): boolean {
+    const g = this.grid;
+    let best = -1;
+    let bd = Infinity;
+    for (let dy = -2; dy <= 2; dy++)
+      for (let dx = -2; dx <= 2; dx++) {
+        const x = tx(n) + dx;
+        const y = ty(n) + dy;
+        if (!inb(x, y)) continue;
+        const j = idx(x, y);
+        if (g.tiles[j] !== Tile.WALL || this.ladders.some((l) => l.tile === j && l.tower)) continue;
+        const d = Math.hypot(cx(j) - e.x, cy(j) - e.y);
+        if (d < bd) {
+          bd = d;
+          best = j;
+        }
+      }
+    if (best < 0) return false;
+    if (bd > T * 0.5 + e.def.r + 4.5) {
+      this.moveToward(e, cx(best), cy(best));
+      if (Math.hypot(e.x - e.px, e.y - e.py) < 0.05) this.handleObstacle(e, best);
+    } else this.handleObstacle(e, best);
+    return true;
+  }
+
+  /** An enemy on the ground inside the walls (courtyard or breach) can reach defenders on the wall top beside it. */
+  reachesWallTop(e: Unit, d: Unit): boolean {
+    if (e.elev || !d.elev) return false;
+    const g = this.grid;
+    const et = tileAt(e.x, e.y);
+    if (g.inside[et] !== 1 && !g.isBoundary(et)) return false;
+    return Math.hypot(d.x - e.x, d.y - e.y) <= e.def.r + d.def.r + e.def.reach + WALLTOP_REACH;
   }
 
   enemyMeleeTarget(e: Unit): Unit | null {
     const R = e.def.role === 'ladder' || e.def.role === 'sapper' ? 1.1 * T : e.def.role === 'giant' ? 2 * T : 2.6 * T;
     const giant = e.def.role === 'giant';
     return this.dHash.best(e.x, e.y, R, (d, d2) => {
-      if (d.elev && !e.elev && !giant) return Infinity;
+      if (d.elev && !e.elev && !giant) return this.reachesWallTop(e, d) ? d2 * 1.6 : Infinity;
       if (!d.elev && !e.elev && this.blockedBetween(e.x, e.y, d.x, d.y)) return Infinity;
       return d2;
     });
@@ -1701,6 +2460,7 @@ export class World {
 
   enemyShoot(e: Unit, t: Unit) {
     e.cd = e.def.cd * this.rng.range(0.9, 1.2);
+    e.ammo -= 1;
     const d = Math.hypot(t.x - e.x, t.y - e.y);
     let acc = e.def.proj === 'bolt' ? 0.78 : 0.7;
     acc *= 1 - 0.3 * (d / (e.def.range * T));
@@ -1730,13 +2490,13 @@ export class World {
     }
     if (role === 'sapper' && (t === Tile.WALL || t === Tile.TOWER)) {
       e.act = ACT.DIG;
-      e.timer = 12;
+      e.timer = Math.max(0.5, SAPPER_DIG_T - this.mineProg[n]);
       e.actTile = n;
       this.alert('sapper' + n, '갱도병이 성벽 밑을 파고 있습니다!', 'danger', cx(n), cy(n));
       return;
     }
     if (role === 'tower') {
-      if (t === Tile.WALL && !this.ladderAt(n)) {
+      if (t === Tile.WALL && !this.ladders.some((l) => l.tile === n && l.tower)) {
         e.act = ACT.DOCKED;
         e.actTile = n;
         this.addLadder(n, e.x, e.y, e);
@@ -1756,6 +2516,12 @@ export class World {
       }
       return;
     }
+    if (role === 'ram' && e.band) this.endConvoy(e.band); // at the gate: escorts join the assault
+    if (role === 'ranged' && e.ammo < 1 && e.band && !e.band.broken && this.bandShotOut(e.band)) {
+      this.bandSpent(e.band);
+      return;
+    }
+    if (e.band) e.band.contactT = this.t;
     if (e.cd <= 0) {
       e.cd = e.def.cd * this.rng.range(0.9, 1.1);
       let dmg = this.structDamageOf(e);
@@ -1769,6 +2535,9 @@ export class World {
   enemyAction(e: Unit, dt: number) {
     const g = this.grid;
     const n = e.actTile;
+    // planting a ladder or digging a mine is progress; a docked tower is only progress while men climb it
+    // (updateClimb), so a tower left alone at the wall cannot hold its band in the fight for ever
+    if (e.band && e.act !== ACT.DOCKED) e.band.contactT = this.t;
     if (e.act === ACT.PLANT) {
       if (g.tiles[n] !== Tile.WALL || this.ladderAt(n)) {
         e.act = ACT.DONE_LADDER;
@@ -1787,10 +2556,16 @@ export class World {
         e.act = ACT.NONE;
         return;
       }
-      e.timer -= dt;
+      // one tunnel per wall tile: a second miner at the same spot is a relief, not twice the speed
+      if (this.mineT[n] !== this.t) {
+        this.mineT[n] = this.t;
+        this.mineProg[n] += dt;
+      }
+      e.timer = Math.max(0, SAPPER_DIG_T - this.mineProg[n]);
       if (this.rng.chance(0.08)) this.fx.push({ k: 'dust', x: e.x, y: e.y });
       if (e.timer <= 0) {
         e.act = ACT.NONE;
+        if (e.band) this.endConvoy(e.band); // breach blown: everyone rushes it
         this.destroyStruct(n, 'sapped');
         // collapse an adjacent wall tile too
         for (let d = 0; d < 4; d++) {
@@ -1811,11 +2586,19 @@ export class World {
   }
 
   updateClimb(e: Unit, dt: number) {
+    if (e.band) e.band.contactT = this.t;
     const lad = this.ladderAt(e.actTile);
     if (!lad) {
-      // ladder pushed or tower destroyed: fall
+      // ladder pushed or tower destroyed: he falls to the foot of the wall, on the outside
       e.state = ST.ACTIVE;
       e.elev = false;
+      const g = this.grid;
+      const here = tileAt(e.x, e.y);
+      const foot = g.nearestTile(here, (k) => g.openGround(k) && !g.inside[k], 3);
+      if (foot >= 0 && foot !== here) {
+        e.x = cx(foot);
+        e.y = cy(foot);
+      }
       this.damage(e, 25, 1, null, false);
       return;
     }
@@ -1834,19 +2617,37 @@ export class World {
   }
 
   attackKeep(e: Unit) {
+    if (e.band) e.band.contactT = this.t;
     if (e.cd > 0) return;
     e.cd = e.def.cd * this.rng.range(0.9, 1.1);
     const dmg = e.def.role === 'ram' ? (e.def.sdmg ?? 60) * 0.6 * e.atkMul : e.def.atk * e.atkMul * Math.max(0.5, e.def.sdmg ?? 0.5) * 0.6;
-    this.keepHp -= dmg;
+    const fresh = this.t - this.lastKeepHit > 20;
+    this.lastKeepHit = this.t;
+    this.keepHp -= dmg * this.keepPressMul();
     if (this.rng.chance(0.2)) this.fx.push({ k: 'chip', x: e.x, y: e.y });
-    if (this.t - this.lastKeepAlert > 6) {
-      this.lastKeepAlert = this.t;
-      this.event('keep', '본성이 공격받고 있습니다!', 'danger', this.grid.keepX, this.grid.keepY);
-    }
+    this.keepAlert(fresh);
     if (this.keepHp <= 0) {
       this.keepHp = 0;
       this.finish(false);
     }
+  }
+
+  /** damage multiplier of a keep assault that has gone on for a while (they are breaking in) */
+  keepPressMul() {
+    return 1 + Math.min(KEEP_PRESS_MAX, this.keepPress / KEEP_PRESS_T);
+  }
+
+  /**
+   * '본성이 공격받고 있습니다!' when an assault on the keep starts (`fresh`: first blow after a lull), then
+   * once per further 10% of the keep lost while it goes on.
+   */
+  keepAlert(fresh: boolean) {
+    const lost = this.keepAlertHp - this.keepHp >= this.keepMax * 0.1;
+    if (!(fresh || lost) || this.t - this.lastKeepAlert < 6) return;
+    this.lastKeepAlert = this.t;
+    this.keepAlertHp = this.keepHp;
+    const pct = Math.round((100 * this.keepHp) / this.keepMax);
+    this.event('keep', fresh ? '본성이 공격받고 있습니다!' : `본성이 공격받고 있습니다! (남은 내구도 ${pct}%)`, 'danger', this.grid.keepX, this.grid.keepY);
   }
 
   trebAI(e: Unit) {
@@ -1876,6 +2677,10 @@ export class World {
       return;
     }
     if (e.cd > 0) return;
+    if (e.ammo < 1) {
+      this.engineRetreat(e); // out of stones: nothing left to do here
+      return;
+    }
     e.cd = e.def.cd * this.rng.range(0.9, 1.1);
     // choose a structure in range, prefer gates and damaged walls near the current aim
     let best = -1;
@@ -1902,6 +2707,8 @@ export class World {
     }
     const txp = keep ? g.keepX : cx(best) + this.rng.range(-5, 5);
     const typ = keep ? g.keepY : cy(best) + this.rng.range(-5, 5);
+    e.ammo -= 1;
+    if (e.band) e.band.contactT = this.t; // a working battery is pressing the siege
     this.projectiles.push({
       x: e.x,
       y: e.y,
@@ -1913,7 +2720,7 @@ export class World {
       dur: 2.3,
       target: null,
       side: 1,
-      dmg: 30 * e.atkMul,
+      dmg: TREB_SPLASH_DMG * e.atkMul,
       ap: 0.5,
       kind: 'stone',
       structTile: keep ? -1 : best,
@@ -1927,17 +2734,26 @@ export class World {
   flyerAI(e: Unit, dt: number) {
     const g = this.grid;
     const dragon = e.def.role === 'dragon';
-    if (e.fleeing || (dragon && e.hp < e.maxHp * 0.18)) {
-      if (!e.fleeing) {
+    if (dragon && !e.fleeing) {
+      e.pain = Math.max(0, e.pain - dt / DRAGON_PAIN_DECAY);
+      const hurt = e.hp < e.maxHp * DRAGON_FLEE_HP;
+      const harried = e.pain >= DRAGON_PAIN_MAX;
+      // its retinue does not matter; only a very long stay with no real wound sends it home sated
+      const b = e.band;
+      const tired = this.t - e.bornT > DRAGON_MAX_STAY;
+      if (hurt || harried || tired) {
         e.fleeing = true;
-        this.event('dragonflee', '고룡이 상처를 입고 물러갑니다!', 'good', e.x, e.y);
-        if (dragon) {
-          this.stats.dragons++;
+        const driven = hurt || harried || e.hp <= e.maxHp * 0.8;
+        if (driven) {
+          this.countDragon(e);
           this.stats.bounty += Math.round(e.def.gold * 0.6);
-        }
-        for (const b of this.bands) if (b.tpl.faction === 'wyrm' && b !== e.band) b.morale -= 45;
-        if (e.band) e.band.morale -= 60;
+          this.event('dragonflee', harried && !hurt ? '노포 세례에 고룡이 물러갑니다!' : '고룡이 상처를 입고 물러갑니다!', 'good', e.x, e.y);
+        } else this.event('dragonleave', '고룡이 하늘 높이 날아갑니다.', 'warn', e.x, e.y);
+        for (const o of this.bands) if (o.tpl.faction === 'wyrm' && o !== b) o.morale -= 45;
+        if (b) b.morale -= 60;
       }
+    }
+    if (e.fleeing) {
       this.moveToward(e, -60, e.y, 1.2);
       if (e.x < -30) {
         e.state = ST.FLED;
@@ -1956,6 +2772,7 @@ export class World {
             if (this.moveToward(e, g.keepX, g.keepY) || Math.hypot(g.keepX - e.x, g.keepY - e.y) < 2 * T) {
               if (e.cd <= 0) {
                 e.cd = e.def.cd;
+                if (e.band) e.band.contactT = this.t;
                 this.keepHp -= e.def.atk * e.atkMul * 0.6;
                 if (this.keepHp <= 0) {
                   this.keepHp = 0;
@@ -2005,7 +2822,7 @@ export class World {
       const d = Math.hypot(e.ftx - e.x, e.fty - e.y);
       if (d < 4.2 * T) {
         e.fState = 1;
-        e.fT = 2.6;
+        e.fT = BREATH_T;
         e.fx = (e.ftx - e.x) / (d || 1);
         e.fy = (e.fty - e.y) / (d || 1);
         this.fx.push({ k: 'roar', x: e.x, y: e.y });
@@ -2016,13 +2833,13 @@ export class World {
       e.timer -= dt;
       if (e.timer <= 0) {
         e.timer = 0.2;
-        const L = 5.5 * T;
-        const dmgTick = e.def.atk * e.atkMul * 0.2;
+        const L = BREATH_LEN;
+        const dmgTick = e.def.atk * e.atkMul * DRAGON_BREATH;
         this.dHash.each(e.x, e.y, L, (d) => {
           const a = Math.atan2(d.y - e.y, d.x - e.x);
           let da = Math.abs(a - ang);
           if (da > Math.PI) da = Math.PI * 2 - da;
-          if (da < 0.5) {
+          if (da < BREATH_HALF) {
             d.fireDeath = true;
             this.damage(d, dmgTick, 0.6, e, false);
             d.fireDeath = false;
@@ -2037,6 +2854,7 @@ export class World {
         }
         this.fx.push({ k: 'breath', x: e.x, y: e.y, a: ang });
         if (Math.hypot(g.keepX - e.x, g.keepY - e.y) < 5 * T) {
+          if (e.band) e.band.contactT = this.t;
           this.keepHp -= dmgTick * 1.5;
           if (this.keepHp <= 0) {
             this.keepHp = 0;
@@ -2072,9 +2890,15 @@ export class World {
     const armor = Math.min(0.85, t.def.armor + t.armorAdd);
     let eff = dmg * (1 - armor * (1 - ap));
     if (ranged && t.def.rangedResist) eff *= t.def.rangedResist;
+    if (ranged && t.screened) eff *= 0.5; // the escort's shields catch half of it
+    else if (ranged && t.act === ACT.DIG) eff *= SAPPER_COVER; // a miner at work is under his mantlet
+    if (src && src.side === 1 && src.band) src.band.contactT = this.t; // the attackers are making headway
+    else if (src && src.side === 0 && !ranged && t.band) t.band.contactT = this.t; // locked in melee
     if (t.side === 0 && t.squad && t.squad.routing) eff *= 1.25;
     if (t.fleeing) eff *= 1.2;
     t.hp -= eff;
+    if (t.crew > 0) t.crew = Math.max(0, t.crew - (eff / t.maxHp) * 60);
+    if (t.def.role === 'dragon') t.pain += src && src.def.id === 'd_ballista' ? 1 : eff / (t.maxHp * DRAGON_PAIN_DMG);
     t.hitFlash = 0.12;
     if (this.rng.chance(0.25)) this.fx.push({ k: 'blood', x: t.x, y: t.y, a: t.side });
     if (t.hp <= 0) {
@@ -2111,13 +2935,20 @@ export class World {
     }
     if (e.def.role === 'dragon') {
       this.event('dragonslain', '잿불 고룡을 쓰러뜨렸습니다!', 'good', e.x, e.y);
-      this.stats.dragons++;
+      this.countDragon(e);
       for (const o of this.bands) if (o.tpl.faction === 'wyrm') o.morale -= 50;
     }
     if (e.def.role === 'tower') {
       const lad = this.ladders.find((l) => l.tower === e);
       if (lad) this.removeLadder(lad, false);
     }
+  }
+
+  /** stats.dragons counts each dragon once, whether driven off or slain */
+  countDragon(e: Unit) {
+    if (this.dragonsCounted.has(e.id)) return;
+    this.dragonsCounted.add(e.id);
+    this.stats.dragons++;
   }
 
   damageStruct(i: number, dmg: number) {
@@ -2134,6 +2965,7 @@ export class World {
     if (!TILE_INFO[t].struct) return;
     g.tiles[i] = t === Tile.GATE ? Tile.GATE_BROKEN : Tile.RUBBLE;
     g.hp[i] = 0;
+    this.mineProg[i] = 0;
     g.refreshStructs();
     this.fieldsDirty = true;
     this.dirtyTiles.push(i);
@@ -2210,9 +3042,9 @@ export class World {
       } else if (p.structTile >= 0) this.damageStruct(p.structTile, (p.src?.def.sdmg ?? 120) * (p.src?.atkMul ?? 1));
       this.fx.push({ k: 'boom', x: p.tx, y: p.ty });
       const hit = (u: Unit) => {
-        if (Math.hypot(u.x - p.tx, u.y - p.ty) < 22) this.damage(u, p.dmg, 0.5, p.src, false);
+        if (Math.hypot(u.x - p.tx, u.y - p.ty) < TREB_SPLASH_R) this.damage(u, p.dmg, 0.5, p.src, false);
       };
-      this.dHash.each(p.tx, p.ty, 22, hit);
+      this.dHash.each(p.tx, p.ty, TREB_SPLASH_R, hit);
       return;
     }
     if (p.area) {
@@ -2227,7 +3059,7 @@ export class World {
         this.damage(t, p.dmg, p.ap, p.src, ranged);
         if (p.kind === 'fire') {
           const i = tileAt(t.x, t.y);
-          this.fire[i] = Math.max(this.fire[i], 3);
+          this.fire[i] = Math.max(this.fire[i], this.grid.isElev(i) ? POT_FIRE_STONE : 3);
         }
         return;
       }
@@ -2239,7 +3071,7 @@ export class World {
     if (stray && this.rng.chance(0.5)) this.damage(stray, p.dmg * 0.7, p.ap, p.src, ranged);
     if (p.kind === 'fire') {
       const i = tileAt(p.tx, p.ty);
-      this.fire[i] = Math.max(this.fire[i], 2.5);
+      this.fire[i] = Math.max(this.fire[i], this.grid.isElev(i) ? POT_FIRE_STONE * 0.8 : 2.5);
     }
   }
 
@@ -2382,11 +3214,11 @@ export class World {
         if (e.elev && e.state !== ST.CLIMB) continue;
         if (Math.hypot(e.x - ox, e.y - oy) > R) continue;
         e.fireDeath = true;
-        this.damage(e, 75 * (e.def.fireWeak ?? 1) * (e.def.big ? 2.5 : 1), 0.8, null, false);
+        this.damage(e, OIL_DMG * (e.def.fireWeak ?? 1) * (e.def.big ? 2.5 : 1), 0.8, null, false);
         e.fireDeath = false;
         if (e.band) hitBands.add(e.band);
       }
-      for (const b of hitBands) b.morale -= 12;
+      for (const b of hitBands) b.morale -= OIL_MORALE;
       for (const l of [...this.ladders]) if (Math.hypot(cx(l.tile) - ox, cy(l.tile) - oy) < R && !l.tower) this.removeLadder(l, true);
       for (let dy = -2; dy <= 2; dy++)
         for (let dx = -2; dx <= 2; dx++) {
@@ -2438,6 +3270,47 @@ export class World {
   checkEnd() {
     if (this.state === 'won' || this.state === 'lost') return;
     if (this.keepHp <= 0) this.finish(false);
+    // nobody left standing to hold the walls while the enemy is still in the field: the castle falls
+    // (a few seconds' grace: the reserve may still be called up)
+    if (this.state === 'battle' && this.activeDefs.length === 0 && this.enemiesRemaining() > 0) {
+      this.wipedT += DT;
+      if (this.wipedT >= GARRISON_GRACE) {
+        this.event('wiped', '수비군이 모두 쓰러졌습니다. 성을 지킬 병사가 없습니다…', 'danger');
+        this.finish(false);
+      }
+    } else this.wipedT = 0;
+  }
+
+  /** Attackers standing inside the walls (courtyard, wall walk, ladders) and not running. */
+  enemiesHoldingWalls() {
+    const g = this.grid;
+    let n = 0;
+    for (const e of this.enemies) {
+      if (e.fleeing || e.def.flying) continue;
+      if (e.state === ST.CLIMB) n++;
+      else if (e.state === ST.ACTIVE) {
+        const i = tileAt(e.x, e.y);
+        if (e.elev || g.inside[i] === 1 || g.keepAdj[i] === 1) n++;
+      }
+    }
+    return n;
+  }
+
+  /**
+   * Hard time cap: the siege is decided as it stands. Attackers holding ground inside the walls, or a keep
+   * all but battered down, and the castle is lost; otherwise the attackers give up and march away.
+   */
+  liftSiege() {
+    const held = this.enemiesHoldingWalls();
+    const lost = held >= CAP_HOLD_N || this.keepHp < this.keepMax * CAP_KEEP_MIN;
+    if (lost) {
+      this.event('siegeend', held >= CAP_HOLD_N ? '긴 공방 끝에 적이 성안을 장악했습니다…' : '긴 공방 끝에 본성이 더는 버티지 못합니다…', 'danger');
+      this.finish(false);
+      return;
+    }
+    for (const e of this.enemies) if (e.state === ST.ACTIVE || e.state === ST.CLIMB) e.fleeing = true;
+    this.event('siegeend', '긴 공방 끝에 적이 공성을 포기하고 물러갑니다!', 'good');
+    this.finish(true);
   }
 
   finish(won: boolean) {
@@ -2472,9 +3345,10 @@ export class World {
     const deployed = Math.max(1, this.stats.deployed);
     let stars = 0;
     if (won) {
+      // 3 stars ask for a well-held keep and few graves: a clean defence, often on a replay
       stars = 1;
-      if (keepPct >= 0.5 && dead / deployed <= 0.4) stars = 2;
-      if (keepPct >= 0.8 && dead / deployed <= 0.2) stars = 3;
+      if (keepPct >= 0.5 && dead / deployed <= 0.35) stars = 2;
+      if (keepPct >= 0.8 && dead / deployed <= 0.15) stars = 3;
     }
     return {
       won,

@@ -82,7 +82,8 @@ class Heap {
   }
 }
 
-const heap = new Heap(GW * GH * 4);
+/** a band never appears closer than this to the castle's wall line (tiles), where the map allows */
+export const SPAWN_GAP = 5;
 
 export interface Field {
   dist: Float64Array;
@@ -104,6 +105,16 @@ export class Grid {
   keepAdj = new Uint8Array(GW * GH);
   /** number of ladders/siege towers docked against this wall tile */
   ladders = new Uint8Array(GW * GH);
+  /**
+   * 1 = tile belongs to the castle's original wall line (wall, tower or gate when the stage was built).
+   * Only these may count as boundary when broken, be rebuilt, or take wall deployments; decorative
+   * rubble scattered in the field is plain outside ground.
+   */
+  wallLine = new Uint8Array(GW * GH);
+  /** 1 = this intact gate is barred: enemies are at it, so defenders cannot pass either */
+  gateShut = new Uint8Array(GW * GH);
+  /** distance in tiles from each tile to the nearest tile of the original wall line (set by finalize) */
+  wallDist = new Float32Array(GW * GH);
   keepTiles: number[] = [];
   depots: number[] = [];
   infirmaries: number[] = [];
@@ -111,6 +122,8 @@ export class Grid {
   keepX = 0;
   keepY = 0;
   version = 0;
+  /** path-search scratch heap, owned by this grid (no shared module state) */
+  private heap = new Heap(GW * GH * 4);
 
   get(x: number, y: number): TileId {
     return this.tiles[idx(x, y)] as TileId;
@@ -131,7 +144,8 @@ export class Grid {
   /** wall line tiles that count as castle boundary (not plain outside ground) */
   isBoundary(i: number) {
     const t = this.tiles[i];
-    return t === Tile.WALL || t === Tile.TOWER || t === Tile.GATE || t === Tile.GATE_BROKEN || t === Tile.RUBBLE;
+    if (t === Tile.RUBBLE) return this.wallLine[i] === 1;
+    return t === Tile.WALL || t === Tile.TOWER || t === Tile.GATE || t === Tile.GATE_BROKEN;
   }
   outsideGround(i: number) {
     return !this.inside[i] && !this.isBoundary(i);
@@ -245,6 +259,23 @@ export class Grid {
         if (inb(nx, ny)) seed(idx(nx, ny));
       }
     }
+    this.wallLine.fill(0);
+    for (let i = 0; i < this.n; i++) {
+      const t = this.tiles[i];
+      if (t === Tile.WALL || t === Tile.TOWER || t === Tile.GATE || t === Tile.GATE_BROKEN) this.wallLine[i] = 1;
+    }
+    const wl: number[] = [];
+    for (let i = 0; i < this.n; i++) if (this.wallLine[i]) wl.push(i);
+    for (let i = 0; i < this.n; i++) {
+      let m = Infinity;
+      const x = tx(i);
+      const y = ty(i);
+      for (const j of wl) {
+        const d = (tx(j) - x) ** 2 + (ty(j) - y) ** 2;
+        if (d < m) m = d;
+      }
+      this.wallDist[i] = Math.sqrt(m);
+    }
     this.inside.fill(0);
     for (let i = 0; i < this.n; i++) {
       const inf = TILE_INFO[this.tiles[i]];
@@ -282,6 +313,7 @@ export class Grid {
     const ib = TILE_INFO[tb];
     if (!ib.dpass) return false;
     if (a === b) return true;
+    if (tb === Tile.GATE && this.gateShut[b]) return false; // barred: step off it, never onto it
     const elevA = this.isElev(a);
     const elevB = ib.elev;
     // cannot climb a wall from outside ground, cannot jump off a wall to outside ground
@@ -325,6 +357,7 @@ export class Grid {
   /** Reverse Dijkstra from keep-adjacent tiles. dist = cost-to-keep for enemies walking there. */
   enemyField(kind: FieldKind, f: Field) {
     const { dist, next } = f;
+    const heap = this.heap;
     dist.fill(Infinity);
     next.fill(-1);
     heap.clear();
@@ -367,6 +400,49 @@ export class Grid {
     }
   }
 
+  /**
+   * Way off the map for a ground enemy that gives up: Dijkstra from every open tile on the map border
+   * outside the castle, through open ground only (no walls climbed or broken on the way out, never out
+   * through the back of a castle that reaches the map edge). dist 0 = on the border.
+   */
+  exitField(f: Field) {
+    const { dist, next } = f;
+    const heap = this.heap;
+    dist.fill(Infinity);
+    next.fill(-1);
+    heap.clear();
+    for (let i = 0; i < this.n; i++) {
+      const x = tx(i);
+      const y = ty(i);
+      if ((x === 0 || y === 0 || x === GW - 1 || y === GH - 1) && this.openGround(i) && !this.inside[i]) {
+        dist[i] = 0;
+        heap.push(0, i);
+      }
+    }
+    while (heap.n) {
+      const u = heap.pop();
+      const du = heap.popKey;
+      if (du > dist[u]) continue;
+      const ux = tx(u);
+      const uy = ty(u);
+      for (let d = 0; d < 8; d++) {
+        const [dx, dy, len] = N8[d];
+        const vx = ux + dx;
+        const vy = uy + dy;
+        if (!inb(vx, vy)) continue;
+        const v = idx(vx, vy);
+        if (!this.openGround(v)) continue;
+        if (d >= 4 && (!this.openGround(idx(ux, vy)) || !this.openGround(idx(vx, uy)))) continue;
+        const nd = du + TILE_INFO[this.tiles[v]].cost * len;
+        if (nd < dist[v]) {
+          dist[v] = nd;
+          next[v] = u;
+          heap.push(nd, v);
+        }
+      }
+    }
+  }
+
   openGround(i: number) {
     const inf = TILE_INFO[this.tiles[i]];
     return inf.epass && !inf.struct;
@@ -375,6 +451,7 @@ export class Grid {
   /** Multi-source Dijkstra for defenders toward a set of goal tiles. */
   defenderField(goals: number[], f: Field) {
     const { dist, next } = f;
+    const heap = this.heap;
     dist.fill(Infinity);
     next.fill(-1);
     heap.clear();
@@ -424,7 +501,11 @@ export class Grid {
     let qi = 0;
     while (qi < q.length && out.length < count) {
       const i = q[qi++];
-      const ok = TILE_INFO[this.tiles[i]].dpass && this.isElev(i) === elev && (insideDest ? this.inside[i] || this.isBoundary(i) : true);
+      const ok =
+        TILE_INFO[this.tiles[i]].dpass &&
+        this.isElev(i) === elev &&
+        (insideDest ? this.inside[i] || this.isBoundary(i) : true) &&
+        !(this.tiles[i] === Tile.GATE && this.gateShut[i]);
       if (ok) out.push(i);
       else if (i !== dest) continue;
       const x = tx(i);
@@ -468,6 +549,37 @@ export class Grid {
       if (best >= 0) return best;
     }
     return -1;
+  }
+
+  /**
+   * Where a band coming from `edge` at `along` tiles down that edge appears: open ground outside the
+   * walls on that edge, at least SPAWN_GAP tiles from the castle's wall line so every band has some
+   * ground to cross under the archers (on a cramped side that is the stretch of the edge nearest to
+   * `along` that is far enough out). Without such ground: the nearest open outside tile (-1 if none
+   * within 30 tiles).
+   */
+  spawnTile(edge: 'W' | 'N' | 'S' | 'E', along: number): number {
+    const a = Math.round(along);
+    const vertical = edge === 'W' || edge === 'E';
+    const len = vertical ? GH : GW;
+    let best = -1;
+    let bs = Infinity;
+    for (let off = 0; off <= 2; off++)
+      for (let k = 0; k < len; k++) {
+        const x = edge === 'W' ? off : edge === 'E' ? GW - 1 - off : k;
+        const y = edge === 'N' ? off : edge === 'S' ? GH - 1 - off : k;
+        const i = idx(x, y);
+        if (!this.openGround(i) || this.inside[i] || this.wallDist[i] < SPAWN_GAP) continue;
+        const sc = Math.abs(k - a) + off * 1.5;
+        if (sc < bs) {
+          bs = sc;
+          best = i;
+        }
+      }
+    if (best >= 0) return best;
+    const x = edge === 'W' ? 0 : edge === 'E' ? GW - 1 : Math.min(GW - 1, Math.max(0, a));
+    const y = edge === 'N' ? 0 : edge === 'S' ? GH - 1 : Math.min(GH - 1, Math.max(0, a));
+    return this.nearestTile(idx(x, y), (i) => this.openGround(i) && !this.inside[i], 30);
   }
 
   /** Is a defender allowed to be deployed / ordered to this tile? */

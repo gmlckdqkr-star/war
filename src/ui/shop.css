@@ -1,0 +1,142 @@
+/* Shop, wardrobe and chronicle previews (drawn cosmetics), storage banner, purchase notices. */
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+.pv-wrap {
+  display: inline-grid;
+  place-items: center;
+  border-radius: 10px;
+  background: linear-gradient(180deg, #2b3340, #1b1f27);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+  flex: none;
+}
+.pv-wrap.sm {
+  width: 44px;
+  height: 44px;
+}
+.pv-wrap.lg {
+  width: 104px;
+  height: 78px;
+}
+.pv-canvas {
+  display: block;
+}
+.pv.title.lg {
+  width: 104px;
+  height: 78px;
+  font-size: 2rem;
+}
+.pv.title.sm {
+  width: 44px;
+  height: 44px;
+}
+
+.pv-cards {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.pv-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  width: 112px;
+  text-align: center;
+}
+.pv-card b {
+  font-size: 0.82em;
+  line-height: 1.2;
+  word-break: keep-all;
+}
+.pv-card small {
+  color: var(--muted);
+  font-size: 0.72em;
+}
+.pv-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* chronicle cells now carry a small drawing */
+.chronicle .cell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+}
+.chronicle .cell .pv-wrap.sm {
+  width: 36px;
+  height: 36px;
+}
+.chronicle .cell .pv-wrap.sm canvas {
+  transform: scale(0.82);
+}
+.chronicle .cell .cl {
+  line-height: 1.15;
+}
+.cell.done .pv-wrap {
+  opacity: 0.6;
+}
+.season-showcase,
+.season-next {
+  margin-top: 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+.season-showcase {
+  border-color: #6a4ca0;
+  background: linear-gradient(180deg, #2e2240, var(--panel));
+}
+.season-showcase h2,
+.season-next h2 {
+  margin: 0 0 8px;
+  font-size: 1rem;
+}
+
+.product .pv-cards {
+  margin: 4px 0;
+}
+.legal {
+  margin-top: 10px;
+}
+.tiny {
+  font-size: 0.72em;
+  line-height: 1.45;
+  margin: 4px 0;
+}
+
+.storage-banner {
+  position: fixed;
+  left: max(8px, var(--sal));
+  right: max(8px, var(--sar));
+  bottom: max(8px, var(--sab));
+  z-index: 60;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: #5a1f14;
+  border: 1px solid var(--danger);
+  color: #ffe2d8;
+  font-size: 0.85em;
+  pointer-events: none;
+}
+body.in-battle .storage-banner {
+  bottom: auto;
+  top: max(52px, calc(var(--sat) + 52px));
+  opacity: 0.9;
+}
+
+.season-head small {
+  display: block;
+}
+.season-head > div small {
+  display: inline;
+}

@@ -1,9 +1,16 @@
 /**
  * "전쟁 연대기" season pass. Seasons rotate by local date and their rewards are generated from the
  * season number, so the game keeps a fresh pass every 6 weeks without any server or content upload.
- * The premium track is a pre-registered non-consumable store product per season (restorable).
+ *
+ * Premium = one pre-registered NON-CONSUMABLE store product per season (chronicle_s01 ...):
+ *  - buying it permanently grants that season's 5 premium cosmetics at once (restorable from the store
+ *    forever, even after the season ended), plus a medal-only bonus track for the rest of the season.
+ *  - premium never gives gold or anything that changes battle power.
+ * Robustness (no server, no support tickets):
+ *  - when a season ends, everything already earned is claimed automatically (nothing is lost);
+ *  - progress is archived per season, so moving the device clock back and forth never wipes it.
  */
-import { seasonCosmetics, seasonTheme } from './cosmetics';
+import { premiumSeasonCosmeticIds, seasonCosmetics, seasonTheme } from './cosmetics';
 import type { SaveData } from './save';
 
 export const SEASON_EPOCH = Date.UTC(2026, 11, 1); // 2026-12-01
@@ -12,18 +19,33 @@ export const PASS_TIERS = 30;
 export const XP_PER_TIER = 1000;
 /** Product ids registered once in the stores. After this many seasons the premium track simply isn't offered. */
 export const MAX_REGISTERED_SEASONS = 24;
+/** How many past seasons' progress is kept for clock-rollback safety. */
+const ARCHIVE_KEEP = 6;
 
 export function seasonAt(now: Date): number {
   const d = Math.floor((now.getTime() - SEASON_EPOCH) / 86400000);
   return Math.max(1, Math.floor(d / SEASON_DAYS) + 1);
 }
 
+export function seasonStarts(season: number): Date {
+  return new Date(SEASON_EPOCH + (season - 1) * SEASON_DAYS * 86400000);
+}
+
 export function seasonEnds(season: number): Date {
   return new Date(SEASON_EPOCH + season * SEASON_DAYS * 86400000);
 }
 
+export function seasonDaysLeft(season: number, now: Date): number {
+  return Math.max(0, Math.ceil((seasonEnds(season).getTime() - now.getTime()) / 86400000));
+}
+
 export function seasonProductId(season: number) {
   return `chronicle_s${String(season).padStart(2, '0')}`;
+}
+
+export function seasonOfProduct(id: string): number | null {
+  const m = /^chronicle_s(\d+)$/.exec(id);
+  return m ? Number(m[1]) : null;
 }
 
 export function premiumAvailable(season: number) {
@@ -42,23 +64,46 @@ export function passRewards(season: number): { free: PassReward[]; prem: PassRew
   const free: PassReward[] = [];
   const prem: PassReward[] = [];
   for (let t = 1; t <= PASS_TIERS; t++) {
+    // free track: earned by playing (gold is fine here because nobody pays for it)
     if (t === 10) free.push({ tier: t, kind: 'cosmetic', cosmetic: cos[5].id });
     else if (t % 3 === 0) free.push({ tier: t, kind: 'medals', amount: 10 });
     else free.push({ tier: t, kind: 'gold', amount: 50 + t * 8 });
-    const premCos: Record<number, number> = { 1: 1, 8: 0, 15: 2, 22: 3, 30: 4 };
-    if (t in premCos) prem.push({ tier: t, kind: 'cosmetic', cosmetic: cos[premCos[t]].id });
-    else if (t % 2 === 0) prem.push({ tier: t, kind: 'medals', amount: 25 });
-    else prem.push({ tier: t, kind: 'gold', amount: 120 + t * 10 });
+    // premium bonus track: medals only (cosmetics are granted at purchase; never gold)
+    prem.push({ tier: t, kind: 'medals', amount: t % 5 === 0 ? 50 : 20 });
   }
   return { free, prem };
 }
 
-/** Reset the pass when the season rolled over. Guard against clock rollback. */
-export function syncSeason(s: SaveData, now: Date) {
+export interface SeasonChange {
+  from: number;
+  to: number;
+  autoClaimed: number;
+}
+
+/**
+ * Bring the pass to the season of `now`. Leaving a season auto-claims everything already earned in it
+ * and archives its progress; entering a season restores archived progress (clock moved back) or
+ * starts fresh. Returns what happened so the UI can tell the player, or null if nothing changed.
+ */
+export function syncSeason(s: SaveData, now: Date): SeasonChange | null {
   const cur = seasonAt(now);
-  if (cur > s.pass.season) {
-    s.pass = { season: cur, xp: 0, claimedFree: [], claimedPrem: [] };
+  const from = s.pass.season;
+  if (cur === from) return null;
+  let autoClaimed = 0;
+  if (from > 0) {
+    autoClaimed = claimAll(s);
+    s.passArchive[String(from)] = { xp: s.pass.xp, claimedFree: [...s.pass.claimedFree], claimedPrem: [...s.pass.claimedPrem] };
   }
+  const prev = s.passArchive[String(cur)];
+  s.pass = prev ? { season: cur, xp: prev.xp, claimedFree: [...prev.claimedFree], claimedPrem: [...prev.claimedPrem] } : { season: cur, xp: 0, claimedFree: [], claimedPrem: [] };
+  // keep only the seasons nearest to the current one
+  const keys = Object.keys(s.passArchive)
+    .map(Number)
+    .filter((k) => k !== cur)
+    .sort((a, b) => Math.abs(a - cur) - Math.abs(b - cur));
+  for (const k of keys.slice(ARCHIVE_KEEP)) delete s.passArchive[String(k)];
+  delete s.passArchive[String(cur)];
+  return from > 0 ? { from, to: cur, autoClaimed } : null;
 }
 
 export function addPassXp(s: SaveData, xp: number, now: Date) {
@@ -101,3 +146,5 @@ export function claimAll(s: SaveData): number {
 export function seasonName(season: number) {
   return `시즌 ${season}: ${seasonTheme(season).name}`;
 }
+
+export { premiumSeasonCosmeticIds };

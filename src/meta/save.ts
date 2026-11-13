@@ -38,6 +38,8 @@ export interface Settings {
   quality: 'low' | 'high';
   reduceMotion: boolean;
   showTips: boolean;
+  /** battle speed the player used last time (1-4); restored at the next battle */
+  speed: number;
 }
 
 export interface SaveData {
@@ -67,8 +69,10 @@ export interface SaveData {
   /** saved lineups (roster ids); slot 0 is free, slots 1-4 come with the commander kit */
   lineups: string[][];
   sweep: { key: string; n: number };
-  /** highest wall-clock time seen, to ignore device clock rollback for daily rewards */
-  maxTime: number;
+  /** pass progress of other seasons (clock-rollback safety), keyed by season number */
+  passArchive: Record<string, { xp: number; claimedFree: number[]; claimedPrem: number[] }>;
+  /** id of the last battle whose result is in this save: a leftover resume record with this id is stale */
+  battleDone: string;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -82,6 +86,7 @@ export const DEFAULT_SETTINGS: Settings = {
   quality: 'high',
   reduceMotion: false,
   showTips: true,
+  speed: 1,
 };
 
 export function newSquad(save: SaveData, type: SquadTypeId, name?: string): RosterSquad {
@@ -130,7 +135,8 @@ export function newSave(now = Date.now()): SaveData {
     lastPlayed: now,
     lineups: [],
     sweep: { key: '', n: 0 },
-    maxTime: now,
+    passArchive: {},
+    battleDone: '',
   };
   s.roster.push(newSquad(s, 'spear', '창병대 I'));
   s.roster.push(newSquad(s, 'sword', '방패검병대 I'));
@@ -232,6 +238,7 @@ export function sanitize(raw: any): SaveData {
   }
   if (!['easy', 'normal', 'hard'].includes(s.settings.difficulty)) s.settings.difficulty = 'normal';
   if (!['low', 'high'].includes(s.settings.quality)) s.settings.quality = 'high';
+  s.settings.speed = Math.round(num(s.settings.speed, 1, 1, 4));
   s.tutorialDone = !!raw.tutorialDone;
   s.seenTips = strArr(raw.seenTips).slice(0, 200);
   s.firstWinKey = typeof raw.firstWinKey === 'string' ? raw.firstWinKey : '';
@@ -239,7 +246,14 @@ export function sanitize(raw: any): SaveData {
   s.lineups = Array.isArray(raw.lineups) ? raw.lineups.slice(0, 5).map((l: unknown) => strArr(l).slice(0, 12)) : [];
   const sw = raw.sweep ?? {};
   s.sweep = { key: typeof sw.key === 'string' ? sw.key : '', n: Math.floor(num(sw.n, 0, 0, 100)) };
-  s.maxTime = num(raw.maxTime, 0, 0);
+  s.passArchive = {};
+  if (raw.passArchive && typeof raw.passArchive === 'object')
+    for (const k of Object.keys(raw.passArchive).slice(0, 12)) {
+      const a = raw.passArchive[k];
+      if (!/^\d+$/.test(k) || !a || typeof a !== 'object') continue;
+      s.passArchive[k] = { xp: num(a.xp, 0, 0, 1e8), claimedFree: numArr(a.claimedFree), claimedPrem: numArr(a.claimedPrem) };
+    }
+  s.battleDone = typeof raw.battleDone === 'string' ? raw.battleDone.slice(0, 64) : '';
   return s;
 }
 
@@ -249,27 +263,66 @@ export interface KV {
   get(k: string): string | null;
   set(k: string, v: string): void;
   remove(k: string): void;
+  /** ok = normal; full = can read but writing failed at start (storage full); memory = storage blocked */
+  mode?: 'ok' | 'full' | 'memory';
 }
 
 export const memoryKV = (): KV => {
   const m = new Map<string, string>();
-  return { get: (k) => m.get(k) ?? null, set: (k, v) => void m.set(k, v), remove: (k) => void m.delete(k) };
+  return { get: (k) => m.get(k) ?? null, set: (k, v) => void m.set(k, v), remove: (k) => void m.delete(k), mode: 'ok' };
 };
 
+/**
+ * localStorage-backed store. If writing fails at start (device storage full) we still READ the
+ * existing save instead of silently starting a new game in memory; writes keep failing loudly so the
+ * UI can warn. Only if storage is blocked entirely do we fall back to memory.
+ */
 export function browserKV(): KV {
+  let ls: Storage;
   try {
-    const ls = window.localStorage;
-    const probe = '__ar_probe';
-    ls.setItem(probe, '1');
-    ls.removeItem(probe);
-    return { get: (k) => ls.getItem(k), set: (k, v) => ls.setItem(k, v), remove: (k) => ls.removeItem(k) };
+    ls = window.localStorage;
+    ls.getItem('__ar_probe');
   } catch {
-    return memoryKV();
+    const m = memoryKV();
+    m.mode = 'memory';
+    return m;
   }
+  let mode: 'ok' | 'full' = 'ok';
+  try {
+    ls.setItem('__ar_probe', '1');
+    ls.removeItem('__ar_probe');
+  } catch {
+    mode = 'full';
+  }
+  const kv: KV = {
+    get: (k) => {
+      try {
+        return ls.getItem(k);
+      } catch {
+        return null;
+      }
+    },
+    set: (k, v) => {
+      ls.setItem(k, v);
+      kv.mode = 'ok';
+    },
+    remove: (k) => {
+      try {
+        ls.removeItem(k);
+      } catch {
+        /* ignore */
+      }
+    },
+    mode,
+  };
+  return kv;
 }
 
-const KEY = 'ashen.save';
+export const SAVE_KEY = 'ashen.save';
+const KEY = SAVE_KEY;
 const BAK = 'ashen.save.bak';
+/** once-a-day snapshot: protects against a bad state being saved twice over both main and backup */
+const DAY = 'ashen.save.day';
 
 function pack(s: SaveData): string {
   const body = JSON.stringify(s);
@@ -289,27 +342,53 @@ function unpack(str: string | null): SaveData | null {
 
 export interface LoadResult {
   save: SaveData;
-  source: 'main' | 'backup' | 'new';
+  source: 'main' | 'backup' | 'day' | 'new';
+  /** the main save existed but was unreadable */
   recovered: boolean;
+  /** some save data existed but nothing could be read: the player starts over (tell them) */
+  lost: boolean;
+}
+
+function dayKey(t = Date.now()) {
+  const d = new Date(t);
+  return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+}
+
+function unpackDay(str: string | null): SaveData | null {
+  if (!str) return null;
+  try {
+    const o = JSON.parse(str);
+    return typeof o?.p === 'string' ? unpack(o.p) : null;
+  } catch {
+    return null;
+  }
 }
 
 export function loadSave(kv: KV): LoadResult {
-  const main = unpack(kv.get(KEY));
-  if (main) return { save: main, source: 'main', recovered: false };
-  const bak = unpack(kv.get(BAK));
-  const hadMain = kv.get(KEY) !== null;
+  const rawMain = kv.get(KEY);
+  const main = unpack(rawMain);
+  if (main) return { save: main, source: 'main', recovered: false, lost: false };
+  const hadMain = rawMain !== null;
   if (hadMain) {
     try {
-      kv.set(KEY + '.corrupt', kv.get(KEY) ?? '');
+      kv.set(KEY + '.corrupt', rawMain ?? '');
     } catch {
       /* ignore */
     }
   }
+  const rawBak = kv.get(BAK);
+  const bak = unpack(rawBak);
   if (bak) {
     writeSave(kv, bak);
-    return { save: bak, source: 'backup', recovered: hadMain };
+    return { save: bak, source: 'backup', recovered: hadMain, lost: false };
   }
-  return { save: newSave(), source: 'new', recovered: hadMain };
+  const rawDay = kv.get(DAY);
+  const day = unpackDay(rawDay);
+  if (day) {
+    writeSave(kv, day);
+    return { save: day, source: 'day', recovered: true, lost: false };
+  }
+  return { save: newSave(), source: 'new', recovered: hadMain, lost: hadMain || rawBak !== null || rawDay !== null };
 }
 
 export function writeSave(kv: KV, s: SaveData): boolean {
@@ -317,8 +396,23 @@ export function writeSave(kv: KV, s: SaveData): boolean {
   const packed = pack(s);
   try {
     const prev = kv.get(KEY);
-    if (prev && unpack(prev)) kv.set(BAK, prev);
+    const prevOk = !!(prev && unpack(prev));
+    if (prevOk) kv.set(BAK, prev!);
     kv.set(KEY, packed);
+    // first save of each day also keeps yesterday's last good state
+    try {
+      const today = dayKey();
+      const dayRaw = kv.get(DAY);
+      let d = '';
+      try {
+        d = dayRaw ? (JSON.parse(dayRaw).d ?? '') : '';
+      } catch {
+        d = '';
+      }
+      if (d !== today) kv.set(DAY, JSON.stringify({ d: today, p: prevOk ? prev : packed }));
+    } catch {
+      /* the day snapshot is optional */
+    }
     return true;
   } catch {
     return false;
@@ -340,27 +434,76 @@ function fromB64(b64: string): string {
   return new TextDecoder().decode(bytes);
 }
 
+/** Uncompressed code (works everywhere). */
 export function exportCode(s: SaveData): string {
   return 'AR1.' + toB64(pack(s));
+}
+
+async function pipeBytes(data: Uint8Array, stream: { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> }): Promise<Uint8Array> {
+  const w = stream.writable.getWriter();
+  void w.write(data);
+  void w.close();
+  const buf = await new Response(stream.readable).arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+function bytesToB64(bytes: Uint8Array): string {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+function b64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/** Short compressed code ('AR2.'), about a third of the AR1 length. Falls back to AR1 when the
+ *  platform has no CompressionStream. */
+export async function exportCodeShort(s: SaveData): Promise<string> {
+  try {
+    if (typeof CompressionStream === 'undefined') return exportCode(s);
+    const bytes = await pipeBytes(new TextEncoder().encode(pack(s)), new CompressionStream('deflate-raw') as any);
+    return 'AR2.' + bytesToB64(bytes);
+  } catch {
+    return exportCode(s);
+  }
 }
 
 /**
  * Import a save code. Store purchases are NOT carried by codes (they are re-read from the store with
  * "구매 복원"), so a shared or edited code can never unlock paid items.
  */
-export function importCode(code: string, paidCosmetics: string[] = []): SaveData | null {
+export function importCode(code: string, isPaid: (id: string) => boolean = () => false): SaveData | null {
   try {
     const t = code.replace(/\s+/g, '');
     if (!t.startsWith('AR1.')) return null;
-    const s = unpack(fromB64(t.slice(4)));
-    if (!s) return null;
-    s.entitlements = [];
-    s.processedTx = [];
-    const paid = new Set(paidCosmetics);
-    s.owned = s.owned.filter((id) => !paid.has(id));
-    for (const k of ['dye', 'banner', 'castle', 'title'] as const) if (!s.owned.includes(s.equipped[k])) s.equipped[k] = DEFAULT_COSMETICS[k];
-    return s;
+    return stripPurchases(unpack(fromB64(t.slice(4))), isPaid);
   } catch {
     return null;
   }
+}
+
+/** Accepts both AR1 (plain) and AR2 (compressed) codes. */
+export async function importCodeAny(code: string, isPaid: (id: string) => boolean = () => false): Promise<SaveData | null> {
+  const t = code.replace(/\s+/g, '');
+  if (t.startsWith('AR1.')) return importCode(t, isPaid);
+  if (!t.startsWith('AR2.') || typeof DecompressionStream === 'undefined') return null;
+  try {
+    const bytes = await pipeBytes(b64ToBytes(t.slice(4)), new DecompressionStream('deflate-raw') as any);
+    return stripPurchases(unpack(new TextDecoder().decode(bytes)), isPaid);
+  } catch {
+    return null;
+  }
+}
+
+function stripPurchases(s: SaveData | null, isPaid: (id: string) => boolean): SaveData | null {
+  if (!s) return null;
+  s.entitlements = [];
+  s.processedTx = [];
+  s.owned = s.owned.filter((id) => !isPaid(id));
+  for (const k of ['dye', 'banner', 'castle', 'title'] as const) if (!s.owned.includes(s.equipped[k])) s.equipped[k] = DEFAULT_COSMETICS[k];
+  return s;
 }

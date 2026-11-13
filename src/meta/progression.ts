@@ -18,20 +18,28 @@ export interface UpgradeDef {
 }
 
 export const UPGRADES: UpgradeDef[] = [
-  { id: 'masonry', name: '석공술', desc: '성벽·성문·본성 내구도 +12%, 공병 작업 +10% (레벨당)', max: 5, base: 120 },
+  { id: 'masonry', name: '석공술', desc: '성벽·성문 내구도 +12%, 본성 +6%, 공병 작업 +10% (레벨당)', max: 5, base: 120 },
   { id: 'fletching', name: '화살 장인', desc: '궁수·석궁·노포 피해 +8% (레벨당)', max: 5, base: 120 },
   { id: 'smithing', name: '대장간', desc: '근접 공격 +6%, 방어 +3% (레벨당)', max: 5, base: 120 },
   { id: 'drill', name: '훈련 교범', desc: '모든 분대 기본 사기 +5 (레벨당)', max: 5, base: 100 },
-  { id: 'logistics', name: '병참', desc: '전투 시작 보급 +15%, 화살 재보급 속도 +15% (레벨당)', max: 5, base: 100 },
+  { id: 'logistics', name: '병참', desc: '전투 시작 보급 +10%, 화살 재보급 속도 +15% (레벨당)', max: 5, base: 100 },
   { id: 'medicine', name: '의술', desc: '쓰러진 병사 사망률 -5%p, 출혈 시간 +6초, 부상 회복 빨라짐 (레벨당)', max: 5, base: 110 },
   { id: 'ballistics', name: '노포 공학', desc: '석궁·노포 피해 +10% (레벨당)', max: 3, base: 160 },
   { id: 'command', name: '지휘술', desc: '지휘관 능력 재사용 대기 -8% (레벨당)', max: 3, base: 180 },
   { id: 'barracks', name: '병영 확장', desc: '출전 가능 분대 +1 (레벨당)', max: 2, base: 400 },
 ];
 
+/**
+ * Price of the next level. The first three levels of a research grow by 1.65x; the fourth and fifth
+ * cost much more, so a full workshop is a long-term goal and gold keeps a use to the end of the campaign.
+ */
 export function upgradeCost(u: UpgradeDef, level: number) {
-  return Math.round(u.base * Math.pow(1.65, level));
+  const top = Math.max(0, level - 2);
+  return Math.round(u.base * Math.pow(1.65, level) * (1 + TOP_LEVEL_PREMIUM * top * top));
 }
+export const TOP_LEVEL_PREMIUM = 0.45;
+/** start supplies per logistics level */
+export const LOGISTICS_START = 0.1;
 
 export function buyUpgrade(s: SaveData, id: string): string | null {
   const u = UPGRADES.find((x) => x.id === id);
@@ -147,7 +155,7 @@ export const SUPPLY_PRICE: Record<keyof Supplies, { per: number; pack: number; n
 };
 
 export function baseSupplies(s: SaveData, st: StageDef): Supplies {
-  const m = 1 + 0.15 * (s.upgrades.logistics ?? 0);
+  const m = 1 + LOGISTICS_START * (s.upgrades.logistics ?? 0);
   return {
     arrows: Math.round(st.supplies.arrows * m),
     food: Math.round(st.supplies.food * m),
@@ -156,7 +164,38 @@ export function baseSupplies(s: SaveData, st: StageDef): Supplies {
   };
 }
 
+/**
+ * Food the whole battle will need for a lineup of `soldiers` fighters (shared by the sim rule and the
+ * pre-battle forecast). The sim deducts ceil(alive / 2) at the start of every wave, so this is the
+ * worst case where nobody falls. A stage with a supply train (endless) brings `resupply.food` before
+ * every later wave, so only the part of each ration the train does not cover has to be in store (over
+ * the first 10 waves: such a siege has no fixed end).
+ * Keep this in sync with World.startWave.
+ */
+export function foodNeeded(st: StageDef, soldiers: number): number {
+  const ration = Math.ceil(Math.max(0, soldiers) / 2);
+  const train = st.resupply?.food ?? 0;
+  if (!st.waves.length) return 0;
+  // a siege with a supply train has no fixed end: the forecast covers its first 10 waves
+  const waves = st.resupply ? Math.min(st.waves.length, 10) : st.waves.length;
+  return ration + (waves - 1) * Math.max(0, ration - train);
+}
+
+/** Soldiers that would deploy for a lineup (ready = not wounded). */
+export function lineupSoldiers(s: SaveData, squadIds: string[]): number {
+  let n = 0;
+  for (const id of squadIds) {
+    const r = s.roster.find((x) => x.id === id);
+    if (r) n += readyCount(r);
+  }
+  return n;
+}
+
 // ---------------------------------------------------------------- battle setup
+
+/** below this many ready soldiers the castle adds militia squads to the lineup (at most LEVY_MAX_SQUADS) */
+export const LEVY_BELOW = 30;
+export const LEVY_MAX_SQUADS = 3;
 
 export function battleConfig(
   s: SaveData,
@@ -177,6 +216,11 @@ export function battleConfig(
     if (ready.length === 0) continue;
     squads.push({ rosterId: r.id, type: r.type, name: r.name, rank: rankOf(r), xp: r.xp, soldiers: ready, color: dye, tile: opts.placement?.[r.id] });
   }
+  // a beaten, penniless army is never left with nobody to send: the castle levies militia (free, not kept)
+  const fielded = squads.reduce((n, q) => n + q.soldiers.length, 0);
+  const levies = Math.min(LEVY_MAX_SQUADS, Math.ceil(Math.max(0, LEVY_BELOW - fielded) / SQUAD_TYPES.militia.size));
+  for (let k = 0; k < levies; k++)
+    squads.push({ rosterId: `levy${k + 1}`, type: 'militia', name: '성 민병대', rank: 0, xp: 0, soldiers: Array.from({ length: SQUAD_TYPES.militia.size }, (_, j) => -2000 - k * 100 - j), color: dye });
   return {
     stage: st,
     seed,
@@ -227,13 +271,17 @@ export function todayKey(d = new Date()) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-/** Apply a finished battle to the save: casualties, wounds, xp, gold, stars, unlocks. */
+/**
+ * Apply a finished battle to the save: casualties, wounds, xp, gold, stars, unlocks. A daily challenge is
+ * credited to `dailyKey`, the day it was the challenge of (today unless given).
+ */
 export function applyBattle(
   s: SaveData,
   st: StageDef,
   res: BattleResult,
   mode: 'campaign' | 'daily' | 'endless',
   now = new Date(),
+  dailyKey = todayKey(now),
 ): Rewards {
   const rw: Rewards = { gold: 0, medals: 0, passXp: 0, firstClear: false, newStars: 0, bonusFirstWin: false, unlocked: [], promoted: [], achievements: [], lines: [] };
   const medLv = s.upgrades.medicine ?? 0;
@@ -301,7 +349,8 @@ export function applyBattle(
         }
       }
       const tk = todayKey(now);
-      if (s.firstWinKey !== tk) {
+      // '>' (not '!=') so moving the device clock back never pays a daily bonus twice
+      if (tk > s.firstWinKey) {
         s.firstWinKey = tk;
         rw.bonusFirstWin = true;
         const b = 60 + st.index * 10;
@@ -315,8 +364,8 @@ export function applyBattle(
     }
     rw.passXp = 80 + 40 * res.wavesCleared + (res.won ? 60 * res.stars : 0) + (rw.firstClear ? 200 : 0);
   } else if (mode === 'daily') {
-    const tk = todayKey(now);
-    if (res.won && s.daily.lastKey !== tk) {
+    const tk = dailyKey;
+    if (res.won && tk > s.daily.lastKey) {
       rw.medals += 20;
       rw.gold += 150;
       rw.lines.push('오늘의 공성 완료: 금화 150, 훈장 20');
@@ -414,19 +463,26 @@ export function checkAchievements(s: SaveData, res: BattleResult, st: StageDef, 
 export const SWEEPS_PER_DAY = 3;
 
 export function sweepsLeft(s: SaveData, now = new Date()) {
-  return s.sweep.key === todayKey(now) ? Math.max(0, SWEEPS_PER_DAY - s.sweep.n) : SWEEPS_PER_DAY;
+  // a date earlier than the last sweep (clock moved back) counts as the same day
+  return todayKey(now) > s.sweep.key ? SWEEPS_PER_DAY : Math.max(0, SWEEPS_PER_DAY - s.sweep.n);
 }
 
-/** Collect a replay reward for a 3-star stage without fighting. Requires the 'sweep' entitlement (checked by caller). */
-export function sweepStage(s: SaveData, st: StageDef, now = new Date()): { gold: number; passXp: number } | string {
+export const SWEEP_PASS_XP = 150;
+export const SWEEP_MEDALS = 2;
+
+/**
+ * Collect a replay of a 3-star stage without fighting (commander kit convenience; the caller checks the
+ * entitlement). Deliberately gives NO gold: gold only comes from battles, so nothing bought with money
+ * turns into battle power. Rewards: chronicle xp + a couple of medals.
+ */
+export function sweepStage(s: SaveData, st: StageDef, now = new Date()): { medals: number; passXp: number } | string {
   if ((s.stars[st.id] ?? 0) < 3) return '별 3개를 받은 성만 소탕할 수 있습니다.';
   if (sweepsLeft(s, now) <= 0) return '오늘의 소탕 횟수를 모두 썼습니다.';
   const tk = todayKey(now);
-  if (s.sweep.key !== tk) s.sweep = { key: tk, n: 0 };
+  if (tk > s.sweep.key) s.sweep = { key: tk, n: 0 };
   s.sweep.n++;
-  const gold = Math.round(st.reward * 0.6);
-  s.gold += gold;
+  s.medals += SWEEP_MEDALS;
   s.cleared[st.id] = (s.cleared[st.id] ?? 0) + 1;
-  addPassXp(s, 150, now);
-  return { gold, passXp: 150 };
+  addPassXp(s, SWEEP_PASS_XP, now);
+  return { medals: SWEEP_MEDALS, passXp: SWEEP_PASS_XP };
 }
